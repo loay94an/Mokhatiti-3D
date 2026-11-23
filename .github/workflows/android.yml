@@ -22,7 +22,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '11'
 
       - name: Set up Node.js required by the upstream build
         uses: actions/setup-node@v4
@@ -145,6 +145,12 @@ jobs:
           test -s "$DEST/lib/generated/SweetHome3D.js"
           test -s "$DEST/lib/resources/localization_ar.json"
           test -s "$DEST/test/testHome.html"
+
+      - name: Switch to JDK 17 for Android Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
