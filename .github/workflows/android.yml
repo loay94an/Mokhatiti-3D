@@ -1,8 +1,8 @@
-name: Android APK
+name: Native Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, native-engine-foundation]
   workflow_dispatch:
 
 permissions:
@@ -11,142 +11,12 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 35
     steps:
-      - name: Checkout project
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '11'
-
-      - name: Set up Node.js required by the upstream build
-        uses: actions/setup-node@v4
-        with:
-          node-version: '14'
-
-      - name: Install Apache Ant and unzip
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ant unzip
-
-      - name: Fetch only the pinned engine source folders
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p third_party
-          git clone --filter=blob:none --no-checkout --depth 1 \
-            https://github.com/lurume84/SweetHome3D.git third_party/SweetHome3D
-          git -C third_party/SweetHome3D sparse-checkout init --cone
-          git -C third_party/SweetHome3D sparse-checkout set \
-            SweetHome3DJS SweetHome3D/src SweetHome3D/libtest
-          git -C third_party/SweetHome3D fetch --depth 1 origin \
-            b64347c2a884ce801cec440cf589c191dfdc30b0
-          git -C third_party/SweetHome3D checkout --detach \
-            b64347c2a884ce801cec440cf589c191dfdc30b0
-
-      - name: Verify pinned upstream source
-        run: |
-          test -f third_party/SweetHome3D/SweetHome3DJS/README.TXT
-          test -f third_party/SweetHome3D/SweetHome3DJS/build.xml
-          test -d third_party/SweetHome3D/SweetHome3D/src
-          grep -q "SWEET HOME 3D JS v 7.5.2" third_party/SweetHome3D/SweetHome3DJS/README.TXT
-
-      - name: Add Arabic translation resources
-        shell: bash
-        run: |
-          set -euo pipefail
-          ROOT="$GITHUB_WORKSPACE/third_party/SweetHome3D"
-          JS="$ROOT/SweetHome3DJS"
-          mkdir -p /tmp/mokhatiti-ar
-          curl --fail --location --retry 3 \
-            https://www.sweethome3d.com/storage/translations/Arabic-7.1.1.sh3l \
-            --output /tmp/Arabic-7.1.1.sh3l
-          unzip -q /tmp/Arabic-7.1.1.sh3l -d /tmp/mokhatiti-ar
-          python3 - <<'PY'
-          from pathlib import Path
-          import shutil
-          extracted = Path("/tmp/mokhatiti-ar")
-          roots = [
-              Path("third_party/SweetHome3D/SweetHome3D/src"),
-              Path("third_party/SweetHome3D/SweetHome3DJS/src"),
-          ]
-          copied = 0
-          for source in extracted.rglob("*_ar.properties"):
-              rel = source.relative_to(extracted)
-              candidates = [rel]
-              if rel.parts and rel.parts[0] in ("src", "SweetHome3D"):
-                  candidates.append(Path(*rel.parts[1:]))
-              for root in roots:
-                  for candidate in candidates:
-                      destination = root / candidate
-                      english = destination.with_name(destination.name.replace("_ar.properties", ".properties"))
-                      if english.is_file():
-                          destination.parent.mkdir(parents=True, exist_ok=True)
-                          shutil.copy2(source, destination)
-                          copied += 1
-                          break
-                  else:
-                      continue
-                  break
-          print(f"Installed {copied} Arabic resource bundles")
-          if copied == 0:
-              raise SystemExit("Arabic SH3L archive contained no matching source resource bundles")
-          PY
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("third_party/SweetHome3D/SweetHome3DJS/tools/json/src/com/eteks/sweethome3d/json/PropertiesToJson.java")
-          s = p.read_text(encoding="utf-8")
-          old = 'String[] supportedLanguages = {"", "bg", "cs"'
-          if old not in s:
-              raise SystemExit("Could not locate PropertiesToJson supported language list")
-          p.write_text(s.replace(old, 'String[] supportedLanguages = {"", "ar", "bg", "cs"', 1), encoding="utf-8")
-          p = Path("third_party/SweetHome3D/SweetHome3DJS/src/UserPreferences.js")
-          s = p.read_text(encoding="utf-8")
-          old = 'UserPreferences.DEFAULT_SUPPORTED_LANGUAGES = ["bg", "cs"'
-          if old not in s:
-              raise SystemExit("Could not locate JS supported language list")
-          s = s.replace(old, 'UserPreferences.DEFAULT_SUPPORTED_LANGUAGES = ["ar", "bg", "cs"', 1)
-          s = s.replace("var defaultLocale = Locale.getDefault();", 'var defaultLocale = "ar";', 1)
-          p.write_text(s, encoding="utf-8")
-          PY
-
-      - name: Generate the Sweet Home 3D JS editor libraries
-        working-directory: third_party/SweetHome3D/SweetHome3DJS
-        run: ant applicationLibraries
-
-      - name: Package the upstream editor into Android assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          DEST="app/src/main/assets/engine"
-          mkdir -p "$DEST/test/resources" "$DEST/src" "$DEST/lib" "app/src/main/assets/licenses"
-          cp -a third_party/SweetHome3D/SweetHome3DJS/src/. "$DEST/src/"
-          cp -a third_party/SweetHome3D/SweetHome3DJS/lib/. "$DEST/lib/"
-          cp third_party/SweetHome3D/SweetHome3DJS/test/testHome.html "$DEST/test/"
-          cp third_party/SweetHome3D/SweetHome3DJS/test/resources/HomeTest.sh3d "$DEST/test/resources/"
-          cp third_party/SweetHome3D/SweetHome3DJS/COPYING.TXT "$DEST/"
-          cp third_party/SweetHome3D/SweetHome3DJS/LICENSE.TXT "$DEST/"
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("app/src/main/assets/engine/test/testHome.html")
-          s = p.read_text(encoding="utf-8")
-          s = s.replace("<html>", '<html lang="ar" dir="rtl">', 1)
-          s = s.replace("</head>", '<link rel="stylesheet" href="arabic-overrides.css">\\n</head>', 1)
-          p.write_text(s, encoding="utf-8")
-          PY
-          cp third_party/SweetHome3D/LICENSE app/src/main/assets/licenses/SweetHome3D-LICENSE.txt
-          cp third_party/SweetHome3D/NOTICE.txt app/src/main/assets/licenses/SweetHome3D-NOTICE.txt
-          cp third_party/SweetHome3D/SweetHome3DJS/THIRDPARTY-LICENSE-*.TXT app/src/main/assets/licenses/
-          test -s "$DEST/lib/generated/SweetHome3D.js"
-          test -s "$DEST/lib/resources/localization_ar.json"
-          test -s "$DEST/test/testHome.html"
-
-      - name: Switch to JDK 17 for Android Gradle
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -157,15 +27,15 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Build debug APK
-        run: gradle --no-daemon assembleDebug
+      - name: Build native debug APK
+        run: gradle --no-daemon clean assembleDebug
 
-      - name: Verify APK output
+      - name: Verify APK
         run: |
           test -s app/build/outputs/apk/debug/app-debug.apk
           sha256sum app/build/outputs/apk/debug/app-debug.apk
 
-      - name: Smoke test APK on Android emulator
+      - name: Install and launch on Android emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -175,21 +45,18 @@ jobs:
           script: |
             adb install -r app/build/outputs/apk/debug/app-debug.apk
             adb shell am start -n com.loay94an.mokhatiti3d/.MainActivity
-            sleep 25
-            adb logcat -d -s MokhatitiSmoke:I | tee /tmp/mokhatiti-smoke.log
-            grep -q '"application":true' /tmp/mokhatiti-smoke.log
-            grep -q '"plan":true' /tmp/mokhatiti-smoke.log
-            grep -q '"view3D":true' /tmp/mokhatiti-smoke.log
+            sleep 8
+            adb shell pidof com.loay94an.mokhatiti3d
             adb logcat -d -s AndroidRuntime:E > /tmp/mokhatiti-runtime.log
             if grep -q 'FATAL EXCEPTION' /tmp/mokhatiti-runtime.log; then
               cat /tmp/mokhatiti-runtime.log
               exit 1
             fi
 
-      - name: Upload debug APK
+      - name: Upload native APK
         uses: actions/upload-artifact@v4
         with:
-          name: Mokhatiti-3D-debug
+          name: Mokhatiti-3D-native-debug
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
