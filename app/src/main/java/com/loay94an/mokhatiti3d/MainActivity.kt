@@ -1,134 +1,115 @@
 package com.loay94an.mokhatiti3d
 
-import android.content.Intent
-import android.net.Uri
+import android.app.Activity
 import android.os.Bundle
+import android.graphics.Color
+import android.view.Gravity
 import android.view.View
-import android.webkit.ConsoleMessage
-import android.webkit.ValueCallback
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.HorizontalScrollView
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.result.contract.ActivityResultContracts
 
-class MainActivity : ComponentActivity() {
-    private lateinit var engineView: WebView
-    private var filePathCallback: ValueCallback<Array<Uri>>? = null
-
-    private val filePicker = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val callback = filePathCallback ?: return@registerForActivityResult
-        val data = result.data
-        val uris = if (result.resultCode == RESULT_OK && data != null) {
-            val clip = data.clipData
-            when {
-                clip != null -> Array(clip.itemCount) { index -> clip.getItemAt(index).uri }
-                data.data != null -> arrayOf(data.data!!)
-                else -> null
-            }
-        } else null
-        callback.onReceiveValue(uris)
-        filePathCallback = null
-    }
+class MainActivity : Activity() {
+    private lateinit var workspace: PlanCanvasView
+    private lateinit var preview: Room3DView
+    private lateinit var hint: TextView
+    private var mode3d = false
+    private var wallMode = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.statusBarColor = Color.rgb(13, 24, 42)
+        window.navigationBarColor = Color.rgb(13, 24, 42)
         window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
-        setContentView(R.layout.activity_main)
-
-        engineView = findViewById(R.id.engineView)
-        engineView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            allowFileAccess = true
-            // The upstream editor loads its bundled .sh3d sample through XMLHttpRequest
-            // from a file:// page. Android WebView blocks this unless explicitly enabled.
-            allowFileAccessFromFileURLs = true
-            allowUniversalAccessFromFileURLs = true
-            allowContentAccess = true
-            javaScriptCanOpenWindowsAutomatically = false
-            setSupportMultipleWindows(false)
-            loadWithOverviewMode = true
-            useWideViewPort = true
-            builtInZoomControls = false
-            displayZoomControls = false
-            mediaPlaybackRequiresUserGesture = true
-            mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
-        }
-        engineView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-        engineView.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView, url: String) {
-                super.onPageFinished(view, url)
-                view.evaluateJavascript(
-                    "(function(){return {application: typeof application === 'object', plan: !!document.getElementById('home-plan'), view3D: !!document.getElementById('home-3D-view')};})()"
-                ) { result ->
-                    android.util.Log.i("MokhatitiSmoke", result ?: "null")
-                }
-            }
-
-            override fun shouldOverrideUrlLoading(
-                view: WebView,
-                request: WebResourceRequest
-            ): Boolean {
-                val uri = request.url
-                return uri.scheme != "file" && uri.scheme != "about"
-            }
-        }
-        engineView.webChromeClient = object : WebChromeClient() {
-            override fun onShowFileChooser(
-                webView: WebView,
-                callback: ValueCallback<Array<Uri>>,
-                params: FileChooserParams
-            ): Boolean {
-                filePathCallback?.onReceiveValue(null)
-                filePathCallback = callback
-                return try {
-                    val intent = params.createIntent().apply {
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                    }
-                    filePicker.launch(intent)
-                    true
-                } catch (_: Exception) {
-                    filePathCallback = null
-                    Toast.makeText(
-                        this@MainActivity,
-                        "تعذر فتح منتقي الملفات",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    false
-                }
-            }
-
-            override fun onConsoleMessage(message: ConsoleMessage): Boolean {
-                android.util.Log.d(
-                    "MokhatitiEngine",
-                    "${message.message()} — ${message.sourceId()}:${message.lineNumber()}"
-                )
-                return true
-            }
-        }
-
-        engineView.loadUrl("file:///android_asset/engine/test/testHome.html?skipTests=true")
+        buildNativeInterface()
     }
 
-    override fun onBackPressed() {
-        if (::engineView.isInitialized && engineView.canGoBack()) {
-            engineView.goBack()
-        } else {
-            super.onBackPressed()
+    private fun buildNativeInterface() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.rgb(245, 247, 250))
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(18, 18, 18, 14)
+            setBackgroundColor(Color.rgb(13, 24, 42))
+        }
+        header.addView(TextView(this).apply {
+            text = "مخططي 3D"
+            textSize = 23f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        })
+        header.addView(TextView(this).apply {
+            text = "استوديو التصميم المعماري"
+            textSize = 12f
+            setTextColor(Color.rgb(170, 190, 210))
+            gravity = Gravity.RIGHT
+        })
+        root.addView(header)
+
+        val tools = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setBackgroundColor(Color.WHITE)
+        }
+        val toolRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(8, 9, 8, 9)
+        }
+        fun tool(label: String, action: () -> Unit) {
+            toolRow.addView(Button(this).apply {
+                text = label
+                textSize = 12f
+                isAllCaps = false
+                setOnClickListener { action() }
+            }, LinearLayout.LayoutParams(-2, 46).apply { marginEnd = 6 })
+        }
+        tool("جدار") { wallMode = true; hint.text = "اسحب على مساحة الرسم لإضافة جدار" }
+        tool("تراجع") { workspace.undo(); preview.invalidate() }
+        tool("مسح") { workspace.clearPlan(); preview.invalidate() }
+        tool("حفظ") { workspace.savePlan(); Toast.makeText(this, "تم حفظ المخطط على الجهاز", Toast.LENGTH_SHORT).show() }
+        tool("فتح") { workspace.loadPlan(); preview.invalidate(); Toast.makeText(this, "تم تحميل المخطط المحفوظ", Toast.LENGTH_SHORT).show() }
+        tool("عرض 3D") { show3d(true) }
+        tool("مخطط 2D") { show3d(false) }
+        tools.addView(toolRow)
+        root.addView(tools)
+
+        hint = TextView(this).apply {
+            text = "اسحب بإصبعك على مساحة الرسم لإضافة الجدران"
+            textSize = 12f
+            setTextColor(Color.rgb(75, 91, 110))
+            setPadding(16, 10, 16, 10)
+            gravity = Gravity.RIGHT
+        }
+        root.addView(hint)
+
+        workspace = PlanCanvasView(this)
+        preview = Room3DView(this, workspace.plan)
+        root.addView(workspace, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(preview, LinearLayout.LayoutParams(-1, 0, 1f))
+        preview.visibility = View.GONE
+
+        val footer = TextView(this).apply {
+            text = "المشروع المحلي  •  الوحدات بالمتر  •  إصدار التطوير الأصلي"
+            textSize = 11f
+            setTextColor(Color.rgb(105, 117, 132))
+            setPadding(14, 12, 14, 12)
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.WHITE)
+        }
+        root.addView(footer)
+        setContentView(root)
     }
 
-    override fun onDestroy() {
-        if (::engineView.isInitialized) {
-            engineView.stopLoading()
-            engineView.destroy()
-        }
-        super.onDestroy()
+    private fun show3d(show: Boolean) {
+        mode3d = show
+        workspace.visibility = if (show) View.GONE else View.VISIBLE
+        preview.visibility = if (show) View.VISIBLE else View.GONE
+        preview.invalidate()
+        hint.text = if (show) "معاينة مجسمة للمخطط الحالي" else "اسحب على مساحة الرسم لإضافة الجدران"
     }
 }
