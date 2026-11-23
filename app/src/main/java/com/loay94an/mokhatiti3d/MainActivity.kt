@@ -46,6 +46,10 @@ class MainActivity : ComponentActivity() {
             domStorageEnabled = true
             databaseEnabled = true
             allowFileAccess = true
+            // The upstream editor loads its bundled .sh3d sample through XMLHttpRequest
+            // from a file:// page. Android WebView blocks this unless explicitly enabled.
+            allowFileAccessFromFileURLs = true
+            allowUniversalAccessFromFileURLs = true
             allowContentAccess = true
             javaScriptCanOpenWindowsAutomatically = false
             setSupportMultipleWindows(false)
