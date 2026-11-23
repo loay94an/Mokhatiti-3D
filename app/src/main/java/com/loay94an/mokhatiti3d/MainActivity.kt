@@ -58,6 +58,15 @@ class MainActivity : ComponentActivity() {
         }
         engineView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         engineView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                view.evaluateJavascript(
+                    "(function(){return {application: typeof application === 'object', plan: !!document.getElementById('home-plan'), view3D: !!document.getElementById('home-3D-view')};})()"
+                ) { result ->
+                    android.util.Log.i("MokhatitiSmoke", result ?: "null")
+                }
+            }
+
             override fun shouldOverrideUrlLoading(
                 view: WebView,
                 request: WebResourceRequest
