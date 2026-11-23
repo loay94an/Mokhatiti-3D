@@ -117,13 +117,12 @@ jobs:
           cp third_party/SweetHome3D/SweetHome3DJS/test/resources/HomeTest.sh3d "$DEST/test/resources/"
           cp third_party/SweetHome3D/SweetHome3DJS/COPYING.TXT "$DEST/"
           cp third_party/SweetHome3D/SweetHome3DJS/LICENSE.TXT "$DEST/"
-          cp app/src/main/assets/engine/arabic-overrides.css "$DEST/"
           python3 - <<'PY'
           from pathlib import Path
           p = Path("app/src/main/assets/engine/test/testHome.html")
           s = p.read_text(encoding="utf-8")
           s = s.replace("<html>", '<html lang="ar" dir="rtl">', 1)
-          s = s.replace("</head>", '<link rel="stylesheet" href="../arabic-overrides.css">\\n</head>', 1)
+          s = s.replace("</head>", '<link rel="stylesheet" href="arabic-overrides.css">\\n</head>', 1)
           p.write_text(s, encoding="utf-8")
           PY
           cp third_party/SweetHome3D/LICENSE app/src/main/assets/licenses/SweetHome3D-LICENSE.txt
