@@ -1,0 +1,86 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout project and pinned engine source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js required by the upstream build
+        uses: actions/setup-node@v4
+        with:
+          node-version: '14'
+
+      - name: Install Apache Ant
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ant
+
+      - name: Verify pinned upstream source
+        run: |
+          test -f third_party/SweetHome3D/SweetHome3DJS/README.TXT
+          test -f third_party/SweetHome3D/SweetHome3DJS/build.xml
+          test -d third_party/SweetHome3D/SweetHome3D/src
+          grep -q "SWEET HOME 3D JS v 7.5.2" third_party/SweetHome3D/SweetHome3DJS/README.TXT
+
+      - name: Generate the Sweet Home 3D JS editor libraries
+        working-directory: third_party/SweetHome3D/SweetHome3DJS
+        run: ant applicationLibraries
+
+      - name: Package the upstream editor into Android assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="app/src/main/assets/engine"
+          mkdir -p "$DEST/test/resources" "$DEST/src" "$DEST/lib" "app/src/main/assets/licenses"
+          cp -a third_party/SweetHome3D/SweetHome3DJS/src/. "$DEST/src/"
+          cp -a third_party/SweetHome3D/SweetHome3DJS/lib/. "$DEST/lib/"
+          cp third_party/SweetHome3D/SweetHome3DJS/test/testHome.html "$DEST/test/"
+          cp third_party/SweetHome3D/SweetHome3DJS/test/resources/HomeTest.sh3d "$DEST/test/resources/"
+          cp third_party/SweetHome3D/SweetHome3DJS/COPYING.TXT "$DEST/"
+          cp third_party/SweetHome3D/SweetHome3DJS/LICENSE.TXT "$DEST/"
+          cp third_party/SweetHome3D/LICENSE app/src/main/assets/licenses/SweetHome3D-LICENSE.txt
+          cp third_party/SweetHome3D/NOTICE.txt app/src/main/assets/licenses/SweetHome3D-NOTICE.txt
+          cp third_party/SweetHome3D/SweetHome3DJS/THIRDPARTY-LICENSE-*.TXT app/src/main/assets/licenses/
+          test -s "$DEST/lib/generated/SweetHome3D.js"
+          test -s "$DEST/test/testHome.html"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Verify APK output
+        run: |
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          sha256sum app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mokhatiti-3D-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
