@@ -1,0 +1,23 @@
+/*
+ * Mokhatiti 3D Arabic layout layer.
+ * The upstream editor remains the source of drawing and 3D functionality.
+ */
+html, body {
+  direction: rtl !important;
+  font-family: "Noto Naskh Arabic", "Noto Sans Arabic", sans-serif;
+}
+#application-menu-toolbar,
+#home-pane-toolbar,
+#catalog-furniture-pane,
+#furniture-view,
+.popup-menu,
+.dialog,
+.card {
+  direction: rtl;
+}
+#home-plan, #home-3D-view {
+  direction: ltr;
+}
+input, textarea, select {
+  font-family: "Noto Naskh Arabic", "Noto Sans Arabic", sans-serif;
+}
