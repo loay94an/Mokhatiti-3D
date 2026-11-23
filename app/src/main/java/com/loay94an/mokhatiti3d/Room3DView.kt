@@ -7,41 +7,57 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.view.View
 import kotlin.math.max
+import kotlin.math.min
 
-/** Native Canvas-based axonometric room preview; geometry is derived from the same plan model. */
+/**
+ * Lightweight native axonometric renderer for the metric wall model.
+ * Each plan segment is projected as a vertical wall prism, not a decorative placeholder.
+ */
 class Room3DView(context: Context, private val walls: List<PlanWall>) : View(context) {
-    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2f; color = Color.rgb(55, 72, 92) }
-    private val label = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(65, 82, 102); textSize = 25f }
+    private val face = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2.2f; color = Color.rgb(55,72,92) }
+    private val caption = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(65,82,102); textSize = 25f }
+    private val wallHeight = 2.8f
+
+    private fun project(x: Float, y: Float, z: Float, cx: Float, cy: Float, scale: Float): Pair<Float,Float> {
+        return Pair(cx + (x-y)*scale, cy + (x+y)*scale*.43f - z*scale*.92f)
+    }
+
+    private fun polygon(canvas: Canvas, points: List<Pair<Float,Float>>, color: Int) {
+        if(points.size<3)return
+        val p=Path().apply { moveTo(points[0].first,points[0].second); points.drop(1).forEach { lineTo(it.first,it.second) }; close() }
+        face.color=color; canvas.drawPath(p,face); canvas.drawPath(p,edge)
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        canvas.drawColor(Color.rgb(244, 248, 252))
-        canvas.drawText("المعاينة المجسمة الأولية", 24f, 42f, label)
-        val cx = width * .5f
-        val cy = height * .56f
-        val sx = max(1f, width * .28f)
-        val sy = sx * .42f
-        val h = max(70f, height * .34f)
-        fun poly(points: Array<FloatArray>, color: Int) {
-            val p = Path()
-            p.moveTo(points[0][0], points[0][1])
-            for (i in 1 until points.size) p.lineTo(points[i][0], points[i][1])
-            p.close(); fill.color = color; canvas.drawPath(p, fill); canvas.drawPath(p, stroke)
+        canvas.drawColor(Color.rgb(244,248,252))
+        canvas.drawText("المعاينة المجسمة — ارتفاع الجدار 2.8 م", 22f, 38f, caption)
+        if(walls.isEmpty()) {
+            canvas.drawText("أضف الجدران من وضع المخطط 2D لعرض المجسم",22f,height-30f,caption)
+            return
         }
-        val a = floatArrayOf(cx, cy - sy)
-        val b = floatArrayOf(cx + sx, cy)
-        val c = floatArrayOf(cx, cy + sy)
-        val d = floatArrayOf(cx - sx, cy)
-        poly(arrayOf(a,b,c,d), Color.rgb(224, 232, 239))
-        poly(arrayOf(d,c,floatArrayOf(c[0],c[1]-h),floatArrayOf(d[0],d[1]-h)), Color.rgb(202, 218, 231))
-        poly(arrayOf(b,c,floatArrayOf(c[0],c[1]-h),floatArrayOf(b[0],b[1]-h)), Color.rgb(178, 199, 216))
-        poly(arrayOf(a,b,floatArrayOf(b[0],b[1]-h),floatArrayOf(a[0],a[1]-h)), Color.rgb(235, 241, 246))
-        poly(arrayOf(a,d,floatArrayOf(d[0],d[1]-h),floatArrayOf(a[0],a[1]-h)), Color.rgb(216, 229, 239))
-        if (walls.isNotEmpty()) {
-            val count = walls.size
-            canvas.drawText("عدد الجدران في النموذج: $count", 24f, height - 28f, label)
-        } else {
-            canvas.drawText("أضف الجدران من وضع المخطط 2D لبدء التصميم", 24f, height - 28f, label)
+        val minX=walls.minOf { min(it.x1,it.x2) }; val maxX=walls.maxOf { max(it.x1,it.x2) }
+        val minY=walls.minOf { min(it.y1,it.y2) }; val maxY=walls.maxOf { max(it.y1,it.y2) }
+        val span=max(2f,max(maxX-minX,maxY-minY))
+        val scale=min(width*.34f/span,height*.48f/span).coerceAtLeast(12f)
+        val cx=width*.5f
+        val cy=height*.52f
+        val pad=.25f
+        val floor=listOf(
+            project(minX-pad,minY-pad,0f,cx,cy,scale),
+            project(maxX+pad,minY-pad,0f,cx,cy,scale),
+            project(maxX+pad,maxY+pad,0f,cx,cy,scale),
+            project(minX-pad,maxY+pad,0f,cx,cy,scale)
+        )
+        polygon(canvas,floor,Color.rgb(224,232,239))
+        walls.forEach { w ->
+            val a=project(w.x1,w.y1,0f,cx,cy,scale)
+            val b=project(w.x2,w.y2,0f,cx,cy,scale)
+            val at=project(w.x1,w.y1,wallHeight,cx,cy,scale)
+            val bt=project(w.x2,w.y2,wallHeight,cx,cy,scale)
+            polygon(canvas,listOf(a,b,bt,at),Color.rgb(190,211,226))
         }
+        canvas.drawText("الجدران: ${walls.size}  •  الارتفاع: 2.8 م",22f,height-26f,caption)
     }
 }
