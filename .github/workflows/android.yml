@@ -13,10 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Checkout project and pinned engine source
+      - name: Checkout project
         uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
 
       - name: Set up JDK
@@ -34,6 +33,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ant unzip
+
+      - name: Fetch only the pinned engine source folders
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p third_party
+          git clone --filter=blob:none --no-checkout --depth 1 \
+            https://github.com/lurume84/SweetHome3D.git third_party/SweetHome3D
+          git -C third_party/SweetHome3D sparse-checkout init --cone
+          git -C third_party/SweetHome3D sparse-checkout set \
+            SweetHome3DJS SweetHome3D/src SweetHome3D/libtest
+          git -C third_party/SweetHome3D fetch --depth 1 origin \
+            b64347c2a884ce801cec440cf589c191dfdc30b0
+          git -C third_party/SweetHome3D checkout --detach \
+            b64347c2a884ce801cec440cf589c191dfdc30b0
 
       - name: Verify pinned upstream source
         run: |
