@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout project and pinned engine source
         uses: actions/checkout@v4
@@ -30,10 +30,10 @@ jobs:
         with:
           node-version: '14'
 
-      - name: Install Apache Ant
+      - name: Install Apache Ant and unzip
         run: |
           sudo apt-get update
-          sudo apt-get install -y ant
+          sudo apt-get install -y ant unzip
 
       - name: Verify pinned upstream source
         run: |
@@ -41,6 +41,65 @@ jobs:
           test -f third_party/SweetHome3D/SweetHome3DJS/build.xml
           test -d third_party/SweetHome3D/SweetHome3D/src
           grep -q "SWEET HOME 3D JS v 7.5.2" third_party/SweetHome3D/SweetHome3DJS/README.TXT
+
+      - name: Add Arabic translation resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/third_party/SweetHome3D"
+          JS="$ROOT/SweetHome3DJS"
+          mkdir -p /tmp/mokhatiti-ar
+          curl --fail --location --retry 3 \
+            https://www.sweethome3d.com/storage/translations/Arabic-7.1.1.sh3l \
+            --output /tmp/Arabic-7.1.1.sh3l
+          unzip -q /tmp/Arabic-7.1.1.sh3l -d /tmp/mokhatiti-ar
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          extracted = Path("/tmp/mokhatiti-ar")
+          roots = [
+              Path("third_party/SweetHome3D/SweetHome3D/src"),
+              Path("third_party/SweetHome3D/SweetHome3DJS/src"),
+          ]
+          copied = 0
+          for source in extracted.rglob("*_ar.properties"):
+              rel = source.relative_to(extracted)
+              candidates = [rel]
+              if rel.parts and rel.parts[0] in ("src", "SweetHome3D"):
+                  candidates.append(Path(*rel.parts[1:]))
+              for root in roots:
+                  for candidate in candidates:
+                      destination = root / candidate
+                      english = destination.with_name(destination.name.replace("_ar.properties", ".properties"))
+                      if english.is_file():
+                          destination.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copy2(source, destination)
+                          copied += 1
+                          break
+                  else:
+                      continue
+                  break
+          print(f"Installed {copied} Arabic resource bundles")
+          if copied == 0:
+              raise SystemExit("Arabic SH3L archive contained no matching source resource bundles")
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("third_party/SweetHome3D/SweetHome3DJS/tools/json/src/com/eteks/sweethome3d/json/PropertiesToJson.java")
+          s = p.read_text(encoding="utf-8")
+          old = 'String[] supportedLanguages = {"", "bg", "cs"'
+          if old not in s:
+              raise SystemExit("Could not locate PropertiesToJson supported language list")
+          p.write_text(s.replace(old, 'String[] supportedLanguages = {"", "ar", "bg", "cs"', 1), encoding="utf-8")
+          p = Path("third_party/SweetHome3D/SweetHome3DJS/src/UserPreferences.js")
+          s = p.read_text(encoding="utf-8")
+          old = 'UserPreferences.DEFAULT_SUPPORTED_LANGUAGES = ["bg", "cs"'
+          if old not in s:
+              raise SystemExit("Could not locate JS supported language list")
+          s = s.replace(old, 'UserPreferences.DEFAULT_SUPPORTED_LANGUAGES = ["ar", "bg", "cs"', 1)
+          s = s.replace("var defaultLocale = Locale.getDefault();", 'var defaultLocale = "ar";', 1)
+          p.write_text(s, encoding="utf-8")
+          PY
 
       - name: Generate the Sweet Home 3D JS editor libraries
         working-directory: third_party/SweetHome3D/SweetHome3DJS
@@ -58,10 +117,20 @@ jobs:
           cp third_party/SweetHome3D/SweetHome3DJS/test/resources/HomeTest.sh3d "$DEST/test/resources/"
           cp third_party/SweetHome3D/SweetHome3DJS/COPYING.TXT "$DEST/"
           cp third_party/SweetHome3D/SweetHome3DJS/LICENSE.TXT "$DEST/"
+          cp app/src/main/assets/engine/arabic-overrides.css "$DEST/"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("app/src/main/assets/engine/test/testHome.html")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace("<html>", '<html lang="ar" dir="rtl">', 1)
+          s = s.replace("</head>", '<link rel="stylesheet" href="../arabic-overrides.css">\\n</head>', 1)
+          p.write_text(s, encoding="utf-8")
+          PY
           cp third_party/SweetHome3D/LICENSE app/src/main/assets/licenses/SweetHome3D-LICENSE.txt
           cp third_party/SweetHome3D/NOTICE.txt app/src/main/assets/licenses/SweetHome3D-NOTICE.txt
           cp third_party/SweetHome3D/SweetHome3DJS/THIRDPARTY-LICENSE-*.TXT app/src/main/assets/licenses/
           test -s "$DEST/lib/generated/SweetHome3D.js"
+          test -s "$DEST/lib/resources/localization_ar.json"
           test -s "$DEST/test/testHome.html"
 
       - name: Set up Gradle
