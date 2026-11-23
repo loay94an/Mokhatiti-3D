@@ -1,0 +1,3 @@
+[submodule "third_party/SweetHome3D"]
+	path = third_party/SweetHome3D
+	url = https://github.com/lurume84/SweetHome3D.git
