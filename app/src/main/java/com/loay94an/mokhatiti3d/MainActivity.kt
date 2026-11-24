@@ -15,7 +15,6 @@ class MainActivity : Activity() {
     private lateinit var workspace: PlanCanvasView
     private lateinit var preview: Room3DView
     private lateinit var hint: TextView
-    private var wallMode = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -67,7 +66,9 @@ class MainActivity : Activity() {
                 setOnClickListener { action() }
             }, LinearLayout.LayoutParams(-2, 46).apply { marginEnd = 6 })
         }
-        tool("جدار") { wallMode = true; hint.text = "اسحب على مساحة الرسم لإضافة جدار" }
+        tool("جدار") { workspace.setTool(PlanCanvasTool.WALL); hint.text = "اسحب لرسم جدار جديد" }
+        tool("تحديد وتحريك") { workspace.setTool(PlanCanvasTool.SELECT); hint.text = "المس الجدار لتحديده ثم اسحبه لتحريكه" }
+        tool("حذف عنصر") { workspace.setTool(PlanCanvasTool.ERASE); hint.text = "المس الجدار الذي تريد حذفه" }
         tool("تراجع") { workspace.undo(); preview.invalidate() }
         tool("غرف") { val count = workspace.detectRooms(); preview.invalidate(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
         tool("مسح") { workspace.clearPlan(); preview.invalidate() }
@@ -109,6 +110,6 @@ class MainActivity : Activity() {
         workspace.visibility = if (show) View.GONE else View.VISIBLE
         preview.visibility = if (show) View.VISIBLE else View.GONE
         preview.invalidate()
-        hint.text = if (show) "معاينة مجسمة للمخطط الحالي" else "اسحب على مساحة الرسم لإضافة الجدران"
+        hint.text = if (show) "معاينة مجسمة للمخطط الحالي" else "اختر أداة الجدار أو التحديد أو الحذف من الشريط"
     }
 }
