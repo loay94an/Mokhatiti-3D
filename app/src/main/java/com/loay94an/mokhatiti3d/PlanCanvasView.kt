@@ -83,6 +83,10 @@ class PlanCanvasView(context: Context) : View(context) {
                     w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),
                     w.optString("id", java.util.UUID.randomUUID().toString()),
                     w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
+                )).toFloat(),
+                    w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),
+                    w.optString("id", java.util.UUID.randomUUID().toString()),
+                    w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
                 ));savePlan()}
                 drawing=false;invalidate();performClick();return true
             }
