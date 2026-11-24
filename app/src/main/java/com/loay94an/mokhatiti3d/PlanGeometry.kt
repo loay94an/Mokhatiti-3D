@@ -28,6 +28,10 @@ data class PlanBounds(
     val maxX: Float,
     val maxY: Float
 ) {
+    init {
+        require(listOf(minX, minY, maxX, maxY).all(Float::isFinite))
+        require(maxX >= minX && maxY >= minY)
+    }
     val width: Float get() = maxX - minX
     val height: Float get() = maxY - minY
 }
@@ -89,6 +93,7 @@ data class PlanRoom(
     init {
         require(id.isNotBlank() && levelId.isNotBlank())
         require(boundary.size >= 3) { "A room needs at least three boundary points" }
+        require(areaSquareMetres > 0.0001f) { "A room boundary must enclose a positive area" }
     }
 
     /** Shoelace area; the result is always non-negative and measured in m². */
@@ -155,6 +160,9 @@ data class PlanProject(
         require(levels.isNotEmpty()) { "A project must contain at least one level" }
         val levelIds = levels.map { it.id }.toSet()
         require(levelIds.size == levels.size) { "Level IDs must be unique" }
+        require(walls.map { it.id }.toSet().size == walls.size) { "Wall IDs must be unique" }
+        require(rooms.map { it.id }.toSet().size == rooms.size) { "Room IDs must be unique" }
+        require(openings.map { it.id }.toSet().size == openings.size) { "Opening IDs must be unique" }
         require(walls.all { it.levelId in levelIds }) { "Every wall must reference an existing level" }
         require(rooms.all { it.levelId in levelIds }) { "Every room must reference an existing level" }
         val wallById = walls.associateBy { it.id }
@@ -162,7 +170,12 @@ data class PlanProject(
             val wall = wallById[opening.wallId] ?: return@all false
             opening.offsetMetres + opening.widthMetres <= wall.lengthMetres + 0.0001f &&
                 opening.sillHeightMetres + opening.heightMetres <= wall.height + 0.0001f
-        }) { "Every opening must fit inside its host wall" }
+        }) { "Every opening must fit inside its host wall" }        require(openings.groupBy { it.wallId }.values.all { wallOpenings ->
+            val ordered = wallOpenings.sortedBy { it.offsetMetres }
+            ordered.zipWithNext().all { (left, right) ->
+                left.offsetMetres + left.widthMetres <= right.offsetMetres + 0.0001f
+            }
+        }) { "Openings on the same wall must not overlap" }
     }
 
     val bounds: PlanBounds?
