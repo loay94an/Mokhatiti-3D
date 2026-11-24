@@ -13,10 +13,18 @@ import org.json.JSONObject
 import kotlin.math.abs
 import kotlin.math.round
 
+enum class PlanCanvasTool { WALL, SELECT, ERASE }
+
 /** Metric editor: geometry is stored in metres, independent of screen resolution. */
 class PlanCanvasView(context: Context) : View(context) {
     val plan = mutableListOf<PlanWall>()
     val rooms = mutableListOf<PlanRoom>()
+    var tool: PlanCanvasTool = PlanCanvasTool.WALL
+        private set
+    private var selectedWallId: String? = null
+    private var selectionStartX = 0f
+    private var selectionStartY = 0f
+    private var selectionMoved = false
     private val undoStack = ArrayDeque<List<PlanWall>>()
     private val prefs get() = context.getSharedPreferences("mokhatiti_native", Context.MODE_PRIVATE)
     private var pixelsPerMetre = 72f
@@ -40,6 +48,7 @@ class PlanCanvasView(context: Context) : View(context) {
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(226,233,241); strokeWidth = 1f }
     private val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(193,205,219); strokeWidth = 2f }
     private val wallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(25,48,75); strokeWidth = 10f; strokeCap = Paint.Cap.ROUND }
+    private val selectedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(22,163,148); strokeWidth = 4f; style = Paint.Style.STROKE }
     private val previewPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(22,163,148); strokeWidth = 8f; strokeCap = Paint.Cap.ROUND }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(93,110,130); textSize = 25f }
     private val measurePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(14,132,122); textSize = 22f; typeface = Typeface.DEFAULT_BOLD }
@@ -63,6 +72,10 @@ class PlanCanvasView(context: Context) : View(context) {
             val x1=screenX(wall.x1); val y1=screenY(wall.y1); val x2=screenX(wall.x2); val y2=screenY(wall.y2)
             wallPaint.strokeWidth = (wall.thickness * pixelsPerMetre).coerceAtLeast(2f)
             canvas.drawLine(x1,y1,x2,y2,wallPaint)
+            if (wall.id == selectedWallId) {
+                selectedPaint.strokeWidth = wallPaint.strokeWidth + 8f
+                canvas.drawLine(x1,y1,x2,y2,selectedPaint)
+            }
             canvas.drawText(String.format("%.2f م",wall.lengthMetres),(x1+x2)/2f+8f,(y1+y2)/2f-10f,measurePaint)
         }
         if (drawing) {
@@ -80,6 +93,22 @@ class PlanCanvasView(context: Context) : View(context) {
         while(y<height){canvas.drawLine(0f,y,width.toFloat(),y,gridPaint);y+=step}
         canvas.drawLine(originX(),0f,originX(),height.toFloat(),axisPaint)
         canvas.drawLine(0f,originY(),width.toFloat(),originY(),axisPaint)
+    }
+
+    fun setTool(next: PlanCanvasTool) {
+        tool = next
+        selectedWallId = null
+        invalidate()
+    }
+
+    private fun distanceToSegment(px: Float, py: Float, wall: PlanWall): Float {
+        val dx = wall.x2 - wall.x1
+        val dy = wall.y2 - wall.y1
+        val lengthSquared = dx * dx + dy * dy
+        val t = (((px - wall.x1) * dx + (py - wall.y1) * dy) / lengthSquared).coerceIn(0f, 1f)
+        val nearestX = wall.x1 + t * dx
+        val nearestY = wall.y1 + t * dy
+        return kotlin.math.hypot(px - nearestX, py - nearestY)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -101,16 +130,70 @@ class PlanCanvasView(context: Context) : View(context) {
             return true
         }
         when(event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { lastFocusX=event.x;lastFocusY=event.y;startX=worldX(event.x);startY=worldY(event.y);endX=startX;endY=startY;drawing=true;invalidate();return true }
-            MotionEvent.ACTION_MOVE -> { endX=worldX(event.x);endY=worldY(event.y);invalidate();return true }
+            MotionEvent.ACTION_DOWN -> {
+                lastFocusX = event.x
+                lastFocusY = event.y
+                startX = worldX(event.x)
+                startY = worldY(event.y)
+                endX = startX
+                endY = startY
+                if (tool != PlanCanvasTool.WALL) {
+                    val hit = plan.minByOrNull { distanceToSegment(startX, startY, it) }
+                        ?.takeIf { distanceToSegment(startX, startY, it) <= 0.35f }
+                    selectedWallId = hit?.id
+                    selectionStartX = startX
+                    selectionStartY = startY
+                    selectionMoved = false
+                    if (tool == PlanCanvasTool.ERASE && hit != null) {
+                        rememberUndo()
+                        plan.removeAll { it.id == hit.id }
+                        rooms.clear()
+                        selectedWallId = null
+                        savePlan()
+                    }
+                    drawing = false
+                    invalidate()
+                    return true
+                }
+                drawing = true
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                endX = worldX(event.x)
+                endY = worldY(event.y)
+                if (tool == PlanCanvasTool.SELECT && selectedWallId != null) {
+                    selectionMoved = kotlin.math.hypot(endX - selectionStartX, endY - selectionStartY) > 0.03f
+                }
+                invalidate()
+                return true
+            }
             MotionEvent.ACTION_UP -> {
-                endX=worldX(event.x);endY=worldY(event.y)
-                if (abs(endX - startX) + abs(endY - startY) >= .2f) {
+                endX = worldX(event.x)
+                endY = worldY(event.y)
+                if (tool == PlanCanvasTool.SELECT && selectedWallId != null && selectionMoved) {
+                    val dx = endX - selectionStartX
+                    val dy = endY - selectionStartY
+                    rememberUndo()
+                    val index = plan.indexOfFirst { it.id == selectedWallId }
+                    if (index >= 0) {
+                        plan[index] = plan[index].copy(
+                            x1 = plan[index].x1 + dx, y1 = plan[index].y1 + dy,
+                            x2 = plan[index].x2 + dx, y2 = plan[index].y2 + dy
+                        )
+                        rooms.clear()
+                        savePlan()
+                    }
+                } else if (tool == PlanCanvasTool.WALL && abs(endX - startX) + abs(endY - startY) >= .2f) {
                     rememberUndo()
                     plan.add(PlanWall(startX, startY, endX, endY))
+                    rooms.clear()
                     savePlan()
                 }
-                drawing=false;invalidate();performClick();return true
+                drawing = false
+                invalidate()
+                performClick()
+                return true
             }
             MotionEvent.ACTION_CANCEL -> {drawing=false;invalidate();return true}
         }
