@@ -75,6 +75,7 @@ class MainActivity : Activity() {
         tool("خصائص الجدار") { editWallProperties() }
         tool("باب") { if (workspace.addOpeningToSelected(PlanOpeningType.DOOR)) preview.refresh() else Toast.makeText(this, "حدد جداراً مناسباً لإضافة الباب", Toast.LENGTH_SHORT).show() }
         tool("نافذة") { if (workspace.addOpeningToSelected(PlanOpeningType.WINDOW)) preview.refresh() else Toast.makeText(this, "حدد جداراً مناسباً لإضافة النافذة", Toast.LENGTH_SHORT).show() }
+        tool("مكتبة الأثاث") { showFurnitureCatalog() }
         tool("تراجع") { workspace.undo(); preview.refresh() }
         tool("غرف") { val count = workspace.detectRooms(); preview.refresh(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
         tool("مسح") { workspace.clearPlan(); preview.refresh() }
@@ -97,7 +98,7 @@ class MainActivity : Activity() {
         root.addView(hint)
 
         workspace = PlanCanvasView(this)
-        preview = Room3DView(this, workspace.plan, workspace.rooms, workspace.openings)
+        preview = Room3DView(this, workspace.plan, workspace.rooms, workspace.openings, workspace.furniture)
         root.addView(workspace, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(preview, LinearLayout.LayoutParams(-1, 0, 1f))
         preview.visibility = View.GONE
@@ -114,6 +115,30 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
+    private fun showFurnitureCatalog() {
+        val names = arrayOf("أريكة", "سرير مفرد", "سرير مزدوج", "طاولة طعام", "كرسي", "خزانة")
+        val catalog = listOf(
+            PlanFurniture(name = names[0], category = "جلوس", x = 0f, y = 0f, width = 2.0f, depth = 0.85f, height = 0.8f),
+            PlanFurniture(name = names[1], category = "نوم", x = 0f, y = 0f, width = 1.0f, depth = 2.0f, height = 0.55f),
+            PlanFurniture(name = names[2], category = "نوم", x = 0f, y = 0f, width = 1.6f, depth = 2.0f, height = 0.6f),
+            PlanFurniture(name = names[3], category = "طاولات", x = 0f, y = 0f, width = 1.4f, depth = 0.85f, height = 0.75f),
+            PlanFurniture(name = names[4], category = "جلوس", x = 0f, y = 0f, width = 0.5f, depth = 0.5f, height = 0.9f),
+            PlanFurniture(name = names[5], category = "تخزين", x = 0f, y = 0f, width = 1.2f, depth = 0.6f, height = 2.1f)
+        )
+        AlertDialog.Builder(this)
+            .setTitle("مكتبة الأثاث")
+            .setItems(names) { _, which ->
+                val points = workspace.plan.flatMap { listOf(it.start, it.end) }
+                val centerX = if (points.isEmpty()) 0f else (points.minOf { it.x } + points.maxOf { it.x }) / 2f
+                val centerY = if (points.isEmpty()) 0f else (points.minOf { it.y } + points.maxOf { it.y }) / 2f
+                val offset = workspace.furniture.size * 0.35f
+                workspace.addFurniture(catalog[which].copy(x = centerX + offset, y = centerY + offset))
+                preview.refresh()
+                hint.text = "تمت إضافة " + names[which] + "؛ اسحبه إلى موضعه باستخدام أداة التحديد"
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
     private fun editWallProperties() {
         val wall = workspace.selectedWall()
         if (wall == null) {
