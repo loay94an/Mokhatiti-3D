@@ -307,7 +307,10 @@ class PlanCanvasView(context: Context) : View(context) {
             val snapshot = undoStack.removeLast()
             plan.clear(); plan.addAll(snapshot.walls)
             openings.clear(); openings.addAll(snapshot.openings)
-        } else if(plan.isNotEmpty()) plan.removeAt(plan.lastIndex)
+        } else if(plan.isNotEmpty()) {
+            val removed = plan.removeAt(plan.lastIndex)
+            openings.removeAll { it.wallId == removed.id }
+        }
         rooms.clear()
         savePlan();invalidate()
     }
@@ -419,6 +422,7 @@ class PlanCanvasView(context: Context) : View(context) {
             PlanProject(walls = loadedWalls, rooms = loadedRooms, openings = loadedOpenings)
             plan.clear()
             plan.addAll(loadedWalls)
+            selectedWallId = null
             rooms.clear()
             rooms.addAll(loadedRooms)
             openings.clear()
