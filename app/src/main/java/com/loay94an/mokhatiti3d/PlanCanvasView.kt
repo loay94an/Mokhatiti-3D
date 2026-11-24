@@ -286,13 +286,15 @@ class PlanCanvasView(context: Context) : View(context) {
                 endX = startX
                 endY = startY
                 if (tool != PlanCanvasTool.WALL) {
-                    val furnitureHit = furniture.firstOrNull { item -> item.levelId == activeLevelId &&
-                        val dx = startX - item.x
-                        val dy = startY - item.y
-                        val angle = Math.toRadians(-item.rotationDegrees.toDouble())
-                        val localX = dx * kotlin.math.cos(angle).toFloat() - dy * kotlin.math.sin(angle).toFloat()
-                        val localY = dx * kotlin.math.sin(angle).toFloat() + dy * kotlin.math.cos(angle).toFloat()
-                        abs(localX) <= item.width / 2f && abs(localY) <= item.depth / 2f
+                    val furnitureHit = furniture.firstOrNull { item ->
+                        if (item.levelId != activeLevelId) false else {
+                            val dx = startX - item.x
+                            val dy = startY - item.y
+                            val angle = Math.toRadians(-item.rotationDegrees.toDouble())
+                            val localX = dx * kotlin.math.cos(angle).toFloat() - dy * kotlin.math.sin(angle).toFloat()
+                            val localY = dx * kotlin.math.sin(angle).toFloat() + dy * kotlin.math.cos(angle).toFloat()
+                            abs(localX) <= item.width / 2f && abs(localY) <= item.depth / 2f
+                        }
                     }
                     if (furnitureHit != null) {
                         selectedFurnitureId = furnitureHit.id
