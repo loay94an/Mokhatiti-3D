@@ -21,6 +21,9 @@ class PlanCanvasView(context: Context) : View(context) {
     val rooms = mutableListOf<PlanRoom>()
     val openings = mutableListOf<PlanOpening>()
     val furniture = mutableListOf<PlanFurniture>()
+    val levels = mutableListOf(PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "الطابق الأرضي"))
+    var activeLevelId: String = PlanWall.DEFAULT_LEVEL_ID
+        private set
     var tool: PlanCanvasTool = PlanCanvasTool.WALL
         private set
     private var selectedWallId: String? = null
@@ -72,7 +75,7 @@ class PlanCanvasView(context: Context) : View(context) {
 
     private fun snappedPoint(x: Float, y: Float, reference: PlanPoint? = null): PlanPoint {
         var point = PlanPoint(snap(x), snap(y))
-        val endpoint = plan.flatMap { listOf(it.start, it.end) }
+        val endpoint = plan.filter { it.levelId == activeLevelId }.flatMap { listOf(it.start, it.end) }
             .minByOrNull { it.distanceTo(point) }
         if (endpoint != null && endpoint.distanceTo(point) <= 0.18f) point = endpoint
         if (reference != null) {
@@ -87,7 +90,7 @@ class PlanCanvasView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         drawGrid(canvas)
-        rooms.forEach { room ->
+        rooms.filter { it.levelId == activeLevelId }.forEach { room ->
             if (room.boundary.size >= 3) {
                 val path = android.graphics.Path().apply {
                     moveTo(screenX(room.boundary[0].x), screenY(room.boundary[0].y))
@@ -102,7 +105,7 @@ class PlanCanvasView(context: Context) : View(context) {
         }
         canvas.drawText("مخطط ثنائي الأبعاد", 22f, 34f, textPaint)
         canvas.drawText("الشبكة 10 سم  •  المقياس " + pixelsPerMetre.toInt() + " px/م", 22f, 64f, textPaint)
-        furniture.forEach { item ->
+        furniture.filter { it.levelId == activeLevelId }.forEach { item ->
             val corners = item.footprint()
             val path = android.graphics.Path().apply {
                 moveTo(screenX(corners[0].x), screenY(corners[0].y))
@@ -114,7 +117,7 @@ class PlanCanvasView(context: Context) : View(context) {
             if (item.id == selectedFurnitureId) canvas.drawPath(path, selectedPaint)
             canvas.drawText(item.name, screenX(item.x), screenY(item.y), measurePaint)
         }
-        plan.forEach { wall ->
+        plan.filter { it.levelId == activeLevelId }.forEach { wall ->
             val x1=screenX(wall.x1); val y1=screenY(wall.y1); val x2=screenX(wall.x2); val y2=screenY(wall.y2)
             wallPaint.strokeWidth = (wall.thickness * pixelsPerMetre).coerceAtLeast(2f)
             drawWallSegments(canvas, wall, wallPaint)
@@ -172,13 +175,32 @@ class PlanCanvasView(context: Context) : View(context) {
         invalidate()
     }
 
-    fun selectedWall(): PlanWall? = plan.firstOrNull { it.id == selectedWallId }
+    fun selectedWall(): PlanWall? = plan.firstOrNull { it.id == selectedWallId && it.levelId == activeLevelId }
+    fun activeLevelName(): String = levels.firstOrNull { it.id == activeLevelId }?.name ?: "الطابق"
+
+    fun addLevel(name: String): String {
+        val nextElevation = levels.maxOfOrNull { it.elevationMetres + it.heightMetres + it.floorThicknessMetres } ?: 0f
+        val level = PlanLevel(id = java.util.UUID.randomUUID().toString(), name = name.ifBlank { "طابق ${levels.size + 1}" }, elevationMetres = nextElevation)
+        levels.add(level)
+        activeLevelId = level.id
+        savePlan()
+        invalidate()
+        return level.name
+    }
+
+    fun switchNextLevel(): String {
+        val index = levels.indexOfFirst { it.id == activeLevelId }.coerceAtLeast(0)
+        activeLevelId = levels[(index + 1) % levels.size].id
+        selectedWallId = null; selectedFurnitureId = null
+        invalidate()
+        return activeLevelName()
+    }
     fun selectedFurniture(): PlanFurniture? = furniture.firstOrNull { it.id == selectedFurnitureId }
 
     fun addFurniture(item: PlanFurniture) {
         rememberUndo()
-        furniture.add(item)
-        selectedFurnitureId = item.id
+        furniture.add(item.copy(levelId = activeLevelId))
+        selectedFurnitureId = furniture.last().id
         selectedWallId = null
         savePlan()
         invalidate()
@@ -280,7 +302,7 @@ class PlanCanvasView(context: Context) : View(context) {
                         drawing = false; invalidate(); return true
                     }
                     selectedFurnitureId = null
-                    val hit = plan.minByOrNull { distanceToSegment(startX, startY, it) }
+                    val hit = plan.filter { it.levelId == activeLevelId }.minByOrNull { distanceToSegment(startX, startY, it) }
                         ?.takeIf { distanceToSegment(startX, startY, it) <= 0.35f }
                     selectedWallId = hit?.id
                     selectionStartX = startX
@@ -337,7 +359,7 @@ class PlanCanvasView(context: Context) : View(context) {
                     }
                 } else if (tool == PlanCanvasTool.WALL && abs(endX - startX) + abs(endY - startY) >= .2f) {
                     rememberUndo()
-                    plan.add(PlanWall(startX, startY, endX, endY))
+                    plan.add(PlanWall(startX, startY, endX, endY, levelId = activeLevelId))
                     rooms.clear()
                     savePlan()
                 }
@@ -369,8 +391,8 @@ class PlanCanvasView(context: Context) : View(context) {
     fun clearPlan(){if(plan.isNotEmpty() || openings.isNotEmpty() || furniture.isNotEmpty())rememberUndo();plan.clear();rooms.clear();openings.clear();furniture.clear();selectedWallId=null;selectedFurnitureId=null;savePlan();invalidate()}
 
     fun detectRooms(): Int {
-        rooms.clear()
-        rooms.addAll(PlanRoomDetector.detectRooms(plan))
+        rooms.removeAll { it.levelId == activeLevelId }
+        rooms.addAll(PlanRoomDetector.detectRooms(plan.filter { it.levelId == activeLevelId }).map { it.copy(levelId = activeLevelId) })
         savePlan()
         invalidate()
         return rooms.size
@@ -391,6 +413,8 @@ class PlanCanvasView(context: Context) : View(context) {
                 .put("x", item.x).put("y", item.y).put("width", item.width).put("depth", item.depth)
                 .put("height", item.height).put("rotation", item.rotationDegrees).put("levelId", item.levelId))
         }
+        val levelArray = JSONArray()
+        levels.forEach { level -> levelArray.put(JSONObject().put("id", level.id).put("name", level.name).put("elevation", level.elevationMetres).put("floorThickness", level.floorThicknessMetres).put("height", level.heightMetres).put("visible", level.visible)) }
         val openingArray = JSONArray()
         openings.forEach { opening ->
             openingArray.put(JSONObject()
@@ -417,6 +441,8 @@ class PlanCanvasView(context: Context) : View(context) {
             .put("rooms", roomArray)
             .put("openings", openingArray)
             .put("furniture", furnitureArray)
+            .put("levels", levelArray)
+            .put("activeLevelId", activeLevelId)
             .toString(2)
     }
 
@@ -432,6 +458,7 @@ class PlanCanvasView(context: Context) : View(context) {
             val loadedRooms = mutableListOf<PlanRoom>()
             val loadedOpenings = mutableListOf<PlanOpening>()
             val loadedFurniture = mutableListOf<PlanFurniture>()
+            val loadedLevels = mutableListOf<PlanLevel>()
             for (i in 0 until walls.length()) {
                 val wall = walls.getJSONObject(i)
                 loadedWalls.add(
@@ -497,7 +524,22 @@ class PlanCanvasView(context: Context) : View(context) {
                     )
                 )
             }
-            PlanProject(walls = loadedWalls, rooms = loadedRooms, openings = loadedOpenings, furniture = loadedFurniture)
+            val savedLevels = root?.optJSONArray("levels") ?: JSONArray()
+            for (i in 0 until savedLevels.length()) {
+                val level = savedLevels.getJSONObject(i)
+                loadedLevels.add(
+                    PlanLevel(
+                        id = level.getString("id"),
+                        name = level.optString("name", "طابق ${i + 1}"),
+                        elevationMetres = level.optDouble("elevation", 0.0).toFloat(),
+                        floorThicknessMetres = level.optDouble("floorThickness", 0.2).toFloat(),
+                        heightMetres = level.optDouble("height", 2.8).toFloat(),
+                        visible = level.optBoolean("visible", true)
+                    )
+                )
+            }
+            if (loadedLevels.isEmpty()) loadedLevels.add(PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "الطابق الأرضي"))
+            PlanProject(walls = loadedWalls, rooms = loadedRooms, openings = loadedOpenings, furniture = loadedFurniture, levels = loadedLevels)
             plan.clear()
             plan.addAll(loadedWalls)
             selectedWallId = null
@@ -507,6 +549,8 @@ class PlanCanvasView(context: Context) : View(context) {
             openings.addAll(loadedOpenings)
             furniture.clear()
             furniture.addAll(loadedFurniture)
+            levels.clear(); levels.addAll(loadedLevels)
+            activeLevelId = root?.optString("activeLevelId", levels.first().id)?.takeIf { id -> levels.any { it.id == id } } ?: levels.first().id
             selectedWallId = null
             selectedFurnitureId = null
             savePlan()
