@@ -27,7 +27,7 @@ The desktop UI/rendering layer is not part of this migration. Swing, Java 3D, AW
 1. Added `PlanGeometry.kt`, an Android-independent metric domain layer with finite-coordinate validation, wall length/thickness/height, wall footprint polygon, room polygon area, level metadata, project validation and project bounds.
 2. Moved `PlanWall` out of the drawing view so the view consumes the domain model rather than owning it.
 3. Upgraded local JSON persistence to schema version 3. It stores wall ID, level ID, thickness and height, and still reads older files by supplying defaults for fields absent from version 2.
-4. Updated the current axonometric preview to use each wall's model height rather than a renderer-wide hard-coded height.
+4. Updated the 2D wall stroke to reflect metric thickness and the axonometric preview to render wall footprints as 3D prisms using each wall's height.\n5. Added JVM unit tests for wall length/footprint, invalid geometry, room polygon area and project-level validation; CI now runs the unit-test task before assembling the APK.
 
 This is a **first native model-port step**, not the complete Sweet Home 3D engine. It does not yet import the upstream Java model classes, create rooms automatically, resolve wall junctions, create doors/windows openings, or generate watertight 3D solids.
 
