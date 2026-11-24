@@ -1,6 +1,7 @@
 package com.loay94an.mokhatiti3d
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import android.graphics.Color
 import android.view.Gravity
@@ -72,8 +73,10 @@ class MainActivity : Activity() {
         tool("تراجع") { workspace.undo(); preview.refresh() }
         tool("غرف") { val count = workspace.detectRooms(); preview.refresh(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
         tool("مسح") { workspace.clearPlan(); preview.refresh() }
-        tool("حفظ") { workspace.savePlan(); Toast.makeText(this, "تم حفظ المخطط على الجهاز", Toast.LENGTH_SHORT).show() }
-        tool("فتح") { workspace.loadPlan(); preview.refresh(); Toast.makeText(this, "تم تحميل المخطط المحفوظ", Toast.LENGTH_SHORT).show() }
+        tool("حفظ") { workspace.savePlan(); Toast.makeText(this, "تم حفظ المشروع محلياً", Toast.LENGTH_SHORT).show() }
+        tool("فتح محلي") { workspace.loadPlan(); preview.refresh(); Toast.makeText(this, "تم تحميل المشروع المحلي", Toast.LENGTH_SHORT).show() }
+        tool("تصدير JSON") { exportProject() }
+        tool("استيراد JSON") { importProject() }
         tool("عرض 3D") { show3d(true) }
         tool("مخطط 2D") { show3d(false) }
         tools.addView(toolRow)
@@ -104,6 +107,54 @@ class MainActivity : Activity() {
         }
         root.addView(footer)
         setContentView(root)
+    }
+
+    private fun exportProject() {
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            putExtra(Intent.EXTRA_TITLE, "Mokhatiti-Project.json")
+        }
+        startActivityForResult(intent, REQUEST_EXPORT)
+    }
+
+    private fun importProject() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+        }
+        startActivityForResult(intent, REQUEST_IMPORT)
+    }
+
+    @Deprecated("Use the document picker result APIs when migrating to ComponentActivity")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        try {
+            when (requestCode) {
+                REQUEST_EXPORT -> {
+                    contentResolver.openOutputStream(uri)?.use { output ->
+                        output.write(workspace.exportPlanJson().toByteArray(Charsets.UTF_8))
+                    } ?: throw IllegalStateException("تعذر فتح الملف للكتابة")
+                    Toast.makeText(this, "تم تصدير ملف المشروع", Toast.LENGTH_SHORT).show()
+                }
+                REQUEST_IMPORT -> {
+                    val json = contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        ?: throw IllegalStateException("تعذر قراءة ملف المشروع")
+                    if (!workspace.importPlanJson(json)) throw IllegalArgumentException("ملف المشروع غير صالح أو غير مدعوم")
+                    preview.refresh()
+                    Toast.makeText(this, "تم استيراد المشروع بنجاح", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } catch (error: Exception) {
+            Toast.makeText(this, error.message ?: "تعذر تنفيذ العملية", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    companion object {
+        private const val REQUEST_EXPORT = 4101
+        private const val REQUEST_IMPORT = 4102
     }
 
     override fun onResume() { super.onResume(); if (::preview.isInitialized) preview.onResume() }
