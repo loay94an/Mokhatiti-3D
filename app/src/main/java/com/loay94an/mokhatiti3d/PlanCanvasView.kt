@@ -87,10 +87,10 @@ class PlanCanvasView(context: Context) : View(context) {
         plan.forEach { wall ->
             val x1=screenX(wall.x1); val y1=screenY(wall.y1); val x2=screenX(wall.x2); val y2=screenY(wall.y2)
             wallPaint.strokeWidth = (wall.thickness * pixelsPerMetre).coerceAtLeast(2f)
-            canvas.drawLine(x1,y1,x2,y2,wallPaint)
+            drawWallSegments(canvas, wall, wallPaint)
             if (wall.id == selectedWallId) {
                 selectedPaint.strokeWidth = wallPaint.strokeWidth + 8f
-                canvas.drawLine(x1,y1,x2,y2,selectedPaint)
+                drawWallSegments(canvas, wall, selectedPaint)
             }
             canvas.drawText(String.format("%.2f م",wall.lengthMetres),(x1+x2)/2f+8f,(y1+y2)/2f-10f,measurePaint)
         }
@@ -98,6 +98,30 @@ class PlanCanvasView(context: Context) : View(context) {
             canvas.drawLine(screenX(startX),screenY(startY),screenX(endX),screenY(endY),previewPaint)
             val len=kotlin.math.sqrt((endX-startX)*(endX-startX)+(endY-startY)*(endY-startY))
             canvas.drawText(String.format("%.2f م",len),screenX(endX)+12f,screenY(endY)-12f,measurePaint)
+        }
+    }
+
+    private fun drawWallSegments(canvas: Canvas, wall: PlanWall, paint: Paint) {
+        val length = wall.lengthMetres
+        val dx = (wall.x2 - wall.x1) / length
+        val dy = (wall.y2 - wall.y1) / length
+        var cursor = 0f
+        openings.filter { it.wallId == wall.id }.sortedBy { it.offsetMetres }.forEach { opening ->
+            val gapStart = opening.offsetMetres.coerceIn(0f, length)
+            val gapEnd = (opening.offsetMetres + opening.widthMetres).coerceIn(0f, length)
+            if (gapStart > cursor) {
+                canvas.drawLine(
+                    screenX(wall.x1 + dx * cursor), screenY(wall.y1 + dy * cursor),
+                    screenX(wall.x1 + dx * gapStart), screenY(wall.y1 + dy * gapStart), paint
+                )
+            }
+            cursor = maxOf(cursor, gapEnd)
+        }
+        if (cursor < length) {
+            canvas.drawLine(
+                screenX(wall.x1 + dx * cursor), screenY(wall.y1 + dy * cursor),
+                screenX(wall.x2), screenY(wall.y2), paint
+            )
         }
     }
 
