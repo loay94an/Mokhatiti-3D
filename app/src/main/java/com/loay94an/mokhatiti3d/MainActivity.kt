@@ -69,7 +69,7 @@ class MainActivity : Activity() {
         tool("جدار") { workspace.setTool(PlanCanvasTool.WALL); hint.text = "اسحب لرسم جدار جديد" }
         tool("تحديد وتحريك") { workspace.setTool(PlanCanvasTool.SELECT); hint.text = "المس الجدار لتحديده ثم اسحبه لتحريكه" }
         tool("حذف عنصر") { workspace.setTool(PlanCanvasTool.ERASE); hint.text = "المس الجدار الذي تريد حذفه" }
-        tool("تراجع") { workspace.undo(); preview.invalidate() }
+        tool("تراجع") { workspace.undo(); preview.refresh() }
         tool("غرف") { val count = workspace.detectRooms(); preview.invalidate(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
         tool("مسح") { workspace.clearPlan(); preview.invalidate() }
         tool("حفظ") { workspace.savePlan(); Toast.makeText(this, "تم حفظ المخطط على الجهاز", Toast.LENGTH_SHORT).show() }
@@ -105,6 +105,10 @@ class MainActivity : Activity() {
         root.addView(footer)
         setContentView(root)
     }
+
+    override fun onResume() { super.onResume(); if (::preview.isInitialized) preview.onResume() }
+
+    override fun onPause() { if (::preview.isInitialized) preview.onPause(); super.onPause() }
 
     private fun show3d(show: Boolean) {
         workspace.visibility = if (show) View.GONE else View.VISIBLE
