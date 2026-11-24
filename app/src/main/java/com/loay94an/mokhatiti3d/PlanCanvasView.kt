@@ -336,7 +336,7 @@ class PlanCanvasView(context: Context) : View(context) {
         }
         return JSONObject()
             .put("format", "mokhatiti-native")
-            .put("version", 3)
+            .put("version", 4)
             .put("unit", "metre")
             .put("walls", walls)
             .put("rooms", roomArray)
