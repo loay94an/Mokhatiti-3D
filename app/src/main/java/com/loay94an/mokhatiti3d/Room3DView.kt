@@ -32,7 +32,7 @@ class Room3DView(context: Context, private val walls: List<PlanWall>) : View(con
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         canvas.drawColor(Color.rgb(244,248,252))
-        canvas.drawText("المعاينة المجسمة — ارتفاع الجدار 2.8 م", 22f, 38f, caption)
+        canvas.drawText("المعاينة المجسمة — نموذج الجدران", 22f, 38f, caption)
         if(walls.isEmpty()) {
             canvas.drawText("أضف الجدران من وضع المخطط 2D لعرض المجسم",22f,height-30f,caption)
             return
@@ -52,12 +52,17 @@ class Room3DView(context: Context, private val walls: List<PlanWall>) : View(con
         )
         polygon(canvas,floor,Color.rgb(224,232,239))
         walls.forEach { w ->
-            val a=project(w.x1,w.y1,0f,cx,cy,scale)
-            val b=project(w.x2,w.y2,0f,cx,cy,scale)
-            val at=project(w.x1,w.y1,w.height,cx,cy,scale)
-            val bt=project(w.x2,w.y2,w.height,cx,cy,scale)
-            polygon(canvas,listOf(a,b,bt,at),Color.rgb(190,211,226))
+            val footprint = w.footprint()
+            val base = footprint.map { project(it.x, it.y, 0f, cx, cy, scale) }
+            val top = footprint.map { project(it.x, it.y, w.height, cx, cy, scale) }
+            footprint.indices.forEach { index ->
+                val next = (index + 1) % footprint.size
+                polygon(canvas, listOf(base[index], base[next], top[next], top[index]),
+                    if (index % 2 == 0) Color.rgb(190,211,226) else Color.rgb(174,198,216))
+            }
+            polygon(canvas, top, Color.rgb(211,225,237))
         }
-        canvas.drawText("الجدران: ${walls.size}  •  الارتفاع: 2.8 م",22f,height-26f,caption)
+        val maxHeight = walls.maxOf { it.height }
+        canvas.drawText("الجدران: ${walls.size}  •  أقصى ارتفاع: ${"%.2f".format(maxHeight)} م",22f,height-26f,caption)
     }
 }
