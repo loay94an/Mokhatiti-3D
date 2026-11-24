@@ -50,6 +50,7 @@ class PlanCanvasView(context: Context) : View(context) {
         canvas.drawText("الشبكة 10 سم  •  المقياس " + pixelsPerMetre.toInt() + " px/م", 22f, 64f, textPaint)
         plan.forEach { wall ->
             val x1=screenX(wall.x1); val y1=screenY(wall.y1); val x2=screenX(wall.x2); val y2=screenY(wall.y2)
+            wallPaint.strokeWidth = (wall.thickness * pixelsPerMetre).coerceAtLeast(2f)
             canvas.drawLine(x1,y1,x2,y2,wallPaint)
             canvas.drawText(String.format("%.2f م",wall.lengthMetres),(x1+x2)/2f+8f,(y1+y2)/2f-10f,measurePaint)
         }
