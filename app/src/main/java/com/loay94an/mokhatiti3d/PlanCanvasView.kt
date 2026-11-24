@@ -47,6 +47,7 @@ class PlanCanvasView(context: Context) : View(context) {
         }
     })
 
+    private val roomPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(42, 22, 163, 148); style = Paint.Style.FILL }
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(226,233,241); strokeWidth = 1f }
     private val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(193,205,219); strokeWidth = 2f }
     private val wallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(25,48,75); strokeWidth = 10f; strokeCap = Paint.Cap.ROUND }
@@ -82,6 +83,19 @@ class PlanCanvasView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         drawGrid(canvas)
+        rooms.forEach { room ->
+            if (room.boundary.size >= 3) {
+                val path = android.graphics.Path().apply {
+                    moveTo(screenX(room.boundary[0].x), screenY(room.boundary[0].y))
+                    room.boundary.drop(1).forEach { lineTo(screenX(it.x), screenY(it.y)) }
+                    close()
+                }
+                canvas.drawPath(path, roomPaint)
+                val centerX = room.boundary.map { it.x }.average().toFloat()
+                val centerY = room.boundary.map { it.y }.average().toFloat()
+                canvas.drawText(room.name + " • " + String.format("%.1f م²", room.areaSquareMetres), screenX(centerX), screenY(centerY), measurePaint)
+            }
+        }
         canvas.drawText("مخطط ثنائي الأبعاد", 22f, 34f, textPaint)
         canvas.drawText("الشبكة 10 سم  •  المقياس " + pixelsPerMetre.toInt() + " px/م", 22f, 64f, textPaint)
         plan.forEach { wall ->
