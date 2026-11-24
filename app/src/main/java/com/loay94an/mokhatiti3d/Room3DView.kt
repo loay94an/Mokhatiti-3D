@@ -16,8 +16,8 @@ import kotlin.math.max
 import kotlin.math.sin
 
 /** Native interactive OpenGL ES 2.0 renderer; no WebView, Canvas projection or Java 3D. */
-class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, private val sourceRooms: List<PlanRoom>) : GLSurfaceView(context) {
-    private val sceneRenderer = PlanGlRenderer(sourceWalls, sourceRooms)
+class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, private val sourceRooms: List<PlanRoom>, private val sourceOpenings: List<PlanOpening>) : GLSurfaceView(context) {
+    private val sceneRenderer = PlanGlRenderer(sourceWalls, sourceRooms, sourceOpenings)
     private var yaw = -0.72f
     private var pitch = 0.58f
     private var distance = 12f
@@ -44,6 +44,7 @@ class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, priv
     fun refresh() {
         val wallSnapshot = sourceWalls.toList()
         val roomSnapshot = sourceRooms.toList()
+        val openingSnapshot = sourceOpenings.toList()
         if (!cameraTouched) {
             val points = wallSnapshot.flatMap { listOf(it.start, it.end) } + roomSnapshot.flatMap { it.boundary }
             if (points.isNotEmpty()) {
@@ -52,7 +53,7 @@ class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, priv
             }
         }
         sceneRenderer.setCamera(yaw, pitch, distance)
-        queueEvent { sceneRenderer.updateScene(wallSnapshot, roomSnapshot) }
+        queueEvent { sceneRenderer.updateScene(wallSnapshot, roomSnapshot, openingSnapshot) }
         requestRender()
     }
 
@@ -77,11 +78,12 @@ class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, priv
     override fun performClick(): Boolean { super.performClick(); return true }
 }
 
-private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>) : GLSurfaceView.Renderer {
+private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>, openings: List<PlanOpening>) : GLSurfaceView.Renderer {
     @Volatile var currentWalls: List<PlanWall> = walls.toList()
         private set
     @Volatile var currentRooms: List<PlanRoom> = rooms.toList()
         private set
+    @Volatile private var currentOpenings: List<PlanOpening> = openings.toList()
     @Volatile private var cameraYaw = -0.72f
     @Volatile private var cameraPitch = 0.58f
     @Volatile private var cameraDistance = 12f
@@ -97,8 +99,8 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>) : GLS
 
     fun setCamera(yaw: Float, pitch: Float, distance: Float) { cameraYaw=yaw; cameraPitch=pitch; cameraDistance=distance }
 
-    fun updateScene(walls: List<PlanWall>, rooms: List<PlanRoom>) {
-        currentWalls = walls.toList(); currentRooms = rooms.toList()
+    fun updateScene(walls: List<PlanWall>, rooms: List<PlanRoom>, openings: List<PlanOpening>) {
+        currentWalls = walls.toList(); currentRooms = rooms.toList(); currentOpenings = openings.toList()
         if (program != 0) rebuildMesh()
     }
 
@@ -169,10 +171,55 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>) : GLS
                 )
             }
         }
-        currentWalls.forEachIndexed{index,wall->
-            val footprint=wall.footprint();val bottom=footprint.map{floatArrayOf(it.x,it.y,0f)};val top=footprint.map{floatArrayOf(it.x,it.y,wall.height)}
-            val color=when(index%3){0->floatArrayOf(0.69f,0.78f,0.86f);1->floatArrayOf(0.58f,0.69f,0.79f);else->floatArrayOf(0.78f,0.84f,0.89f)}
-            for(i in 0..3){val n=(i+1)%4;quad(bottom[i],bottom[n],top[n],top[i],color)}
+        currentWalls.forEachIndexed { index, wall ->
+            val length = wall.lengthMetres
+            val ux = (wall.x2 - wall.x1) / length
+            val uy = (wall.y2 - wall.y1) / length
+            val nx = -uy
+            val ny = ux
+            val wallOpenings = currentOpenings.filter { it.wallId == wall.id }
+            val tCuts = (listOf(0f, length) + wallOpenings.flatMap { listOf(it.offsetMetres, it.offsetMetres + it.widthMetres) })
+                .map { it.coerceIn(0f, length) }.distinct().sorted()
+            val zCuts = (listOf(0f, wall.height) + wallOpenings.flatMap { listOf(it.sillHeightMetres, it.sillHeightMetres + it.heightMetres) })
+                .map { it.coerceIn(0f, wall.height) }.distinct().sorted()
+            val color = when(index % 3) {
+                0 -> floatArrayOf(0.69f,0.78f,0.86f)
+                1 -> floatArrayOf(0.58f,0.69f,0.79f)
+                else -> floatArrayOf(0.78f,0.84f,0.89f)
+            }
+            fun point(t: Float, side: Float, z: Float) = floatArrayOf(
+                wall.x1 + ux * t + nx * side,
+                wall.y1 + uy * t + ny * side,
+                z
+            )
+            for (side in listOf(-wall.thickness / 2f, wall.thickness / 2f)) {
+                for (ti in 0 until tCuts.lastIndex) {
+                    val t0 = tCuts[ti]; val t1 = tCuts[ti + 1]; val tm = (t0 + t1) / 2f
+                    for (zi in 0 until zCuts.lastIndex) {
+                        val z0 = zCuts[zi]; val z1 = zCuts[zi + 1]; val zm = (z0 + z1) / 2f
+                        val insideOpening = wallOpenings.any {
+                            tm > it.offsetMetres && tm < it.offsetMetres + it.widthMetres &&
+                                zm > it.sillHeightMetres && zm < it.sillHeightMetres + it.heightMetres
+                        }
+                        if (!insideOpening) quad(point(t0,side,z0),point(t1,side,z0),point(t1,side,z1),point(t0,side,z1),color)
+                    }
+                }
+            }
+            val revealColor = floatArrayOf(0.42f,0.52f,0.62f)
+            wallOpenings.forEach { opening ->
+                val a = opening.offsetMetres.coerceIn(0f,length)
+                val b = (opening.offsetMetres + opening.widthMetres).coerceIn(0f,length)
+                val bottom = opening.sillHeightMetres
+                val top = (opening.sillHeightMetres + opening.heightMetres).coerceIn(0f,wall.height)
+                val negative = -wall.thickness / 2f
+                val positive = wall.thickness / 2f
+                quad(point(a,negative,bottom),point(a,positive,bottom),point(a,positive,top),point(a,negative,top),revealColor)
+                quad(point(b,positive,bottom),point(b,negative,bottom),point(b,negative,top),point(b,positive,top),revealColor)
+                quad(point(a,negative,top),point(b,negative,top),point(b,positive,top),point(a,positive,top),revealColor)
+                if (bottom > 0f) quad(point(a,positive,bottom),point(b,positive,bottom),point(b,negative,bottom),point(a,negative,bottom),revealColor)
+            }
+            val footprint = wall.footprint()
+            val top = footprint.map { floatArrayOf(it.x,it.y,wall.height) }
             quad(top[0],top[1],top[2],top[3],floatArrayOf(0.82f,0.87f,0.92f))
         }
         val floats=FloatArray(data.size){data[it]};vertexCount=floats.size/7
