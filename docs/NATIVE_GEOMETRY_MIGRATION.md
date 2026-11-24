@@ -63,7 +63,7 @@ This is a **first native model-port step**, not the complete Sweet Home 3D engin
 - Add furniture/model catalog loading and material editing.
 
 ### E. Verification
-- Unit tests for geometry, room area, intersections, invalid coordinates and project validation.
+- Unit tests for geometry, room area, room-face extraction, concave polygon triangulation, invalid coordinates and project validation.
 - Compatibility tests loading schema v2 projects and saving/reopening schema v3.
 - Instrumented tests on phone and tablet profiles; verify touch, rotation, memory and large plans.
 - Do not label the APK complete until these tests and all advertised tools pass.
