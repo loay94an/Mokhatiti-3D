@@ -29,7 +29,7 @@ The desktop UI/rendering layer is not part of this migration. Swing, Java 3D, AW
 3. Upgraded local JSON persistence to schema version 3. It stores wall ID, level ID, thickness and height, and still reads older files by supplying defaults for fields absent from version 2.
 4. Updated the 2D wall stroke to reflect metric thickness and the axonometric preview to render wall footprints as 3D prisms using each wall's height.\n5. Added JVM unit tests for wall length/footprint, invalid geometry, room polygon area and project-level validation; CI now runs the unit-test task before assembling the APK.
 
-This is a **first native model-port step**, not the complete Sweet Home 3D engine. It does not yet import the upstream Java model classes, create rooms automatically, resolve wall junctions, create doors/windows openings, or generate watertight 3D solids.
+This is a **first native model-port step**, not the complete Sweet Home 3D engine. It does not yet import the upstream Java model classes, implement robust curved walls or full wall-junction cleanup, create door/window openings, load furniture models, or provide a complete professional CAD/BIM-grade 3D scene and project manager.
 
 ## Required next stages
 
