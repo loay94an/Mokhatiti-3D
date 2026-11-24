@@ -116,9 +116,20 @@ class PlanCanvasView(context: Context) : View(context) {
             val root=JSONObject(raw)
             val walls=if(root.has("walls"))root.getJSONArray("walls") else JSONArray(raw)
             plan.clear()
-            for(i in 0 until walls.length()){
-                val w=walls.getJSONObject(i)
-                plan.add(PlanWall(\n                    w.getDouble("x1").toFloat(), w.getDouble("y1").toFloat(),\n                    w.getDouble("x2").toFloat(), w.getDouble("y2").toFloat(),\n                    w.optDouble("thickness", PlanWall.DEFAULT_WALL_THICKNESS_METRES.toDouble()).toFloat(),\n                    w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),\n                    w.optString("id", java.util.UUID.randomUUID().toString()),\n                    w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)\n                ))
+            for (i in 0 until walls.length()) {
+                val w = walls.getJSONObject(i)
+                plan.add(
+                    PlanWall(
+                        w.getDouble("x1").toFloat(),
+                        w.getDouble("y1").toFloat(),
+                        w.getDouble("x2").toFloat(),
+                        w.getDouble("y2").toFloat(),
+                        w.optDouble("thickness", PlanWall.DEFAULT_WALL_THICKNESS_METRES.toDouble()).toFloat(),
+                        w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),
+                        w.optString("id", java.util.UUID.randomUUID().toString()),
+                        w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
+                    )
+                )
             }
             invalidate()
         } catch (_:Exception) { /* preserve editor availability if local data is invalid */ }
