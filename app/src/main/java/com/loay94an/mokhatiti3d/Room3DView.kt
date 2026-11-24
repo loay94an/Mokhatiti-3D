@@ -13,7 +13,7 @@ import kotlin.math.min
  * Lightweight native axonometric renderer for the metric wall model.
  * Each plan segment is projected as a vertical wall prism, not a decorative placeholder.
  */
-class Room3DView(context: Context, private val walls: List<PlanWall>) : View(context) {
+class Room3DView(context: Context, private val walls: List<PlanWall>, private val rooms: List<PlanRoom>) : View(context) {
     private val face = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2.2f; color = Color.rgb(55,72,92) }
     private val caption = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(65,82,102); textSize = 25f }
@@ -36,8 +36,9 @@ class Room3DView(context: Context, private val walls: List<PlanWall>) : View(con
             canvas.drawText("أضف الجدران من وضع المخطط 2D لعرض المجسم",22f,height-30f,caption)
             return
         }
-        val minX=walls.minOf { min(it.x1,it.x2) }; val maxX=walls.maxOf { max(it.x1,it.x2) }
-        val minY=walls.minOf { min(it.y1,it.y2) }; val maxY=walls.maxOf { max(it.y1,it.y2) }
+        val allPoints = walls.flatMap { listOf(it.start, it.end) } + rooms.flatMap { it.boundary }
+        val minX=allPoints.minOf { it.x }; val maxX=allPoints.maxOf { it.x }
+        val minY=allPoints.minOf { it.y }; val maxY=allPoints.maxOf { it.y }
         val span=max(2f,max(maxX-minX,maxY-minY))
         val scale=min(width*.34f/span,height*.48f/span).coerceAtLeast(12f)
         val cx=width*.5f
@@ -50,6 +51,14 @@ class Room3DView(context: Context, private val walls: List<PlanWall>) : View(con
             project(minX-pad,maxY+pad,0f,cx,cy,scale)
         )
         polygon(canvas,floor,Color.rgb(224,232,239))
+        rooms.forEach { room ->
+            val roomFloor = room.boundary.map { project(it.x, it.y, 0.015f, cx, cy, scale) }
+            polygon(canvas, roomFloor, Color.rgb(205,226,218))
+            val centerX = room.boundary.map { it.x }.average().toFloat()
+            val centerY = room.boundary.map { it.y }.average().toFloat()
+            val label = project(centerX, centerY, 0.03f, cx, cy, scale)
+            canvas.drawText(room.name + " • " + String.format("%.1f م²", room.areaSquareMetres), label.first, label.second, caption)
+        }
         walls.forEach { w ->
             val footprint = w.footprint()
             val base = footprint.map { project(it.x, it.y, 0f, cx, cy, scale) }
@@ -62,6 +71,6 @@ class Room3DView(context: Context, private val walls: List<PlanWall>) : View(con
             polygon(canvas, top, Color.rgb(211,225,237))
         }
         val maxHeight = walls.maxOf { it.height }
-        canvas.drawText("الجدران: ${walls.size}  •  أقصى ارتفاع: ${"%.2f".format(maxHeight)} م",22f,height-26f,caption)
+        canvas.drawText("الجدران: ${walls.size}  •  الغرف: ${rooms.size}  •  أقصى ارتفاع: ${"%.2f".format(maxHeight)} م",22f,height-26f,caption)
     }
 }
