@@ -202,7 +202,8 @@ data class PlanProject(
             val wall = wallById[opening.wallId] ?: return@all false
             opening.offsetMetres + opening.widthMetres <= wall.lengthMetres + 0.0001f &&
                 opening.sillHeightMetres + opening.heightMetres <= wall.height + 0.0001f
-        }) { "Every opening must fit inside its host wall" }        require(openings.groupBy { it.wallId }.values.all { wallOpenings ->
+        }) { "Every opening must fit inside its host wall" }
+        require(openings.groupBy { it.wallId }.values.all { wallOpenings ->
             val ordered = wallOpenings.sortedBy { it.offsetMetres }
             ordered.zipWithNext().all { (left, right) ->
                 left.offsetMetres + left.widthMetres <= right.offsetMetres + 0.0001f
