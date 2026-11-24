@@ -16,8 +16,8 @@ import kotlin.math.max
 import kotlin.math.sin
 
 /** Native interactive OpenGL ES 2.0 renderer; no WebView, Canvas projection or Java 3D. */
-class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, private val sourceRooms: List<PlanRoom>, private val sourceOpenings: List<PlanOpening>, private val sourceFurniture: List<PlanFurniture>) : GLSurfaceView(context) {
-    private val sceneRenderer = PlanGlRenderer(sourceWalls, sourceRooms, sourceOpenings, sourceFurniture)
+class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, private val sourceRooms: List<PlanRoom>, private val sourceOpenings: List<PlanOpening>, private val sourceFurniture: List<PlanFurniture>, private val sourceLevels: List<PlanLevel>) : GLSurfaceView(context) {
+    private val sceneRenderer = PlanGlRenderer(sourceWalls, sourceRooms, sourceOpenings, sourceFurniture, sourceLevels)
     private var yaw = -0.72f
     private var pitch = 0.58f
     private var distance = 12f
@@ -46,6 +46,7 @@ class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, priv
         val roomSnapshot = sourceRooms.toList()
         val openingSnapshot = sourceOpenings.toList()
         val furnitureSnapshot = sourceFurniture.toList()
+        val levelSnapshot = sourceLevels.toList()
         if (!cameraTouched) {
             val points = wallSnapshot.flatMap { listOf(it.start, it.end) } + roomSnapshot.flatMap { it.boundary } + furnitureSnapshot.flatMap { it.footprint() }
             if (points.isNotEmpty()) {
@@ -54,7 +55,7 @@ class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, priv
             }
         }
         sceneRenderer.setCamera(yaw, pitch, distance)
-        queueEvent { sceneRenderer.updateScene(wallSnapshot, roomSnapshot, openingSnapshot, furnitureSnapshot) }
+        queueEvent { sceneRenderer.updateScene(wallSnapshot, roomSnapshot, openingSnapshot, furnitureSnapshot, levelSnapshot) }
         requestRender()
     }
 
@@ -79,13 +80,14 @@ class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, priv
     override fun performClick(): Boolean { super.performClick(); return true }
 }
 
-private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>, openings: List<PlanOpening>, furniture: List<PlanFurniture>) : GLSurfaceView.Renderer {
+private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>, openings: List<PlanOpening>, furniture: List<PlanFurniture>, levels: List<PlanLevel>) : GLSurfaceView.Renderer {
     @Volatile var currentWalls: List<PlanWall> = walls.toList()
         private set
     @Volatile var currentRooms: List<PlanRoom> = rooms.toList()
         private set
     @Volatile private var currentOpenings: List<PlanOpening> = openings.toList()
     @Volatile private var currentFurniture: List<PlanFurniture> = furniture.toList()
+    @Volatile private var currentLevels: List<PlanLevel> = levels.toList()
     @Volatile private var cameraYaw = -0.72f
     @Volatile private var cameraPitch = 0.58f
     @Volatile private var cameraDistance = 12f
@@ -101,8 +103,8 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>, openi
 
     fun setCamera(yaw: Float, pitch: Float, distance: Float) { cameraYaw=yaw; cameraPitch=pitch; cameraDistance=distance }
 
-    fun updateScene(walls: List<PlanWall>, rooms: List<PlanRoom>, openings: List<PlanOpening>, furniture: List<PlanFurniture>) {
-        currentWalls = walls.toList(); currentRooms = rooms.toList(); currentOpenings = openings.toList(); currentFurniture = furniture.toList()
+    fun updateScene(walls: List<PlanWall>, rooms: List<PlanRoom>, openings: List<PlanOpening>, furniture: List<PlanFurniture>, levels: List<PlanLevel>) {
+        currentWalls = walls.toList(); currentRooms = rooms.toList(); currentOpenings = openings.toList(); currentFurniture = furniture.toList(); currentLevels = levels.toList()
         if (program != 0) rebuildMesh()
     }
 
@@ -156,27 +158,38 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>, openi
         fun vertex(x:Float,y:Float,z:Float,c:FloatArray){ data.add(x);data.add(y);data.add(z);data.add(c[0]);data.add(c[1]);data.add(c[2]);data.add(1f) }
         fun triangle(a:FloatArray,b:FloatArray,c:FloatArray,color:FloatArray){vertex(a[0],a[1],a[2],color);vertex(b[0],b[1],b[2],color);vertex(c[0],c[1],c[2],color)}
         fun quad(a:FloatArray,b:FloatArray,c:FloatArray,d:FloatArray,color:FloatArray){triangle(a,b,c,color);triangle(a,c,d,color)}
-        val all=currentWalls.flatMap{listOf(it.start,it.end)}+currentRooms.flatMap{it.boundary}+currentFurniture.flatMap{it.footprint()}
-        if(all.isEmpty()){vertexBuffer=null;vertexCount=0;return}
-        val minX=all.minOf{it.x};val maxX=all.maxOf{it.x};val minY=all.minOf{it.y};val maxY=all.maxOf{it.y}
-        centerX=(minX+maxX)/2f;centerY=(minY+maxY)/2f;centerZ=(currentWalls.maxOfOrNull{it.height}?:2.8f)/2f
-        val ground=floatArrayOf(0.78f,0.82f,0.86f);val roomColor=floatArrayOf(0.64f,0.79f,0.71f)
-        val groundZ=0f
-        quad(floatArrayOf(minX-0.5f,minY-0.5f,groundZ),floatArrayOf(maxX+0.5f,minY-0.5f,groundZ),floatArrayOf(maxX+0.5f,maxY+0.5f,groundZ),floatArrayOf(minX-0.5f,maxY+0.5f,groundZ),ground)
-        currentRooms.forEach { room ->
+        val visibleLevels = currentLevels.filter { it.visible }
+        val levelById = visibleLevels.associateBy { it.id }
+        val visibleWalls = currentWalls.filter { it.levelId in levelById }
+        val visibleRooms = currentRooms.filter { it.levelId in levelById }
+        val visibleFurniture = currentFurniture.filter { it.levelId in levelById }
+        val all = visibleWalls.flatMap { listOf(it.start,it.end) } + visibleRooms.flatMap { it.boundary } + visibleFurniture.flatMap { it.footprint() }
+        if (all.isEmpty()) { vertexBuffer=null; vertexCount=0; return }
+        val minX=all.minOf{it.x}; val maxX=all.maxOf{it.x}; val minY=all.minOf{it.y}; val maxY=all.maxOf{it.y}
+        val minElevation = visibleLevels.minOfOrNull { it.elevationMetres } ?: 0f
+        val maxElevation = visibleLevels.maxOfOrNull { level -> level.elevationMetres + level.heightMetres } ?: 2.8f
+        centerX=(minX+maxX)/2f; centerY=(minY+maxY)/2f; centerZ=(minElevation+maxElevation)/2f
+        val ground=floatArrayOf(0.78f,0.82f,0.86f); val roomColor=floatArrayOf(0.64f,0.79f,0.71f)
+        visibleLevels.forEachIndexed { index, level ->
+            val z = level.elevationMetres
+            quad(floatArrayOf(minX-0.5f,minY-0.5f,z),floatArrayOf(maxX+0.5f,minY-0.5f,z),floatArrayOf(maxX+0.5f,maxY+0.5f,z),floatArrayOf(minX-0.5f,maxY+0.5f,z),if(index%2==0) ground else floatArrayOf(0.82f,0.85f,0.88f))
+        }
+        visibleRooms.forEach { room ->
+            val elevation = levelById[room.levelId]?.elevationMetres ?: 0f
             PlanPolygonTriangulator.triangulate(room.boundary).forEach { tri ->
                 triangle(
-                    floatArrayOf(tri.first.x, tri.first.y, 0.012f),
-                    floatArrayOf(tri.second.x, tri.second.y, 0.012f),
-                    floatArrayOf(tri.third.x, tri.third.y, 0.012f),
+                    floatArrayOf(tri.first.x, tri.first.y, elevation + 0.012f),
+                    floatArrayOf(tri.second.x, tri.second.y, elevation + 0.012f),
+                    floatArrayOf(tri.third.x, tri.third.y, elevation + 0.012f),
                     roomColor
                 )
             }
         }
-        currentFurniture.forEachIndexed { index, item ->
+        visibleFurniture.forEachIndexed { index, item ->
+            val elevation = levelById[item.levelId]?.elevationMetres ?: 0f
             val footprint = item.footprint()
-            val bottom = footprint.map { floatArrayOf(it.x, it.y, 0f) }
-            val top = footprint.map { floatArrayOf(it.x, it.y, item.height) }
+            val bottom = footprint.map { floatArrayOf(it.x, it.y, elevation) }
+            val top = footprint.map { floatArrayOf(it.x, it.y, elevation + item.height) }
             val color = when (item.category) {
                 "جلوس" -> floatArrayOf(0.72f,0.55f,0.42f)
                 "نوم" -> floatArrayOf(0.72f,0.68f,0.82f)
@@ -189,7 +202,8 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>, openi
             }
             quad(top[0],top[1],top[2],top[3],floatArrayOf(0.84f,0.79f,0.70f))
         }
-        currentWalls.forEachIndexed { index, wall ->
+        visibleWalls.forEachIndexed { index, wall ->
+            val elevation = levelById[wall.levelId]?.elevationMetres ?: 0f
             val length = wall.lengthMetres
             val ux = (wall.x2 - wall.x1) / length
             val uy = (wall.y2 - wall.y1) / length
@@ -208,7 +222,7 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>, openi
             fun point(t: Float, side: Float, z: Float) = floatArrayOf(
                 wall.x1 + ux * t + nx * side,
                 wall.y1 + uy * t + ny * side,
-                z
+                elevation + z
             )
             for (side in listOf(-wall.thickness / 2f, wall.thickness / 2f)) {
                 for (ti in 0 until tCuts.lastIndex) {
@@ -237,7 +251,7 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>, openi
                 if (bottom > 0f) quad(point(a,positive,bottom),point(b,positive,bottom),point(b,negative,bottom),point(a,negative,bottom),revealColor)
             }
             val footprint = wall.footprint()
-            val top = footprint.map { floatArrayOf(it.x,it.y,wall.height) }
+            val top = footprint.map { floatArrayOf(it.x,it.y,elevation + wall.height) }
             quad(top[0],top[1],top[2],top[3],floatArrayOf(0.82f,0.87f,0.92f))
         }
         val floats=FloatArray(data.size){data[it]};vertexCount=floats.size/7
