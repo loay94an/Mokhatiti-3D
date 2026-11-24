@@ -86,4 +86,14 @@ class PlanGeometryTest {
         val item = PlanFurniture(name = "كرسي", category = "جلوس", x = 0f, y = 0f, width = 0.5f, depth = 0.5f, height = 0.9f, levelId = "missing")
         assertThrows(IllegalArgumentException::class.java) { PlanProject(furniture = listOf(item)) }
     }
+    @Test
+    fun validatesWallsAndFurnitureAcrossMultipleLevels() {
+        val ground = PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "الأرضي", elevationMetres = 0f)
+        val upper = PlanLevel("level-upper", "الأول", elevationMetres = 3f)
+        val upperWall = PlanWall(0f, 0f, 4f, 0f, levelId = upper.id)
+        val chair = PlanFurniture(name = "كرسي", category = "جلوس", x = 1f, y = 1f, width = 0.5f, depth = 0.5f, height = 0.9f, levelId = upper.id)
+        val project = PlanProject(walls = listOf(upperWall), furniture = listOf(chair), levels = listOf(ground, upper))
+        assertEquals(2, project.levels.size)
+        assertEquals(upper.id, project.walls.single().levelId)
+    }
 }
