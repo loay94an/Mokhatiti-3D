@@ -45,23 +45,22 @@ This is a **first native model-port step**, not the complete Sweet Home 3D engin
 - Record the exact license for every copied/adapted class and catalog asset.
 
 ### B. Native architectural model
-- Add connected wall graph and stable endpoint/junction identities.
-- Add robust wall joins, intersections, wall thickness footprints and curved-wall representation.
-- Derive closed room polygons from wall topology; handle gaps, overlaps and self-intersections.
-- Add doors/windows as wall-hosted openings, not free-standing decorative objects.
+- Replace the current endpoint graph with persistent junction identities and robust wall joins/intersections, including curved walls and overlap/self-intersection repair.
+- Improve room boundary generation for complex and concave plans, disconnected segments and wall thickness offsets.
+- Add doors/windows as wall-hosted openings with real mesh cut-outs and reveals.
 - Add furniture transforms, elevation, dimensions, levels and material references.
-- Use a versioned, documented project format with migration tests.
+- Extend project schema for full level metadata, openings, furniture and materials with migration tests.
 
 ### C. Native 2D editor
-- Selection, move, resize, rotate, delete, multi-select and undo/redo commands.
-- Snap-to-grid, endpoint/midpoint/orthogonal snapping, dimensions and precise numeric entry.
-- Gesture arbitration for pan, zoom, drawing and selection on phones and tablets.
+- Add resize, rotate, multi-select, grouping and full undo/redo command history.
+- Add midpoint/perpendicular/parallel snapping, dimension lines, guides and precise numeric coordinate entry.
+- Add wall alignment and join editing, keyboard/pen input, and configurable touch gesture arbitration.
 
 ### D. Native 3D engine
-- Generate floor and wall meshes from the same model graph used by 2D.
-- Cut actual door/window openings; generate reveals and wall caps.
-- Add camera orbit/pan/zoom, lighting, materials and furniture model loading.
-- Evaluate Android-supported rendering technology separately; do not pull in Java 3D or a WebView as a shortcut.
+- Improve mesh topology, face normals, lighting/shadows and physically based materials.
+- Cut actual door/window openings; generate reveals, wall caps, ceilings, stairs and roof geometry.
+- Add camera pan, orthographic views, section/cutaway modes, picking and object manipulation.
+- Add furniture/model catalog loading and material editing.
 
 ### E. Verification
 - Unit tests for geometry, room area, intersections, invalid coordinates and project validation.
