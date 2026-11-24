@@ -19,13 +19,15 @@ enum class PlanCanvasTool { WALL, SELECT, ERASE }
 class PlanCanvasView(context: Context) : View(context) {
     val plan = mutableListOf<PlanWall>()
     val rooms = mutableListOf<PlanRoom>()
+    val openings = mutableListOf<PlanOpening>()
     var tool: PlanCanvasTool = PlanCanvasTool.WALL
         private set
     private var selectedWallId: String? = null
     private var selectionStartX = 0f
     private var selectionStartY = 0f
     private var selectionMoved = false
-    private val undoStack = ArrayDeque<List<PlanWall>>()
+    private data class EditorSnapshot(val walls: List<PlanWall>, val openings: List<PlanOpening>)
+    private val undoStack = ArrayDeque<EditorSnapshot>()
     private val prefs get() = context.getSharedPreferences("mokhatiti_native", Context.MODE_PRIVATE)
     private var pixelsPerMetre = 72f
     private var panX = 0f
@@ -117,10 +119,34 @@ class PlanCanvasView(context: Context) : View(context) {
 
     fun selectedWall(): PlanWall? = plan.firstOrNull { it.id == selectedWallId }
 
+    fun addOpeningToSelected(type: PlanOpeningType): Boolean {
+        val wall = selectedWall() ?: return false
+        val width = if (type == PlanOpeningType.DOOR) 0.9f else 1.2f
+        val height = if (type == PlanOpeningType.DOOR) 2.1f else 1.0f
+        val sill = if (type == PlanOpeningType.DOOR) 0f else 0.9f
+        if (wall.lengthMetres < width + 0.1f || sill + height > wall.height) return false
+        rememberUndo()
+        openings.add(
+            PlanOpening(
+                wallId = wall.id,
+                type = type,
+                offsetMetres = (wall.lengthMetres - width) / 2f,
+                widthMetres = width,
+                heightMetres = height,
+                sillHeightMetres = sill
+            )
+        )
+        rooms.clear()
+        savePlan()
+        invalidate()
+        return true
+    }
+
     fun updateSelectedWall(thicknessMetres: Float, heightMetres: Float): Boolean {
         val index = plan.indexOfFirst { it.id == selectedWallId }
         if (index < 0 || !thicknessMetres.isFinite() || !heightMetres.isFinite() ||
             thicknessMetres <= 0f || heightMetres <= 0f) return false
+        if (openings.filter { it.wallId == selectedWallId }.any { it.sillHeightMetres + it.heightMetres > heightMetres }) return false
         return try {
             rememberUndo()
             plan[index] = plan[index].copy(thickness = thicknessMetres, height = heightMetres)
@@ -180,6 +206,7 @@ class PlanCanvasView(context: Context) : View(context) {
                     if (tool == PlanCanvasTool.ERASE && hit != null) {
                         rememberUndo()
                         plan.removeAll { it.id == hit.id }
+                        openings.removeAll { it.wallId == hit.id }
                         rooms.clear()
                         selectedWallId = null
                         savePlan()
@@ -236,14 +263,17 @@ class PlanCanvasView(context: Context) : View(context) {
     }
     override fun performClick(): Boolean { super.performClick(); return true }
 
-    private fun rememberUndo() { undoStack.addLast(plan.toList()); if(undoStack.size>40) undoStack.removeFirst() }
+    private fun rememberUndo() { undoStack.addLast(EditorSnapshot(plan.toList(), openings.toList())); if(undoStack.size>40) undoStack.removeFirst() }
     fun undo() {
-        if(undoStack.isNotEmpty()){plan.clear();plan.addAll(undoStack.removeLast())}
-        else if(plan.isNotEmpty()) plan.removeAt(plan.lastIndex)
+        if(undoStack.isNotEmpty()) {
+            val snapshot = undoStack.removeLast()
+            plan.clear(); plan.addAll(snapshot.walls)
+            openings.clear(); openings.addAll(snapshot.openings)
+        } else if(plan.isNotEmpty()) plan.removeAt(plan.lastIndex)
         rooms.clear()
         savePlan();invalidate()
     }
-    fun clearPlan(){if(plan.isNotEmpty())rememberUndo();plan.clear();rooms.clear();savePlan();invalidate()}
+    fun clearPlan(){if(plan.isNotEmpty() || openings.isNotEmpty())rememberUndo();plan.clear();rooms.clear();openings.clear();selectedWallId=null;savePlan();invalidate()}
 
     fun detectRooms(): Int {
         rooms.clear()
@@ -262,6 +292,14 @@ class PlanCanvasView(context: Context) : View(context) {
                 .put("x2", wall.x2).put("y2", wall.y2)
                 .put("thickness", wall.thickness).put("height", wall.height))
         }
+        val openingArray = JSONArray()
+        openings.forEach { opening ->
+            openingArray.put(JSONObject()
+                .put("id", opening.id).put("wallId", opening.wallId)
+                .put("type", opening.type.name).put("offset", opening.offsetMetres)
+                .put("width", opening.widthMetres).put("height", opening.heightMetres)
+                .put("sill", opening.sillHeightMetres))
+        }
         val roomArray = JSONArray()
         rooms.forEach { room ->
             val boundary = JSONArray()
@@ -278,6 +316,7 @@ class PlanCanvasView(context: Context) : View(context) {
             .put("unit", "metre")
             .put("walls", walls)
             .put("rooms", roomArray)
+            .put("openings", openingArray)
             .toString(2)
     }
 
@@ -291,6 +330,7 @@ class PlanCanvasView(context: Context) : View(context) {
             val walls = root?.optJSONArray("walls") ?: JSONArray(raw)
             val loadedWalls = mutableListOf<PlanWall>()
             val loadedRooms = mutableListOf<PlanRoom>()
+            val loadedOpenings = mutableListOf<PlanOpening>()
             for (i in 0 until walls.length()) {
                 val wall = walls.getJSONObject(i)
                 loadedWalls.add(
@@ -323,10 +363,28 @@ class PlanCanvasView(context: Context) : View(context) {
                     )
                 }
             }
+            val savedOpenings = root?.optJSONArray("openings") ?: JSONArray()
+            for (i in 0 until savedOpenings.length()) {
+                val opening = savedOpenings.getJSONObject(i)
+                loadedOpenings.add(
+                    PlanOpening(
+                        id = opening.optString("id", java.util.UUID.randomUUID().toString()),
+                        wallId = opening.getString("wallId"),
+                        type = PlanOpeningType.valueOf(opening.getString("type")),
+                        offsetMetres = opening.getDouble("offset").toFloat(),
+                        widthMetres = opening.getDouble("width").toFloat(),
+                        heightMetres = opening.getDouble("height").toFloat(),
+                        sillHeightMetres = opening.optDouble("sill", 0.0).toFloat()
+                    )
+                )
+            }
+            PlanProject(walls = loadedWalls, rooms = loadedRooms, openings = loadedOpenings)
             plan.clear()
             plan.addAll(loadedWalls)
             rooms.clear()
             rooms.addAll(loadedRooms)
+            openings.clear()
+            openings.addAll(loadedOpenings)
             savePlan()
             invalidate()
             true
