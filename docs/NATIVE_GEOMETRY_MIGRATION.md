@@ -26,15 +26,15 @@ The desktop UI/rendering layer is not part of this migration. Swing, Java 3D, AW
 
 1. Added `PlanGeometry.kt`, an Android-independent metric domain layer with finite-coordinate validation, wall length/thickness/height, wall footprint polygon, room polygon area, level metadata, project validation and project bounds.
 2. Moved `PlanWall` out of the drawing view so the view consumes the domain model rather than owning it.
-3. Upgraded local JSON persistence to schema version 4. It stores wall ID, level ID, thickness and height, and still reads older files by supplying defaults for fields absent from version 2.
-4. Updated the 2D wall stroke to reflect metric thickness and the axonometric preview to render wall footprints as 3D prisms using each wall's height.
+3. Upgraded local JSON persistence to schema version 4. It stores wall ID, level ID, thickness and height, and reads earlier wall-only versions by supplying defaults for missing fields.
+4. Updated the 2D wall stroke to reflect metric thickness and the native OpenGL renderer to consume wall footprint and height data.
 5. Added a half-edge wall graph room detector that splits long segments at T-junctions and extracts bounded room faces. Tests cover a closed room, adjacent rooms and endpoint tolerance.
 6. Added wall selection, drag-move, delete, endpoint/orthogonal snapping, pinch zoom, two-finger pan and editable wall thickness/height. Added host-wall door/window entities with 2D wall gaps, 3D mesh cut-outs and reveals.
 7. Added Android document-picker JSON import/export while retaining local autosave.
-8. Replaced the projected preview with an interactive OpenGL ES 2.0 renderer using triangle meshes for wall prisms and room floors, with orbit, pinch zoom and camera fitting.
-9. Added JVM unit tests for wall geometry, room area, graph extraction, endpoint tolerance and project validation; CI runs tests before assembling the APK.
+8. Replaced the projected preview with an interactive OpenGL ES 2.0 renderer using triangle meshes for wall prisms and room floors, with orbit, pinch zoom and camera fitting. Concave room floors use ear-clipping triangulation.
+9. Added JVM unit tests for wall geometry, room area, graph extraction, endpoint tolerance, concave triangulation, opening bounds and project validation; CI runs tests before assembling the APK.
 
-This is a **first native model-port step**, not the complete Sweet Home 3D engine. It does not yet import the upstream Java model classes, implement robust curved walls or full wall-junction cleanup, create door/window openings, load furniture models, or provide a complete professional CAD/BIM-grade 3D scene and project manager.
+This is a **first native model-port step**, not the complete Sweet Home 3D engine. It does not yet import the upstream Java model classes, implement robust curved walls or full wall-junction cleanup, provide fully editable door/window frame and swing systems, load furniture models, or provide a complete professional CAD/BIM-grade 3D scene and project manager.
 
 ## Required next stages
 
@@ -64,7 +64,7 @@ This is a **first native model-port step**, not the complete Sweet Home 3D engin
 
 ### E. Verification
 - Unit tests for geometry, room area, room-face extraction, concave polygon triangulation, wall-opening bounds, invalid coordinates and project validation.
-- Compatibility tests loading schema v2 projects and saving/reopening schema v3.
+- Compatibility tests loading schema v2/v3 projects and saving/reopening schema v4.
 - Instrumented tests on phone and tablet profiles; verify touch, rotation, memory and large plans.
 - Do not label the APK complete until these tests and all advertised tools pass.
 
