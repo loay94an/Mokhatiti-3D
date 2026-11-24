@@ -103,7 +103,7 @@ class PlanCanvasView(context: Context) : View(context) {
                 canvas.drawText(room.name + " • " + String.format("%.1f م²", room.areaSquareMetres), screenX(centerX), screenY(centerY), measurePaint)
             }
         }
-        canvas.drawText("مخطط ثنائي الأبعاد", 22f, 34f, textPaint)
+        canvas.drawText("مخطط ثنائي الأبعاد • " + activeLevelName(), 22f, 34f, textPaint)
         canvas.drawText("الشبكة 10 سم  •  المقياس " + pixelsPerMetre.toInt() + " px/م", 22f, 64f, textPaint)
         furniture.filter { it.levelId == activeLevelId }.forEach { item ->
             val corners = item.footprint()
