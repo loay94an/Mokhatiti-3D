@@ -110,6 +110,23 @@ data class PlanRoom(
         )
 }
 
+enum class PlanOpeningType { DOOR, WINDOW }
+
+data class PlanOpening(
+    val id: String = UUID.randomUUID().toString(),
+    val wallId: String,
+    val type: PlanOpeningType,
+    val offsetMetres: Float,
+    val widthMetres: Float,
+    val heightMetres: Float,
+    val sillHeightMetres: Float = 0f
+) {
+    init {
+        require(id.isNotBlank() && wallId.isNotBlank())
+        require(listOf(offsetMetres, widthMetres, heightMetres, sillHeightMetres).all(Float::isFinite))
+        require(offsetMetres >= 0f && widthMetres > 0f && heightMetres > 0f && sillHeightMetres >= 0f)
+    }
+}
 data class PlanLevel(
     val id: String,
     val name: String,
@@ -130,6 +147,7 @@ data class PlanProject(
     val name: String = "مشروع جديد",
     val walls: List<PlanWall> = emptyList(),
     val rooms: List<PlanRoom> = emptyList(),
+    val openings: List<PlanOpening> = emptyList(),
     val levels: List<PlanLevel> = listOf(PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "الطابق الأرضي"))
 ) {
     init {
@@ -139,6 +157,12 @@ data class PlanProject(
         require(levelIds.size == levels.size) { "Level IDs must be unique" }
         require(walls.all { it.levelId in levelIds }) { "Every wall must reference an existing level" }
         require(rooms.all { it.levelId in levelIds }) { "Every room must reference an existing level" }
+        val wallById = walls.associateBy { it.id }
+        require(openings.all { opening ->
+            val wall = wallById[opening.wallId] ?: return@all false
+            opening.offsetMetres + opening.widthMetres <= wall.lengthMetres + 0.0001f &&
+                opening.sillHeightMetres + opening.heightMetres <= wall.height + 0.0001f
+        }) { "Every opening must fit inside its host wall" }
     }
 
     val bounds: PlanBounds?
