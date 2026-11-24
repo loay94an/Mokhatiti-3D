@@ -233,8 +233,8 @@ class PlanCanvasView(context: Context) : View(context) {
     fun loadPlan() {
         val raw=prefs.getString("plan_json",null)?:return
         try {
-            val root=JSONObject(raw)
-            val walls=if(root.has("walls"))root.getJSONArray("walls") else JSONArray(raw)
+            val root = if (raw.trimStart().startsWith("{")) JSONObject(raw) else null
+            val walls = root?.optJSONArray("walls") ?: JSONArray(raw)
             plan.clear()
             rooms.clear()
             for (i in 0 until walls.length()) {
@@ -252,7 +252,7 @@ class PlanCanvasView(context: Context) : View(context) {
                     )
                 )
             }
-            val savedRooms = root.optJSONArray("rooms") ?: JSONArray()
+            val savedRooms = root?.optJSONArray("rooms") ?: JSONArray()
             for (i in 0 until savedRooms.length()) {
                 val room = savedRooms.getJSONObject(i)
                 val boundaryJson = room.getJSONArray("boundary")
