@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import org.json.JSONArray
 import org.json.JSONObject
@@ -26,6 +27,15 @@ class PlanCanvasView(context: Context) : View(context) {
     private var startY = 0f
     private var endX = 0f
     private var endY = 0f
+    private var lastFocusX = 0f
+    private var lastFocusY = 0f
+    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            pixelsPerMetre = (pixelsPerMetre * detector.scaleFactor).coerceIn(20f, 300f)
+            invalidate()
+            return true
+        }
+    })
 
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(226,233,241); strokeWidth = 1f }
     private val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(193,205,219); strokeWidth = 2f }
@@ -73,8 +83,25 @@ class PlanCanvasView(context: Context) : View(context) {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(event)
+        if (event.pointerCount > 1) {
+            drawing = false
+            val focusX = (event.getX(0) + event.getX(1)) / 2f
+            val focusY = (event.getY(0) + event.getY(1)) / 2f
+            if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+                lastFocusX = focusX
+                lastFocusY = focusY
+            } else if (event.actionMasked == MotionEvent.ACTION_MOVE) {
+                panX += focusX - lastFocusX
+                panY += focusY - lastFocusY
+                lastFocusX = focusX
+                lastFocusY = focusY
+                invalidate()
+            }
+            return true
+        }
         when(event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { startX=worldX(event.x);startY=worldY(event.y);endX=startX;endY=startY;drawing=true;invalidate();return true }
+            MotionEvent.ACTION_DOWN -> { lastFocusX=event.x;lastFocusY=event.y;startX=worldX(event.x);startY=worldY(event.y);endX=startX;endY=startY;drawing=true;invalidate();return true }
             MotionEvent.ACTION_MOVE -> { endX=worldX(event.x);endY=worldY(event.y);invalidate();return true }
             MotionEvent.ACTION_UP -> {
                 endX=worldX(event.x);endY=worldY(event.y)
@@ -95,6 +122,7 @@ class PlanCanvasView(context: Context) : View(context) {
     fun undo() {
         if(undoStack.isNotEmpty()){plan.clear();plan.addAll(undoStack.removeLast())}
         else if(plan.isNotEmpty()) plan.removeAt(plan.lastIndex)
+        rooms.clear()
         savePlan();invalidate()
     }
     fun clearPlan(){if(plan.isNotEmpty())rememberUndo();plan.clear();rooms.clear();savePlan();invalidate()}
