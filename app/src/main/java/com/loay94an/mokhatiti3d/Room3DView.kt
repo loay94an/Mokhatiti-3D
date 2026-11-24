@@ -40,7 +40,7 @@ class Room3DView(context: Context, walls: List<PlanWall>, rooms: List<PlanRoom>)
     }
 
     fun refresh() {
-        sceneRenderer.updateScene(sceneRenderer.currentWalls, sceneRenderer.currentRooms)
+        queueEvent { sceneRenderer.updateScene(sceneRenderer.currentWalls, sceneRenderer.currentRooms) }
         requestRender()
     }
 
@@ -92,7 +92,7 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>) : GLS
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0.95f,0.97f,0.99f,1f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
-        GLES20.glEnable(GLES20.GL_CULL_FACE)
+        GLES20.glDisable(GLES20.GL_CULL_FACE)
         val vertexShader=compileShader(GLES20.GL_VERTEX_SHADER,"attribute vec3 aPosition; attribute vec4 aColor; uniform mat4 uMVP; varying vec4 vColor; void main(){ gl_Position=uMVP*vec4(aPosition,1.0); vColor=aColor; }")
         val fragmentShader=compileShader(GLES20.GL_FRAGMENT_SHADER,"precision mediump float; varying vec4 vColor; void main(){ gl_FragColor=vColor; }")
         program=GLES20.glCreateProgram(); GLES20.glAttachShader(program,vertexShader); GLES20.glAttachShader(program,fragmentShader); GLES20.glLinkProgram(program)
