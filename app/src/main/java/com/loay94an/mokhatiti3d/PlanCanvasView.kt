@@ -99,8 +99,8 @@ class PlanCanvasView(context: Context) : View(context) {
 
     fun savePlan() {
         val walls=JSONArray()
-        plan.forEach { w -> walls.put(JSONObject().put("x1",w.x1).put("y1",w.y1).put("x2",w.x2).put("y2",w.y2)) }
-        val project=JSONObject().put("format","mokhatiti-native").put("version",2).put("unit","metre").put("walls",walls)
+        plan.forEach { w -> walls.put(JSONObject().put("id",w.id).put("levelId",w.levelId).put("x1",w.x1).put("y1",w.y1).put("x2",w.x2).put("y2",w.y2).put("thickness",w.thickness).put("height",w.height)) }
+        val project=JSONObject().put("format","mokhatiti-native").put("version",3).put("unit","metre").put("walls",walls)
         prefs.edit().putString("plan_json",project.toString()).apply()
     }
     fun loadPlan() {
@@ -111,7 +111,7 @@ class PlanCanvasView(context: Context) : View(context) {
             plan.clear()
             for(i in 0 until walls.length()){
                 val w=walls.getJSONObject(i)
-                plan.add(PlanWall(w.getDouble("x1").toFloat(),w.getDouble("y1").toFloat(),w.getDouble("x2").toFloat(),w.getDouble("y2").toFloat()))
+                plan.add(PlanWall(\n                    w.getDouble("x1").toFloat(), w.getDouble("y1").toFloat(),\n                    w.getDouble("x2").toFloat(), w.getDouble("y2").toFloat(),\n                    w.optDouble("thickness", PlanWall.DEFAULT_WALL_THICKNESS_METRES.toDouble()).toFloat(),\n                    w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),\n                    w.optString("id", java.util.UUID.randomUUID().toString()),\n                    w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)\n                ))
             }
             invalidate()
         } catch (_:Exception) { /* preserve editor availability if local data is invalid */ }
