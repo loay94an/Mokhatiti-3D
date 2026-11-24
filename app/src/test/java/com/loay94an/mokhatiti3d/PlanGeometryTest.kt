@@ -73,4 +73,17 @@ class PlanGeometryTest {
             PlanRoom("flat", "غرفة", listOf(PlanPoint(0f, 0f), PlanPoint(1f, 0f), PlanPoint(2f, 0f)))
         }
     }
+    @Test
+    fun furnitureFootprintRotatesAroundItsCenter() {
+        val item = PlanFurniture(name = "طاولة", category = "طاولات", x = 3f, y = 4f, width = 2f, depth = 1f, height = 0.8f, rotationDegrees = 90f)
+        val points = item.footprint()
+        assertEquals(1f, points.maxOf { it.x } - points.minOf { it.x }, 0.001f)
+        assertEquals(2f, points.maxOf { it.y } - points.minOf { it.y }, 0.001f)
+    }
+
+    @Test
+    fun validatesFurnitureLevelReference() {
+        val item = PlanFurniture(name = "كرسي", category = "جلوس", x = 0f, y = 0f, width = 0.5f, depth = 0.5f, height = 0.9f, levelId = "missing")
+        assertThrows(IllegalArgumentException::class.java) { PlanProject(furniture = listOf(item)) }
+    }
 }
