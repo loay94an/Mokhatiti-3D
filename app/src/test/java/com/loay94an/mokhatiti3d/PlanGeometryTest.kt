@@ -39,7 +39,7 @@ class PlanGeometryTest {
     fun projectValidatesLevelReferencesAndCalculatesBounds() {
         val wall = PlanWall(1f, 2f, 5f, 7f)
         val project = PlanProject(walls = listOf(wall))
-        assertEquals(5f, project.totalWallLengthMetres, 0.0001f)
+        assertEquals(kotlin.math.sqrt(41f), project.totalWallLengthMetres, 0.0001f)
         assertNotNull(project.bounds)
         assertEquals(1f, project.bounds!!.minX, 0.0001f)
         assertThrows(IllegalArgumentException::class.java) {
