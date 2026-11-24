@@ -23,7 +23,32 @@ object PlanRoomDetector {
             return indices.getOrPut(key) { points.add(point); points.lastIndex }
         }
 
-        val edges = walls.map { vertex(it.start) to vertex(it.end) }.filter { it.first != it.second }
+        val segments = walls.map { vertex(it.start) to vertex(it.end) }.filter { it.first != it.second }
+        // Split long wall segments wherever another wall endpoint lands on them.
+        // This is essential for T and cross junctions (for example two rooms sharing a wall).
+        val edges = linkedSetOf<Pair<Int, Int>>()
+        segments.forEach { (a, b) ->
+            val start = points[a]
+            val end = points[b]
+            val dx = end.x - start.x
+            val dy = end.y - start.y
+            val lengthSquared = dx * dx + dy * dy
+            val onSegment = points.indices.mapNotNull { candidate ->
+                val point = points[candidate]
+                val t = ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
+                if (t < -0.0001f || t > 1.0001f) return@mapNotNull null
+                val projectedX = start.x + t * dx
+                val projectedY = start.y + t * dy
+                val distance = kotlin.math.hypot(point.x - projectedX, point.y - projectedY)
+                if (distance <= endpointToleranceMetres) t to candidate else null
+            }.sortedBy { it.first }
+            onSegment.zipWithNext().forEach { (left, right) ->
+                if (left.second != right.second) {
+                    val edge = minOf(left.second, right.second) to maxOf(left.second, right.second)
+                    edges.add(edge)
+                }
+            }
+        }
         val adjacency = MutableList(points.size) { linkedSetOf<Int>() }
         edges.forEach { (a, b) -> adjacency[a].add(b); adjacency[b].add(a) }
         val ordered = adjacency.mapIndexed { index, neighbours ->
