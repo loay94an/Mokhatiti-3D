@@ -63,6 +63,20 @@ class PlanCanvasView(context: Context) : View(context) {
     private fun worldY(py: Float) = snap((originY()-py)/pixelsPerMetre)
     private fun snap(v: Float) = round(v*10f)/10f
 
+    private fun snappedPoint(x: Float, y: Float, reference: PlanPoint? = null): PlanPoint {
+        var point = PlanPoint(snap(x), snap(y))
+        val endpoint = plan.flatMap { listOf(it.start, it.end) }
+            .minByOrNull { it.distanceTo(point) }
+        if (endpoint != null && endpoint.distanceTo(point) <= 0.18f) point = endpoint
+        if (reference != null) {
+            val dx = point.x - reference.x
+            val dy = point.y - reference.y
+            if (abs(dx) <= 0.10f) point = point.copy(x = reference.x)
+            else if (abs(dy) <= 0.10f) point = point.copy(y = reference.y)
+        }
+        return point
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         drawGrid(canvas)
@@ -133,8 +147,9 @@ class PlanCanvasView(context: Context) : View(context) {
             MotionEvent.ACTION_DOWN -> {
                 lastFocusX = event.x
                 lastFocusY = event.y
-                startX = worldX(event.x)
-                startY = worldY(event.y)
+                val start = if (tool == PlanCanvasTool.WALL) snappedPoint(worldX(event.x), worldY(event.y)) else PlanPoint(worldX(event.x), worldY(event.y))
+                startX = start.x
+                startY = start.y
                 endX = startX
                 endY = startY
                 if (tool != PlanCanvasTool.WALL) {
@@ -160,8 +175,9 @@ class PlanCanvasView(context: Context) : View(context) {
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                endX = worldX(event.x)
-                endY = worldY(event.y)
+                val current = if (tool == PlanCanvasTool.WALL) snappedPoint(worldX(event.x), worldY(event.y), PlanPoint(startX, startY)) else PlanPoint(worldX(event.x), worldY(event.y))
+                endX = current.x
+                endY = current.y
                 if (tool == PlanCanvasTool.SELECT && selectedWallId != null) {
                     selectionMoved = kotlin.math.hypot(endX - selectionStartX, endY - selectionStartY) > 0.03f
                 }
@@ -169,8 +185,9 @@ class PlanCanvasView(context: Context) : View(context) {
                 return true
             }
             MotionEvent.ACTION_UP -> {
-                endX = worldX(event.x)
-                endY = worldY(event.y)
+                val current = if (tool == PlanCanvasTool.WALL) snappedPoint(worldX(event.x), worldY(event.y), PlanPoint(startX, startY)) else PlanPoint(worldX(event.x), worldY(event.y))
+                endX = current.x
+                endY = current.y
                 if (tool == PlanCanvasTool.SELECT && selectedWallId != null && selectionMoved) {
                     val dx = endX - selectionStartX
                     val dy = endY - selectionStartY
