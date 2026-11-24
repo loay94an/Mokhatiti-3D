@@ -143,7 +143,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("مكتبة الأثاث")
             .setItems(names) { _, which ->
-                val points = workspace.plan.flatMap { listOf(it.start, it.end) }
+                val points = workspace.activeWalls().flatMap { listOf(it.start, it.end) }
                 val centerX = if (points.isEmpty()) 0f else (points.minOf { it.x } + points.maxOf { it.x }) / 2f
                 val centerY = if (points.isEmpty()) 0f else (points.minOf { it.y } + points.maxOf { it.y }) / 2f
                 val offset = workspace.furniture.size * 0.35f
