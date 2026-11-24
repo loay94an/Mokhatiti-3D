@@ -115,6 +115,24 @@ class PlanCanvasView(context: Context) : View(context) {
         invalidate()
     }
 
+    fun selectedWall(): PlanWall? = plan.firstOrNull { it.id == selectedWallId }
+
+    fun updateSelectedWall(thicknessMetres: Float, heightMetres: Float): Boolean {
+        val index = plan.indexOfFirst { it.id == selectedWallId }
+        if (index < 0 || !thicknessMetres.isFinite() || !heightMetres.isFinite() ||
+            thicknessMetres <= 0f || heightMetres <= 0f) return false
+        return try {
+            rememberUndo()
+            plan[index] = plan[index].copy(thickness = thicknessMetres, height = heightMetres)
+            rooms.clear()
+            savePlan()
+            invalidate()
+            true
+        } catch (_: IllegalArgumentException) {
+            false
+        }
+    }
+
     private fun distanceToSegment(px: Float, py: Float, wall: PlanWall): Float {
         val dx = wall.x2 - wall.x1
         val dy = wall.y2 - wall.y1
