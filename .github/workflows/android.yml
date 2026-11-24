@@ -38,10 +38,12 @@ jobs:
       - name: Install and launch on Android emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 35
+          api-level: 30
           target: google_apis
           arch: x86_64
           profile: pixel_2
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
           script: |
             adb install -r app/build/outputs/apk/debug/app-debug.apk
             adb shell am start -n com.loay94an.mokhatiti3d/.MainActivity
