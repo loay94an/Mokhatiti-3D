@@ -46,4 +46,15 @@ class PlanGeometryTest {
             PlanProject(walls = listOf(wall.copy(levelId = "missing")))
         }
     }
+    @Test
+    fun validatesDoorAndWindowOpeningsAgainstHostWall() {
+        val wall = PlanWall(0f, 0f, 4f, 0f, height = 2.8f)
+        val door = PlanOpening(wallId = wall.id, type = PlanOpeningType.DOOR, offsetMetres = 1f, widthMetres = 0.9f, heightMetres = 2.1f)
+        val window = PlanOpening(wallId = wall.id, type = PlanOpeningType.WINDOW, offsetMetres = 2f, widthMetres = 1.2f, heightMetres = 1f, sillHeightMetres = 0.9f)
+        PlanProject(walls = listOf(wall), openings = listOf(door, window))
+        assertThrows(IllegalArgumentException::class.java) {
+            PlanProject(walls = listOf(wall), openings = listOf(door.copy(offsetMetres = 3.5f)))
+        }
+    }
+
 }
