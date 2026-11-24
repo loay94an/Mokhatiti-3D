@@ -20,13 +20,15 @@ class PlanCanvasView(context: Context) : View(context) {
     val plan = mutableListOf<PlanWall>()
     val rooms = mutableListOf<PlanRoom>()
     val openings = mutableListOf<PlanOpening>()
+    val furniture = mutableListOf<PlanFurniture>()
     var tool: PlanCanvasTool = PlanCanvasTool.WALL
         private set
     private var selectedWallId: String? = null
+    private var selectedFurnitureId: String? = null
     private var selectionStartX = 0f
     private var selectionStartY = 0f
     private var selectionMoved = false
-    private data class EditorSnapshot(val walls: List<PlanWall>, val openings: List<PlanOpening>)
+    private data class EditorSnapshot(val walls: List<PlanWall>, val openings: List<PlanOpening>, val furniture: List<PlanFurniture>)
     private val undoStack = ArrayDeque<EditorSnapshot>()
     private val prefs get() = context.getSharedPreferences("mokhatiti_native", Context.MODE_PRIVATE)
     private var pixelsPerMetre = 72f
@@ -51,6 +53,8 @@ class PlanCanvasView(context: Context) : View(context) {
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(226,233,241); strokeWidth = 1f }
     private val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(193,205,219); strokeWidth = 2f }
     private val wallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(25,48,75); strokeWidth = 10f; strokeCap = Paint.Cap.ROUND }
+    private val furniturePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(224, 171, 92); style = Paint.Style.FILL }
+    private val furnitureEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(126, 86, 38); style = Paint.Style.STROKE; strokeWidth = 2.5f }
     private val selectedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(22,163,148); strokeWidth = 4f; style = Paint.Style.STROKE }
     private val previewPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(22,163,148); strokeWidth = 8f; strokeCap = Paint.Cap.ROUND }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(93,110,130); textSize = 25f }
@@ -98,6 +102,18 @@ class PlanCanvasView(context: Context) : View(context) {
         }
         canvas.drawText("مخطط ثنائي الأبعاد", 22f, 34f, textPaint)
         canvas.drawText("الشبكة 10 سم  •  المقياس " + pixelsPerMetre.toInt() + " px/م", 22f, 64f, textPaint)
+        furniture.forEach { item ->
+            val corners = item.footprint()
+            val path = android.graphics.Path().apply {
+                moveTo(screenX(corners[0].x), screenY(corners[0].y))
+                corners.drop(1).forEach { lineTo(screenX(it.x), screenY(it.y)) }
+                close()
+            }
+            canvas.drawPath(path, furniturePaint)
+            canvas.drawPath(path, furnitureEdgePaint)
+            if (item.id == selectedFurnitureId) canvas.drawPath(path, selectedPaint)
+            canvas.drawText(item.name, screenX(item.x), screenY(item.y), measurePaint)
+        }
         plan.forEach { wall ->
             val x1=screenX(wall.x1); val y1=screenY(wall.y1); val x2=screenX(wall.x2); val y2=screenY(wall.y2)
             wallPaint.strokeWidth = (wall.thickness * pixelsPerMetre).coerceAtLeast(2f)
@@ -152,10 +168,19 @@ class PlanCanvasView(context: Context) : View(context) {
     fun setTool(next: PlanCanvasTool) {
         tool = next
         selectedWallId = null
+        selectedFurnitureId = null
         invalidate()
     }
 
     fun selectedWall(): PlanWall? = plan.firstOrNull { it.id == selectedWallId }
+    fun selectedFurniture(): PlanFurniture? = furniture.firstOrNull { it.id == selectedFurnitureId }
+
+    fun addFurniture(item: PlanFurniture) {
+        rememberUndo()
+        furniture.add(item)
+        savePlan()
+        invalidate()
+    }
 
     fun addOpeningToSelected(type: PlanOpeningType): Boolean {
         val wall = selectedWall() ?: return false
@@ -235,6 +260,24 @@ class PlanCanvasView(context: Context) : View(context) {
                 endX = startX
                 endY = startY
                 if (tool != PlanCanvasTool.WALL) {
+                    val furnitureHit = furniture.firstOrNull { item ->
+                        val dx = startX - item.x
+                        val dy = startY - item.y
+                        val angle = Math.toRadians(-item.rotationDegrees.toDouble())
+                        val localX = dx * kotlin.math.cos(angle).toFloat() - dy * kotlin.math.sin(angle).toFloat()
+                        val localY = dx * kotlin.math.sin(angle).toFloat() + dy * kotlin.math.cos(angle).toFloat()
+                        abs(localX) <= item.width / 2f && abs(localY) <= item.depth / 2f
+                    }
+                    if (furnitureHit != null) {
+                        selectedFurnitureId = furnitureHit.id
+                        selectedWallId = null
+                        selectionStartX = startX; selectionStartY = startY; selectionMoved = false
+                        if (tool == PlanCanvasTool.ERASE) {
+                            rememberUndo(); furniture.removeAll { it.id == furnitureHit.id }; selectedFurnitureId = null; savePlan()
+                        }
+                        drawing = false; invalidate(); return true
+                    }
+                    selectedFurnitureId = null
                     val hit = plan.minByOrNull { distanceToSegment(startX, startY, it) }
                         ?.takeIf { distanceToSegment(startX, startY, it) <= 0.35f }
                     selectedWallId = hit?.id
@@ -261,7 +304,7 @@ class PlanCanvasView(context: Context) : View(context) {
                 val current = if (tool == PlanCanvasTool.WALL) snappedPoint(worldX(event.x), worldY(event.y), PlanPoint(startX, startY)) else PlanPoint(worldX(event.x), worldY(event.y))
                 endX = current.x
                 endY = current.y
-                if (tool == PlanCanvasTool.SELECT && selectedWallId != null) {
+                if (tool == PlanCanvasTool.SELECT && (selectedWallId != null || selectedFurnitureId != null)) {
                     selectionMoved = kotlin.math.hypot(endX - selectionStartX, endY - selectionStartY) > 0.03f
                 }
                 invalidate()
@@ -271,7 +314,13 @@ class PlanCanvasView(context: Context) : View(context) {
                 val current = if (tool == PlanCanvasTool.WALL) snappedPoint(worldX(event.x), worldY(event.y), PlanPoint(startX, startY)) else PlanPoint(worldX(event.x), worldY(event.y))
                 endX = current.x
                 endY = current.y
-                if (tool == PlanCanvasTool.SELECT && selectedWallId != null && selectionMoved) {
+                if (tool == PlanCanvasTool.SELECT && selectedFurnitureId != null && selectionMoved) {
+                    val dx = endX - selectionStartX
+                    val dy = endY - selectionStartY
+                    rememberUndo()
+                    val index = furniture.indexOfFirst { it.id == selectedFurnitureId }
+                    if (index >= 0) { furniture[index] = furniture[index].copy(x = furniture[index].x + dx, y = furniture[index].y + dy); savePlan() }
+                } else if (tool == PlanCanvasTool.SELECT && selectedWallId != null && selectionMoved) {
                     val dx = endX - selectionStartX
                     val dy = endY - selectionStartY
                     rememberUndo()
@@ -301,12 +350,13 @@ class PlanCanvasView(context: Context) : View(context) {
     }
     override fun performClick(): Boolean { super.performClick(); return true }
 
-    private fun rememberUndo() { undoStack.addLast(EditorSnapshot(plan.toList(), openings.toList())); if(undoStack.size>40) undoStack.removeFirst() }
+    private fun rememberUndo() { undoStack.addLast(EditorSnapshot(plan.toList(), openings.toList(), furniture.toList())); if(undoStack.size>40) undoStack.removeFirst() }
     fun undo() {
         if(undoStack.isNotEmpty()) {
             val snapshot = undoStack.removeLast()
             plan.clear(); plan.addAll(snapshot.walls)
             openings.clear(); openings.addAll(snapshot.openings)
+            furniture.clear(); furniture.addAll(snapshot.furniture)
         } else if(plan.isNotEmpty()) {
             val removed = plan.removeAt(plan.lastIndex)
             openings.removeAll { it.wallId == removed.id }
@@ -314,7 +364,7 @@ class PlanCanvasView(context: Context) : View(context) {
         rooms.clear()
         savePlan();invalidate()
     }
-    fun clearPlan(){if(plan.isNotEmpty() || openings.isNotEmpty())rememberUndo();plan.clear();rooms.clear();openings.clear();selectedWallId=null;savePlan();invalidate()}
+    fun clearPlan(){if(plan.isNotEmpty() || openings.isNotEmpty() || furniture.isNotEmpty())rememberUndo();plan.clear();rooms.clear();openings.clear();furniture.clear();selectedWallId=null;selectedFurnitureId=null;savePlan();invalidate()}
 
     fun detectRooms(): Int {
         rooms.clear()
@@ -332,6 +382,12 @@ class PlanCanvasView(context: Context) : View(context) {
                 .put("x1", wall.x1).put("y1", wall.y1)
                 .put("x2", wall.x2).put("y2", wall.y2)
                 .put("thickness", wall.thickness).put("height", wall.height))
+        }
+        val furnitureArray = JSONArray()
+        furniture.forEach { item ->
+            furnitureArray.put(JSONObject().put("id", item.id).put("name", item.name).put("category", item.category)
+                .put("x", item.x).put("y", item.y).put("width", item.width).put("depth", item.depth)
+                .put("height", item.height).put("rotation", item.rotationDegrees).put("levelId", item.levelId))
         }
         val openingArray = JSONArray()
         openings.forEach { opening ->
@@ -358,6 +414,7 @@ class PlanCanvasView(context: Context) : View(context) {
             .put("walls", walls)
             .put("rooms", roomArray)
             .put("openings", openingArray)
+            .put("furniture", furnitureArray)
             .toString(2)
     }
 
@@ -372,6 +429,7 @@ class PlanCanvasView(context: Context) : View(context) {
             val loadedWalls = mutableListOf<PlanWall>()
             val loadedRooms = mutableListOf<PlanRoom>()
             val loadedOpenings = mutableListOf<PlanOpening>()
+            val loadedFurniture = mutableListOf<PlanFurniture>()
             for (i in 0 until walls.length()) {
                 val wall = walls.getJSONObject(i)
                 loadedWalls.add(
@@ -419,7 +477,25 @@ class PlanCanvasView(context: Context) : View(context) {
                     )
                 )
             }
-            PlanProject(walls = loadedWalls, rooms = loadedRooms, openings = loadedOpenings)
+            val savedFurniture = root?.optJSONArray("furniture") ?: JSONArray()
+            for (i in 0 until savedFurniture.length()) {
+                val item = savedFurniture.getJSONObject(i)
+                loadedFurniture.add(
+                    PlanFurniture(
+                        id = item.optString("id", java.util.UUID.randomUUID().toString()),
+                        name = item.getString("name"),
+                        category = item.optString("category", "عام"),
+                        x = item.getDouble("x").toFloat(),
+                        y = item.getDouble("y").toFloat(),
+                        width = item.getDouble("width").toFloat(),
+                        depth = item.getDouble("depth").toFloat(),
+                        height = item.getDouble("height").toFloat(),
+                        rotationDegrees = item.optDouble("rotation", 0.0).toFloat(),
+                        levelId = item.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
+                    )
+                )
+            }
+            PlanProject(walls = loadedWalls, rooms = loadedRooms, openings = loadedOpenings, furniture = loadedFurniture)
             plan.clear()
             plan.addAll(loadedWalls)
             selectedWallId = null
@@ -427,6 +503,10 @@ class PlanCanvasView(context: Context) : View(context) {
             rooms.addAll(loadedRooms)
             openings.clear()
             openings.addAll(loadedOpenings)
+            furniture.clear()
+            furniture.addAll(loadedFurniture)
+            selectedWallId = null
+            selectedFurnitureId = null
             savePlan()
             invalidate()
             true
