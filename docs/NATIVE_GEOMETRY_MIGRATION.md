@@ -29,7 +29,7 @@ The desktop UI/rendering layer is not part of this migration. Swing, Java 3D, AW
 3. Upgraded local JSON persistence to schema version 3. It stores wall ID, level ID, thickness and height, and still reads older files by supplying defaults for fields absent from version 2.
 4. Updated the 2D wall stroke to reflect metric thickness and the axonometric preview to render wall footprints as 3D prisms using each wall's height.
 5. Added a half-edge wall graph room detector that splits long segments at T-junctions and extracts bounded room faces. Tests cover a closed room, adjacent rooms and endpoint tolerance.
-6. Added wall selection, drag-move, delete, endpoint/orthogonal snapping, pinch zoom, two-finger pan and editable wall thickness/height.
+6. Added wall selection, drag-move, delete, endpoint/orthogonal snapping, pinch zoom, two-finger pan and editable wall thickness/height. Added host-wall door/window entities with 2D wall gaps, 3D mesh cut-outs and reveals.
 7. Added Android document-picker JSON import/export while retaining local autosave.
 8. Replaced the projected preview with an interactive OpenGL ES 2.0 renderer using triangle meshes for wall prisms and room floors, with orbit, pinch zoom and camera fitting.
 9. Added JVM unit tests for wall geometry, room area, graph extraction, endpoint tolerance and project validation; CI runs tests before assembling the APK.
@@ -47,7 +47,7 @@ This is a **first native model-port step**, not the complete Sweet Home 3D engin
 ### B. Native architectural model
 - Replace the current endpoint graph with persistent junction identities and robust wall joins/intersections, including curved walls and overlap/self-intersection repair.
 - Improve room boundary generation for complex and concave plans, disconnected segments and wall thickness offsets.
-- Add doors/windows as wall-hosted openings with real mesh cut-outs and reveals.
+- Extend door/window editing with adjustable dimensions, swing direction, frame/sash geometry, and robust collision/host-wall updates.
 - Add furniture transforms, elevation, dimensions, levels and material references.
 - Extend project schema for full level metadata, openings, furniture and materials with migration tests.
 
@@ -63,7 +63,7 @@ This is a **first native model-port step**, not the complete Sweet Home 3D engin
 - Add furniture/model catalog loading and material editing.
 
 ### E. Verification
-- Unit tests for geometry, room area, room-face extraction, concave polygon triangulation, invalid coordinates and project validation.
+- Unit tests for geometry, room area, room-face extraction, concave polygon triangulation, wall-opening bounds, invalid coordinates and project validation.
 - Compatibility tests loading schema v2 projects and saving/reopening schema v3.
 - Instrumented tests on phone and tablet profiles; verify touch, rotation, memory and large plans.
 - Do not label the APK complete until these tests and all advertised tools pass.
