@@ -54,8 +54,8 @@ class Room3DView(context: Context, private val walls: List<PlanWall>) : View(con
         walls.forEach { w ->
             val a=project(w.x1,w.y1,0f,cx,cy,scale)
             val b=project(w.x2,w.y2,0f,cx,cy,scale)
-            val at=project(w.x1,w.y1,wallHeight,cx,cy,scale)
-            val bt=project(w.x2,w.y2,wallHeight,cx,cy,scale)
+            val at=project(w.x1,w.y1,w.height,cx,cy,scale)
+            val bt=project(w.x2,w.y2,w.height,cx,cy,scale)
             polygon(canvas,listOf(a,b,bt,at),Color.rgb(190,211,226))
         }
         canvas.drawText("الجدران: ${walls.size}  •  الارتفاع: 2.8 م",22f,height-26f,caption)
