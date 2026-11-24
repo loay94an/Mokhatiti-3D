@@ -178,6 +178,8 @@ class PlanCanvasView(context: Context) : View(context) {
     fun addFurniture(item: PlanFurniture) {
         rememberUndo()
         furniture.add(item)
+        selectedFurnitureId = item.id
+        selectedWallId = null
         savePlan()
         invalidate()
     }
