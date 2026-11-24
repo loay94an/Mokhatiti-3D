@@ -16,15 +16,17 @@ import kotlin.math.max
 import kotlin.math.sin
 
 /** Native interactive OpenGL ES 2.0 renderer; no WebView, Canvas projection or Java 3D. */
-class Room3DView(context: Context, walls: List<PlanWall>, rooms: List<PlanRoom>) : GLSurfaceView(context) {
-    private val sceneRenderer = PlanGlRenderer(walls, rooms)
+class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, private val sourceRooms: List<PlanRoom>) : GLSurfaceView(context) {
+    private val sceneRenderer = PlanGlRenderer(sourceWalls, sourceRooms)
     private var yaw = -0.72f
     private var pitch = 0.58f
     private var distance = 12f
     private var lastX = 0f
     private var lastY = 0f
+    private var cameraTouched = false
     private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
         override fun onScale(detector: ScaleGestureDetector): Boolean {
+            cameraTouched = true
             distance = (distance / detector.scaleFactor).coerceIn(2f, 150f)
             sceneRenderer.setCamera(yaw, pitch, distance)
             requestRender()
@@ -40,7 +42,17 @@ class Room3DView(context: Context, walls: List<PlanWall>, rooms: List<PlanRoom>)
     }
 
     fun refresh() {
-        queueEvent { sceneRenderer.updateScene(sceneRenderer.currentWalls, sceneRenderer.currentRooms) }
+        val wallSnapshot = sourceWalls.toList()
+        val roomSnapshot = sourceRooms.toList()
+        if (!cameraTouched) {
+            val points = wallSnapshot.flatMap { listOf(it.start, it.end) } + roomSnapshot.flatMap { it.boundary }
+            if (points.isNotEmpty()) {
+                val span = maxOf(points.maxOf { it.x } - points.minOf { it.x }, points.maxOf { it.y } - points.minOf { it.y })
+                distance = (span * 1.8f + 5f).coerceIn(6f, 150f)
+            }
+        }
+        sceneRenderer.setCamera(yaw, pitch, distance)
+        queueEvent { sceneRenderer.updateScene(wallSnapshot, roomSnapshot) }
         requestRender()
     }
 
@@ -49,6 +61,7 @@ class Room3DView(context: Context, walls: List<PlanWall>, rooms: List<PlanRoom>)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> { lastX = event.x; lastY = event.y; return true }
             MotionEvent.ACTION_MOVE -> if (event.pointerCount == 1 && !scaleDetector.isInProgress) {
+                cameraTouched = true
                 yaw += (event.x - lastX) * 0.008f
                 pitch = (pitch + (event.y - lastY) * 0.006f).coerceIn(0.12f, 1.35f)
                 lastX = event.x; lastY = event.y
