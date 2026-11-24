@@ -177,6 +177,7 @@ class PlanCanvasView(context: Context) : View(context) {
 
     fun selectedWall(): PlanWall? = plan.firstOrNull { it.id == selectedWallId && it.levelId == activeLevelId }
     fun activeLevelName(): String = levels.firstOrNull { it.id == activeLevelId }?.name ?: "الطابق"
+    fun activeWalls(): List<PlanWall> = plan.filter { it.levelId == activeLevelId }
 
     fun addLevel(name: String): String {
         val nextElevation = levels.maxOfOrNull { it.elevationMetres + it.heightMetres + it.floorThicknessMetres } ?: 0f
@@ -192,6 +193,7 @@ class PlanCanvasView(context: Context) : View(context) {
         val index = levels.indexOfFirst { it.id == activeLevelId }.coerceAtLeast(0)
         activeLevelId = levels[(index + 1) % levels.size].id
         selectedWallId = null; selectedFurnitureId = null
+        savePlan()
         invalidate()
         return activeLevelName()
     }
@@ -284,7 +286,7 @@ class PlanCanvasView(context: Context) : View(context) {
                 endX = startX
                 endY = startY
                 if (tool != PlanCanvasTool.WALL) {
-                    val furnitureHit = furniture.firstOrNull { item ->
+                    val furnitureHit = furniture.firstOrNull { item -> item.levelId == activeLevelId &&
                         val dx = startX - item.x
                         val dy = startY - item.y
                         val angle = Math.toRadians(-item.rotationDegrees.toDouble())
@@ -388,7 +390,17 @@ class PlanCanvasView(context: Context) : View(context) {
         rooms.clear()
         savePlan();invalidate()
     }
-    fun clearPlan(){if(plan.isNotEmpty() || openings.isNotEmpty() || furniture.isNotEmpty())rememberUndo();plan.clear();rooms.clear();openings.clear();furniture.clear();selectedWallId=null;selectedFurnitureId=null;savePlan();invalidate()}
+    fun clearPlan() {
+        val activeWallIds = plan.filter { it.levelId == activeLevelId }.map { it.id }.toSet()
+        val hasItems = activeWallIds.isNotEmpty() || rooms.any { it.levelId == activeLevelId } || furniture.any { it.levelId == activeLevelId }
+        if (hasItems) rememberUndo()
+        plan.removeAll { it.levelId == activeLevelId }
+        rooms.removeAll { it.levelId == activeLevelId }
+        openings.removeAll { it.wallId in activeWallIds }
+        furniture.removeAll { it.levelId == activeLevelId }
+        selectedWallId = null; selectedFurnitureId = null
+        savePlan(); invalidate()
+    }
 
     fun detectRooms(): Int {
         rooms.removeAll { it.levelId == activeLevelId }
