@@ -26,7 +26,7 @@ The desktop UI/rendering layer is not part of this migration. Swing, Java 3D, AW
 
 1. Added `PlanGeometry.kt`, an Android-independent metric domain layer with finite-coordinate validation, wall length/thickness/height, wall footprint polygon, room polygon area, level metadata, project validation and project bounds.
 2. Moved `PlanWall` out of the drawing view so the view consumes the domain model rather than owning it.
-3. Upgraded local JSON persistence to schema version 3. It stores wall ID, level ID, thickness and height, and still reads older files by supplying defaults for fields absent from version 2.
+3. Upgraded local JSON persistence to schema version 4. It stores wall ID, level ID, thickness and height, and still reads older files by supplying defaults for fields absent from version 2.
 4. Updated the 2D wall stroke to reflect metric thickness and the axonometric preview to render wall footprints as 3D prisms using each wall's height.
 5. Added a half-edge wall graph room detector that splits long segments at T-junctions and extracts bounded room faces. Tests cover a closed room, adjacent rooms and endpoint tolerance.
 6. Added wall selection, drag-move, delete, endpoint/orthogonal snapping, pinch zoom, two-finger pan and editable wall thickness/height. Added host-wall door/window entities with 2D wall gaps, 3D mesh cut-outs and reveals.
