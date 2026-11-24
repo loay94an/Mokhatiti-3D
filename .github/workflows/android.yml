@@ -28,7 +28,7 @@ jobs:
           gradle-version: '8.9'
 
       - name: Build native debug APK
-        run: gradle --no-daemon clean assembleDebug
+        run: gradle --no-daemon clean testDebugUnitTest assembleDebug
 
       - name: Verify APK
         run: |
