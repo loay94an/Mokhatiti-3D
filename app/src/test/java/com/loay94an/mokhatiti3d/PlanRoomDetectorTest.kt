@@ -30,4 +30,16 @@ class PlanRoomDetectorTest {
         assertEquals(6f, rooms.sumOf { it.areaSquareMetres.toDouble() }.toFloat(), 0.001f)
         assertTrue(rooms.all { it.areaSquareMetres > 0f })
     }
+    @Test fun joinsEndpointsWithinTolerance() {
+        val walls = listOf(
+            PlanWall(0f, 0f, 4f, 0f),
+            PlanWall(4.02f, 0f, 4.02f, 3f),
+            PlanWall(4.02f, 3f, 0f, 3f),
+            PlanWall(0f, 3f, 0f, 0f)
+        )
+        val rooms = PlanRoomDetector.detectRooms(walls, endpointToleranceMetres = 0.05f)
+        assertEquals(1, rooms.size)
+        assertTrue(rooms.single().areaSquareMetres > 11.9f)
+    }
+
 }
