@@ -17,7 +17,6 @@ class Room3DView(context: Context, private val walls: List<PlanWall>) : View(con
     private val face = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2.2f; color = Color.rgb(55,72,92) }
     private val caption = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(65,82,102); textSize = 25f }
-    private val wallHeight = 2.8f
 
     private fun project(x: Float, y: Float, z: Float, cx: Float, cy: Float, scale: Float): Pair<Float,Float> {
         return Pair(cx + (x-y)*scale, cy + (x+y)*scale*.43f - z*scale*.92f)
