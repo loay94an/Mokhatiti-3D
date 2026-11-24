@@ -159,7 +159,16 @@ private class PlanGlRenderer(walls: List<PlanWall>, rooms: List<PlanRoom>) : GLS
         val ground=floatArrayOf(0.78f,0.82f,0.86f);val roomColor=floatArrayOf(0.64f,0.79f,0.71f)
         val groundZ=0f
         quad(floatArrayOf(minX-0.5f,minY-0.5f,groundZ),floatArrayOf(maxX+0.5f,minY-0.5f,groundZ),floatArrayOf(maxX+0.5f,maxY+0.5f,groundZ),floatArrayOf(minX-0.5f,maxY+0.5f,groundZ),ground)
-        currentRooms.forEach{room->val p=room.boundary;if(p.size>=3)for(i in 1 until p.lastIndex)triangle(floatArrayOf(p[0].x,p[0].y,0.012f),floatArrayOf(p[i].x,p[i].y,0.012f),floatArrayOf(p[i+1].x,p[i+1].y,0.012f),roomColor)}
+        currentRooms.forEach { room ->
+            PlanPolygonTriangulator.triangulate(room.boundary).forEach { tri ->
+                triangle(
+                    floatArrayOf(tri.first.x, tri.first.y, 0.012f),
+                    floatArrayOf(tri.second.x, tri.second.y, 0.012f),
+                    floatArrayOf(tri.third.x, tri.third.y, 0.012f),
+                    roomColor
+                )
+            }
+        }
         currentWalls.forEachIndexed{index,wall->
             val footprint=wall.footprint();val bottom=footprint.map{floatArrayOf(it.x,it.y,0f)};val top=footprint.map{floatArrayOf(it.x,it.y,wall.height)}
             val color=when(index%3){0->floatArrayOf(0.69f,0.78f,0.86f);1->floatArrayOf(0.58f,0.69f,0.79f);else->floatArrayOf(0.78f,0.84f,0.89f)}
