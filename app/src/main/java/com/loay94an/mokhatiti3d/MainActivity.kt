@@ -71,9 +71,9 @@ class MainActivity : Activity() {
         tool("حذف عنصر") { workspace.setTool(PlanCanvasTool.ERASE); hint.text = "المس الجدار الذي تريد حذفه" }
         tool("تراجع") { workspace.undo(); preview.refresh() }
         tool("غرف") { val count = workspace.detectRooms(); preview.refresh(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
-        tool("مسح") { workspace.clearPlan(); preview.invalidate() }
+        tool("مسح") { workspace.clearPlan(); preview.refresh() }
         tool("حفظ") { workspace.savePlan(); Toast.makeText(this, "تم حفظ المخطط على الجهاز", Toast.LENGTH_SHORT).show() }
-        tool("فتح") { workspace.loadPlan(); preview.invalidate(); Toast.makeText(this, "تم تحميل المخطط المحفوظ", Toast.LENGTH_SHORT).show() }
+        tool("فتح") { workspace.loadPlan(); preview.refresh(); Toast.makeText(this, "تم تحميل المخطط المحفوظ", Toast.LENGTH_SHORT).show() }
         tool("عرض 3D") { show3d(true) }
         tool("مخطط 2D") { show3d(false) }
         tools.addView(toolRow)
@@ -113,7 +113,7 @@ class MainActivity : Activity() {
     private fun show3d(show: Boolean) {
         workspace.visibility = if (show) View.GONE else View.VISIBLE
         preview.visibility = if (show) View.VISIBLE else View.GONE
-        preview.invalidate()
+        preview.refresh()
         hint.text = if (show) "معاينة مجسمة للمخطط الحالي" else "اختر أداة الجدار أو التحديد أو الحذف من الشريط"
     }
 }
