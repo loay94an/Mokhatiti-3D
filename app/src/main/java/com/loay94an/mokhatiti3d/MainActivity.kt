@@ -1,10 +1,12 @@
 package com.loay94an.mokhatiti3d
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import android.graphics.Color
 import android.view.Gravity
+import android.text.InputType
 import android.view.View
 import android.widget.Button
 import android.widget.HorizontalScrollView
@@ -70,6 +72,7 @@ class MainActivity : Activity() {
         tool("جدار") { workspace.setTool(PlanCanvasTool.WALL); hint.text = "اسحب لرسم جدار جديد" }
         tool("تحديد وتحريك") { workspace.setTool(PlanCanvasTool.SELECT); hint.text = "المس الجدار لتحديده ثم اسحبه لتحريكه" }
         tool("حذف عنصر") { workspace.setTool(PlanCanvasTool.ERASE); hint.text = "المس الجدار الذي تريد حذفه" }
+        tool("خصائص الجدار") { editWallProperties() }
         tool("تراجع") { workspace.undo(); preview.refresh() }
         tool("غرف") { val count = workspace.detectRooms(); preview.refresh(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
         tool("مسح") { workspace.clearPlan(); preview.refresh() }
@@ -107,6 +110,45 @@ class MainActivity : Activity() {
         }
         root.addView(footer)
         setContentView(root)
+    }
+
+    private fun editWallProperties() {
+        val wall = workspace.selectedWall()
+        if (wall == null) {
+            Toast.makeText(this, "حدد جداراً أولاً باستخدام أداة التحديد", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val fields = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 12, 24, 4)
+        }
+        val thickness = android.widget.EditText(this).apply {
+            hint = "سماكة الجدار بالمتر"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(wall.thickness.toString())
+        }
+        val height = android.widget.EditText(this).apply {
+            hint = "ارتفاع الجدار بالمتر"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(wall.height.toString())
+        }
+        fields.addView(thickness)
+        fields.addView(height)
+        AlertDialog.Builder(this)
+            .setTitle("خصائص الجدار")
+            .setView(fields)
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("تطبيق") { _, _ ->
+                val t = thickness.text.toString().toFloatOrNull()
+                val h = height.text.toString().toFloatOrNull()
+                if (t == null || h == null || !workspace.updateSelectedWall(t, h)) {
+                    Toast.makeText(this, "أدخل قيماً موجبة وصحيحة", Toast.LENGTH_SHORT).show()
+                } else {
+                    preview.refresh()
+                    Toast.makeText(this, "تم تحديث خصائص الجدار", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .show()
     }
 
     private fun exportProject() {
