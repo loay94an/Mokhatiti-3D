@@ -115,6 +115,35 @@ data class PlanRoom(
         )
 }
 
+data class PlanFurniture(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val category: String,
+    val x: Float,
+    val y: Float,
+    val width: Float,
+    val depth: Float,
+    val height: Float,
+    val rotationDegrees: Float = 0f,
+    val levelId: String = PlanWall.DEFAULT_LEVEL_ID
+) {
+    init {
+        require(id.isNotBlank() && name.isNotBlank() && category.isNotBlank() && levelId.isNotBlank())
+        require(listOf(x, y, width, depth, height, rotationDegrees).all(Float::isFinite))
+        require(width > 0f && depth > 0f && height > 0f)
+    }
+
+    fun footprint(): List<PlanPoint> {
+        val angle = Math.toRadians(rotationDegrees.toDouble())
+        val cosA = kotlin.math.cos(angle).toFloat()
+        val sinA = kotlin.math.sin(angle).toFloat()
+        val halfW = width / 2f
+        val halfD = depth / 2f
+        return listOf(-halfW to -halfD, halfW to -halfD, halfW to halfD, -halfW to halfD).map { (localX, localY) ->
+            PlanPoint(x + localX * cosA - localY * sinA, y + localX * sinA + localY * cosA)
+        }
+    }
+}
 enum class PlanOpeningType { DOOR, WINDOW }
 
 data class PlanOpening(
@@ -153,6 +182,7 @@ data class PlanProject(
     val walls: List<PlanWall> = emptyList(),
     val rooms: List<PlanRoom> = emptyList(),
     val openings: List<PlanOpening> = emptyList(),
+    val furniture: List<PlanFurniture> = emptyList(),
     val levels: List<PlanLevel> = listOf(PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "الطابق الأرضي"))
 ) {
     init {
@@ -163,6 +193,8 @@ data class PlanProject(
         require(walls.map { it.id }.toSet().size == walls.size) { "Wall IDs must be unique" }
         require(rooms.map { it.id }.toSet().size == rooms.size) { "Room IDs must be unique" }
         require(openings.map { it.id }.toSet().size == openings.size) { "Opening IDs must be unique" }
+        require(furniture.map { it.id }.toSet().size == furniture.size) { "Furniture IDs must be unique" }
+        require(furniture.all { it.levelId in levelIds }) { "Every furniture item must reference an existing level" }
         require(walls.all { it.levelId in levelIds }) { "Every wall must reference an existing level" }
         require(rooms.all { it.levelId in levelIds }) { "Every room must reference an existing level" }
         val wallById = walls.associateBy { it.id }
