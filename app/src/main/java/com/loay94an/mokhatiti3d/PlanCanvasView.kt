@@ -13,10 +13,6 @@ import kotlin.math.abs
 import kotlin.math.round
 
 /** Metric editor: geometry is stored in metres, independent of screen resolution. */
-data class PlanWall(val x1: Float, val y1: Float, val x2: Float, val y2: Float) {
-    val lengthMetres: Float get() = kotlin.math.sqrt((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1))
-}
-
 class PlanCanvasView(context: Context) : View(context) {
     val plan = mutableListOf<PlanWall>()
     private val undoStack = ArrayDeque<List<PlanWall>>()
@@ -80,7 +76,14 @@ class PlanCanvasView(context: Context) : View(context) {
             MotionEvent.ACTION_MOVE -> { endX=worldX(event.x);endY=worldY(event.y);invalidate();return true }
             MotionEvent.ACTION_UP -> {
                 endX=worldX(event.x);endY=worldY(event.y)
-                if(abs(endX-startX)+abs(endY-startY)>=.2f){rememberUndo();plan.add(PlanWall(startX,startY,endX,endY));savePlan()}
+                if(abs(endX-startX)+abs(endY-startY)>=.2f){rememberUndo();plan.add(PlanWall(
+                    w.getDouble("x1").toFloat(), w.getDouble("y1").toFloat(),
+                    w.getDouble("x2").toFloat(), w.getDouble("y2").toFloat(),
+                    w.optDouble("thickness", PlanWall.DEFAULT_WALL_THICKNESS_METRES.toDouble()).toFloat(),
+                    w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),
+                    w.optString("id", java.util.UUID.randomUUID().toString()),
+                    w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
+                ));savePlan()}
                 drawing=false;invalidate();performClick();return true
             }
             MotionEvent.ACTION_CANCEL -> {drawing=false;invalidate();return true}
