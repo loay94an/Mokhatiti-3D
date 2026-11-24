@@ -73,6 +73,8 @@ class MainActivity : Activity() {
         tool("تحديد وتحريك") { workspace.setTool(PlanCanvasTool.SELECT); hint.text = "المس الجدار لتحديده ثم اسحبه لتحريكه" }
         tool("حذف عنصر") { workspace.setTool(PlanCanvasTool.ERASE); hint.text = "المس الجدار الذي تريد حذفه" }
         tool("خصائص الجدار") { editWallProperties() }
+        tool("باب") { if (workspace.addOpeningToSelected(PlanOpeningType.DOOR)) preview.refresh() else Toast.makeText(this, "حدد جداراً مناسباً لإضافة الباب", Toast.LENGTH_SHORT).show() }
+        tool("نافذة") { if (workspace.addOpeningToSelected(PlanOpeningType.WINDOW)) preview.refresh() else Toast.makeText(this, "حدد جداراً مناسباً لإضافة النافذة", Toast.LENGTH_SHORT).show() }
         tool("تراجع") { workspace.undo(); preview.refresh() }
         tool("غرف") { val count = workspace.detectRooms(); preview.refresh(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
         tool("مسح") { workspace.clearPlan(); preview.refresh() }
@@ -95,7 +97,7 @@ class MainActivity : Activity() {
         root.addView(hint)
 
         workspace = PlanCanvasView(this)
-        preview = Room3DView(this, workspace.plan, workspace.rooms)
+        preview = Room3DView(this, workspace.plan, workspace.rooms, workspace.openings)
         root.addView(workspace, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(preview, LinearLayout.LayoutParams(-1, 0, 1f))
         preview.visibility = View.GONE
