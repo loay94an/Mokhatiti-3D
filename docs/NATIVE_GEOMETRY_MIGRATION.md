@@ -26,7 +26,7 @@ The desktop UI/rendering layer is not part of this migration. Swing, Java 3D, AW
 
 1. Added `PlanGeometry.kt`, an Android-independent metric domain layer with finite-coordinate validation, wall length/thickness/height, wall footprint polygon, room polygon area, level metadata, project validation and project bounds.
 2. Moved `PlanWall` out of the drawing view so the view consumes the domain model rather than owning it.
-3. Upgraded local JSON persistence to schema version 4. It stores wall ID, level ID, thickness and height, and reads earlier wall-only versions by supplying defaults for missing fields.
+3. Upgraded local JSON persistence to schema version 5. It stores wall ID, level ID, thickness and height, and reads earlier wall-only versions by supplying defaults for missing fields.
 4. Updated the 2D wall stroke to reflect metric thickness and the native OpenGL renderer to consume wall footprint and height data.
 5. Added a half-edge wall graph room detector that splits long segments at T-junctions and extracts bounded room faces. Tests cover a closed room, adjacent rooms and endpoint tolerance.
 6. Added wall selection, drag-move, delete, endpoint/orthogonal snapping, pinch zoom, two-finger pan and editable wall thickness/height. Added host-wall door/window entities with 2D wall gaps, 3D mesh cut-outs and reveals. Added an initial Arabic furniture catalog (sofa, beds, table, chair, cabinet), 2D footprint placement/movement and basic 3D block meshes.
@@ -64,7 +64,7 @@ This is a **first native model-port step**, not the complete Sweet Home 3D engin
 
 ### E. Verification
 - Unit tests for geometry, room area, room-face extraction, concave polygon triangulation, wall-opening bounds, furniture transforms, invalid coordinates and project validation.
-- Compatibility tests loading schema v2/v3 projects and saving/reopening schema v4.
+- Compatibility tests loading schema v2/v3 projects and saving/reopening schema v5.
 - Instrumented tests on phone and tablet profiles; verify touch, rotation, memory and large plans.
 - Do not label the APK complete until these tests and all advertised tools pass.
 
