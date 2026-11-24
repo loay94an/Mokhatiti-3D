@@ -50,7 +50,10 @@ class Room3DView(context: Context, private val sourceWalls: List<PlanWall>, priv
         if (!cameraTouched) {
             val points = wallSnapshot.flatMap { listOf(it.start, it.end) } + roomSnapshot.flatMap { it.boundary } + furnitureSnapshot.flatMap { it.footprint() }
             if (points.isNotEmpty()) {
-                val span = maxOf(points.maxOf { it.x } - points.minOf { it.x }, points.maxOf { it.y } - points.minOf { it.y })
+                val horizontalSpan = maxOf(points.maxOf { it.x } - points.minOf { it.x }, points.maxOf { it.y } - points.minOf { it.y })
+                val verticalSpan = (levelSnapshot.maxOfOrNull { it.elevationMetres + it.heightMetres } ?: 2.8f) -
+                    (levelSnapshot.minOfOrNull { it.elevationMetres } ?: 0f)
+                val span = max(horizontalSpan, verticalSpan)
                 distance = (span * 1.8f + 5f).coerceIn(6f, 150f)
             }
         }
