@@ -406,7 +406,7 @@ class PlanCanvasView(context: Context) : View(context) {
 
     fun detectRooms(): Int {
         rooms.removeAll { it.levelId == activeLevelId }
-        rooms.addAll(PlanRoomDetector.detectRooms(plan.filter { it.levelId == activeLevelId }).map { it.copy(levelId = activeLevelId) })
+        rooms.addAll(PlanRoomDetector.detectRooms(plan.filter { it.levelId == activeLevelId }).map { it.copy(id = activeLevelId + "-" + it.id, levelId = activeLevelId) })
         savePlan()
         invalidate()
         return rooms.size
