@@ -3,6 +3,8 @@ name: Native Android APK
 on:
   push:
     branches: [main, native-engine-foundation, feat/native-sweethome3d-core-port]
+  pull_request:
+    branches: [main, native-engine-foundation]
   workflow_dispatch:
 
 permissions:
