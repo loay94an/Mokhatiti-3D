@@ -15,6 +15,7 @@ import kotlin.math.round
 /** Metric editor: geometry is stored in metres, independent of screen resolution. */
 class PlanCanvasView(context: Context) : View(context) {
     val plan = mutableListOf<PlanWall>()
+    val rooms = mutableListOf<PlanRoom>()
     private val undoStack = ArrayDeque<List<PlanWall>>()
     private val prefs get() = context.getSharedPreferences("mokhatiti_native", Context.MODE_PRIVATE)
     private var pixelsPerMetre = 72f
@@ -96,12 +97,26 @@ class PlanCanvasView(context: Context) : View(context) {
         else if(plan.isNotEmpty()) plan.removeAt(plan.lastIndex)
         savePlan();invalidate()
     }
-    fun clearPlan(){if(plan.isNotEmpty())rememberUndo();plan.clear();savePlan();invalidate()}
+    fun clearPlan(){if(plan.isNotEmpty())rememberUndo();plan.clear();rooms.clear();savePlan();invalidate()}
+
+    fun detectRooms(): Int {
+        rooms.clear()
+        rooms.addAll(PlanRoomDetector.detectRooms(plan))
+        savePlan()
+        invalidate()
+        return rooms.size
+    }
 
     fun savePlan() {
         val walls=JSONArray()
         plan.forEach { w -> walls.put(JSONObject().put("id",w.id).put("levelId",w.levelId).put("x1",w.x1).put("y1",w.y1).put("x2",w.x2).put("y2",w.y2).put("thickness",w.thickness).put("height",w.height)) }
-        val project=JSONObject().put("format","mokhatiti-native").put("version",3).put("unit","metre").put("walls",walls)
+        val roomArray=JSONArray()
+        rooms.forEach { room ->
+            val boundary=JSONArray()
+            room.boundary.forEach { point -> boundary.put(JSONObject().put("x",point.x).put("y",point.y)) }
+            roomArray.put(JSONObject().put("id",room.id).put("name",room.name).put("levelId",room.levelId).put("boundary",boundary))
+        }
+        val project=JSONObject().put("format","mokhatiti-native").put("version",3).put("unit","metre").put("walls",walls).put("rooms",roomArray)
         prefs.edit().putString("plan_json",project.toString()).apply()
     }
     fun loadPlan() {
@@ -110,6 +125,7 @@ class PlanCanvasView(context: Context) : View(context) {
             val root=JSONObject(raw)
             val walls=if(root.has("walls"))root.getJSONArray("walls") else JSONArray(raw)
             plan.clear()
+            rooms.clear()
             for (i in 0 until walls.length()) {
                 val w = walls.getJSONObject(i)
                 plan.add(
@@ -124,6 +140,16 @@ class PlanCanvasView(context: Context) : View(context) {
                         w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
                     )
                 )
+            }
+            val savedRooms = root.optJSONArray("rooms") ?: JSONArray()
+            for (i in 0 until savedRooms.length()) {
+                val room = savedRooms.getJSONObject(i)
+                val boundaryJson = room.getJSONArray("boundary")
+                val boundary = (0 until boundaryJson.length()).map { index ->
+                    val point = boundaryJson.getJSONObject(index)
+                    PlanPoint(point.getDouble("x").toFloat(), point.getDouble("y").toFloat())
+                }
+                if (boundary.size >= 3) rooms.add(PlanRoom(room.optString("id", "room-$i"), room.optString("name", "غرفة ${i + 1}"), boundary, room.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)))
             }
             invalidate()
         } catch (_:Exception) { /* preserve editor availability if local data is invalid */ }
