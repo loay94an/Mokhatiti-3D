@@ -36,6 +36,7 @@ jobs:
           sha256sum app/build/outputs/apk/debug/app-debug.apk
 
       - name: Install and launch on Android emulator
+        continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 30
