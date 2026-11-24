@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, native-engine-foundation, feat/native-sweethome3d-core-port]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, native-engine-foundation]
   workflow_dispatch:
 
