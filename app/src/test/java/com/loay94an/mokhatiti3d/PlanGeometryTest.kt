@@ -57,4 +57,20 @@ class PlanGeometryTest {
         }
     }
 
+    @Test
+    fun rejectsOverlappingOpeningsOnTheSameWall() {
+        val wall = PlanWall(0f, 0f, 5f, 0f)
+        val first = PlanOpening(wallId = wall.id, type = PlanOpeningType.DOOR, offsetMetres = 1f, widthMetres = 1f, heightMetres = 2f)
+        val second = PlanOpening(wallId = wall.id, type = PlanOpeningType.WINDOW, offsetMetres = 1.5f, widthMetres = 1f, heightMetres = 1f, sillHeightMetres = 1f)
+        assertThrows(IllegalArgumentException::class.java) {
+            PlanProject(walls = listOf(wall), openings = listOf(first, second))
+        }
+    }
+
+    @Test
+    fun rejectsZeroAreaRooms() {
+        assertThrows(IllegalArgumentException::class.java) {
+            PlanRoom("flat", "غرفة", listOf(PlanPoint(0f, 0f), PlanPoint(1f, 0f), PlanPoint(2f, 0f)))
+        }
+    }
 }
