@@ -76,18 +76,11 @@ class PlanCanvasView(context: Context) : View(context) {
             MotionEvent.ACTION_MOVE -> { endX=worldX(event.x);endY=worldY(event.y);invalidate();return true }
             MotionEvent.ACTION_UP -> {
                 endX=worldX(event.x);endY=worldY(event.y)
-                if(abs(endX-startX)+abs(endY-startY)>=.2f){rememberUndo();plan.add(PlanWall(
-                    w.getDouble("x1").toFloat(), w.getDouble("y1").toFloat(),
-                    w.getDouble("x2").toFloat(), w.getDouble("y2").toFloat(),
-                    w.optDouble("thickness", PlanWall.DEFAULT_WALL_THICKNESS_METRES.toDouble()).toFloat(),
-                    w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),
-                    w.optString("id", java.util.UUID.randomUUID().toString()),
-                    w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
-                )).toFloat(),
-                    w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),
-                    w.optString("id", java.util.UUID.randomUUID().toString()),
-                    w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
-                ));savePlan()}
+                if (abs(endX - startX) + abs(endY - startY) >= .2f) {
+                    rememberUndo()
+                    plan.add(PlanWall(startX, startY, endX, endY))
+                    savePlan()
+                }
                 drawing=false;invalidate();performClick();return true
             }
             MotionEvent.ACTION_CANCEL -> {drawing=false;invalidate();return true}
