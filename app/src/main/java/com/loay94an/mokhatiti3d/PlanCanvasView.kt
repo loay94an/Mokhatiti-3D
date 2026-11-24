@@ -218,37 +218,54 @@ class PlanCanvasView(context: Context) : View(context) {
         return rooms.size
     }
 
-    fun savePlan() {
-        val walls=JSONArray()
-        plan.forEach { w -> walls.put(JSONObject().put("id",w.id).put("levelId",w.levelId).put("x1",w.x1).put("y1",w.y1).put("x2",w.x2).put("y2",w.y2).put("thickness",w.thickness).put("height",w.height)) }
-        val roomArray=JSONArray()
-        rooms.forEach { room ->
-            val boundary=JSONArray()
-            room.boundary.forEach { point -> boundary.put(JSONObject().put("x",point.x).put("y",point.y)) }
-            roomArray.put(JSONObject().put("id",room.id).put("name",room.name).put("levelId",room.levelId).put("boundary",boundary))
+    fun exportPlanJson(): String {
+        val walls = JSONArray()
+        plan.forEach { wall ->
+            walls.put(JSONObject()
+                .put("id", wall.id).put("levelId", wall.levelId)
+                .put("x1", wall.x1).put("y1", wall.y1)
+                .put("x2", wall.x2).put("y2", wall.y2)
+                .put("thickness", wall.thickness).put("height", wall.height))
         }
-        val project=JSONObject().put("format","mokhatiti-native").put("version",3).put("unit","metre").put("walls",walls).put("rooms",roomArray)
-        prefs.edit().putString("plan_json",project.toString()).apply()
+        val roomArray = JSONArray()
+        rooms.forEach { room ->
+            val boundary = JSONArray()
+            room.boundary.forEach { point ->
+                boundary.put(JSONObject().put("x", point.x).put("y", point.y))
+            }
+            roomArray.put(JSONObject()
+                .put("id", room.id).put("name", room.name)
+                .put("levelId", room.levelId).put("boundary", boundary))
+        }
+        return JSONObject()
+            .put("format", "mokhatiti-native")
+            .put("version", 3)
+            .put("unit", "metre")
+            .put("walls", walls)
+            .put("rooms", roomArray)
+            .toString(2)
     }
-    fun loadPlan() {
-        val raw=prefs.getString("plan_json",null)?:return
-        try {
+
+    fun savePlan() {
+        prefs.edit().putString("plan_json", exportPlanJson()).apply()
+    }
+
+    fun importPlanJson(raw: String): Boolean {
+        return try {
             val root = if (raw.trimStart().startsWith("{")) JSONObject(raw) else null
             val walls = root?.optJSONArray("walls") ?: JSONArray(raw)
-            plan.clear()
-            rooms.clear()
+            val loadedWalls = mutableListOf<PlanWall>()
+            val loadedRooms = mutableListOf<PlanRoom>()
             for (i in 0 until walls.length()) {
-                val w = walls.getJSONObject(i)
-                plan.add(
+                val wall = walls.getJSONObject(i)
+                loadedWalls.add(
                     PlanWall(
-                        w.getDouble("x1").toFloat(),
-                        w.getDouble("y1").toFloat(),
-                        w.getDouble("x2").toFloat(),
-                        w.getDouble("y2").toFloat(),
-                        w.optDouble("thickness", PlanWall.DEFAULT_WALL_THICKNESS_METRES.toDouble()).toFloat(),
-                        w.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),
-                        w.optString("id", java.util.UUID.randomUUID().toString()),
-                        w.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
+                        wall.getDouble("x1").toFloat(), wall.getDouble("y1").toFloat(),
+                        wall.getDouble("x2").toFloat(), wall.getDouble("y2").toFloat(),
+                        wall.optDouble("thickness", PlanWall.DEFAULT_WALL_THICKNESS_METRES.toDouble()).toFloat(),
+                        wall.optDouble("height", PlanWall.DEFAULT_WALL_HEIGHT_METRES.toDouble()).toFloat(),
+                        wall.optString("id", java.util.UUID.randomUUID().toString()),
+                        wall.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
                     )
                 )
             }
@@ -260,9 +277,31 @@ class PlanCanvasView(context: Context) : View(context) {
                     val point = boundaryJson.getJSONObject(index)
                     PlanPoint(point.getDouble("x").toFloat(), point.getDouble("y").toFloat())
                 }
-                if (boundary.size >= 3) rooms.add(PlanRoom(room.optString("id", "room-$i"), room.optString("name", "غرفة ${i + 1}"), boundary, room.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)))
+                if (boundary.size >= 3) {
+                    loadedRooms.add(
+                        PlanRoom(
+                            room.optString("id", "room-$i"),
+                            room.optString("name", "غرفة ${i + 1}"),
+                            boundary,
+                            room.optString("levelId", PlanWall.DEFAULT_LEVEL_ID)
+                        )
+                    )
+                }
             }
+            plan.clear()
+            plan.addAll(loadedWalls)
+            rooms.clear()
+            rooms.addAll(loadedRooms)
+            savePlan()
             invalidate()
-        } catch (_:Exception) { /* preserve editor availability if local data is invalid */ }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun loadPlan() {
+        val raw = prefs.getString("plan_json", null) ?: return
+        importPlanJson(raw)
     }
 }
