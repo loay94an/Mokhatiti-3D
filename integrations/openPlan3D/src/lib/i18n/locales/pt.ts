@@ -1567,6 +1567,8 @@ export const pt = {
   "customModelValidation.unsupportedExtension": "Extensão GLB não suportada: a importação local de modelos ainda não aceita {name}.",
   "customModelValidation.undeclaredExtension": "Extensão GLB não suportada: {name} não está declarada em extensionsUsed.",
   "renderLab.title": "Laboratório de renderização",
+  "renderLab.localFloorplan": "Planta local",
+  "renderLab.viewerCanvas": "Renderização interativa da planta",
   "renderLab.browserRendering": "Renderização no navegador",
   "renderLab.localWorkspace": "Espaço de trabalho local",
   "renderLab.eyebrow": "ESTUDO DE RENDERIZAÇÃO / 01",
