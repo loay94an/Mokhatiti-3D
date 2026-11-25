@@ -44,7 +44,7 @@
     } catch (error) { importError = error instanceof Error ? error.message : $t('welcome.projectFailed'); }
   }
 
-  function startFromScratch() { return createProject(() => createDefaultProject('Untitled Project')); }
+  function startFromScratch() { return createProject(() => createDefaultProject()); }
   function useHouseTemplate(index: number) { return createProject(houseTemplates[index].create); }
 
   let showTemplates = $state(false);
