@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { t } from '$lib/i18n';
   import { dev } from '$app/environment';
   import type { createViewer, LabStatus } from '$lib/renderLab/viewer';
   let { startupModel = '' }: { startupModel?: string } = $props();
@@ -7,18 +8,18 @@
   let viewer: Awaited<ReturnType<typeof createViewer>> | undefined;
   let status = $state<LabStatus>({ samples: 0, triangles: 0, mode: 'Starting' });
   let loading = $state(true), loaded = $state(false), quality = $state(true), paused = $state(false);
-  let error = $state(''), name = $state('Local floorplan'), exposure = $state(1);
+  let error = $state(''), name = $state(''), exposure = $state(1);
   let selectedView = $state('isometric');
   async function load(buffer: ArrayBuffer, title: string) {
     loading = true; error = '';
-    try { if (!viewer) throw new Error('The renderer is unavailable. Reload using a browser with WebGL 2 support.'); await viewer.load(buffer); loaded = true; name = title; selectedView = 'isometric'; }
+    try { if (!viewer) throw new Error($t('renderLab.rendererUnavailable')); await viewer.load(buffer); loaded = true; name = title; selectedView = 'isometric'; }
     catch (e) { error = e instanceof Error ? e.message : String(e); }
     finally { loading = false; }
   }
   async function fileChanged(event: Event) {
     const input = event.currentTarget as HTMLInputElement; const file = input.files?.[0];
     if (!file) return;
-    if (file.size > 128 * 1024 * 1024) { error = 'Choose a GLB smaller than 128 MB.'; input.value = ''; return; }
+    if (file.size > 128 * 1024 * 1024) { error = $t('renderLab.fileTooLarge'); input.value = ''; return; }
     await load(await file.arrayBuffer(), file.name.replace(/\.glb$/i, '')); input.value = '';
   }
   function setView(view: string) { selectedView = view; viewer?.preset(view); }
@@ -43,53 +44,53 @@
   });
 </script>
 
-<svelte:head><title>Render lab · OpenPlan3D</title><meta name="robots" content="noindex" /></svelte:head>
+<svelte:head><title>{$t('renderLab.title')} · OpenPlan3D</title><meta name="robots" content="noindex" /></svelte:head>
 <div class="lab">
   <header>
-    <a href="/" class="brand"><span class="mark">◈</span> OpenPlan3D <span class="divider">/</span> <span class="light">Render lab</span></a>
-    <div class="private"><span></span> {startupModel ? 'Browser rendering' : 'Local workspace'}</div>
+    <a href="/" class="brand"><span class="mark">◈</span> OpenPlan3D <span class="divider">/</span> <span class="light">{$t('renderLab.title')}</span></a>
+    <div class="private"><span></span> {startupModel ? $t('renderLab.browserRendering') : $t('renderLab.localWorkspace')}</div>
   </header>
   <main>
     <aside>
-      <div class="eyebrow">RENDER STUDY / 01</div>
-      <h1>A different<br />point of view.</h1>
-      <p class="intro">Explore your captured space with natural light, real materials, and a little more detail.</p>
+      <div class="eyebrow">{$t('renderLab.eyebrow')}</div>
+      <h1>{$t('renderLab.heading')}</h1>
+      <p class="intro">{$t('renderLab.intro')}</p>
       <section>
-        <div class="section-title">Rendering <span class="tag">THREE.JS</span></div>
+        <div class="section-title">{$t('renderLab.rendering')} <span class="tag">THREE.JS</span></div>
         <div class="modes">
-          <button class:active={!quality} disabled={!loaded || loading} onclick={() => { quality = false; paused = false; viewer?.setQuality(false); }}>Interactive</button>
-          <button class:active={quality} disabled={!loaded || loading} onclick={() => { quality = true; paused = false; viewer?.setQuality(true); }}>Path traced</button>
+          <button class:active={!quality} disabled={!loaded || loading} onclick={() => { quality = false; paused = false; viewer?.setQuality(false); }}>{$t('renderLab.interactive')}</button>
+          <button class:active={quality} disabled={!loaded || loading} onclick={() => { quality = true; paused = false; viewer?.setQuality(true); }}>{$t('renderLab.pathTraced')}</button>
         </div>
-        <p class="hint">{quality ? 'Light refines while you hold the view still. Moving the camera restarts the render.' : 'A fast preview for exploring the space. Switch to path tracing for softer light and reflections.'}</p>
-        <div class="progress-label"><span>{status.mode}</span><strong>{quality ? `${status.samples} / 512` : 'Live'}</strong></div>
+        <p class="hint">{quality ? $t('renderLab.pathHint') : $t('renderLab.interactiveHint')}</p>
+        <div class="progress-label"><span>{status.mode === 'Starting' ? $t('renderLab.statusStarting') : status.mode === 'Paused' ? $t('renderLab.statusPaused') : status.mode === 'Path tracing' ? $t('renderLab.statusPathTracing') : $t('renderLab.statusInteractive')}</span><strong>{quality ? `${status.samples} / 512` : $t('renderLab.live')}</strong></div>
         <div class="progress"><div style={`width:${quality ? status.samples / 512 * 100 : 100}%`}></div></div>
-        <button class="text-button" disabled={!loaded || !quality} onclick={() => { paused = !paused; viewer?.setPaused(paused); }}>{paused ? 'Resume refinement' : 'Pause refinement'}</button>
+        <button class="text-button" disabled={!loaded || !quality} onclick={() => { paused = !paused; viewer?.setPaused(paused); }}>{paused ? $t('renderLab.resume') : $t('renderLab.pause')}</button>
       </section>
       <section>
-        <div class="section-title">Camera</div>
+        <div class="section-title">{$t('renderLab.camera')}</div>
         <div class="views">
-          {#each [['isometric', 'Overview'], ['top', 'Top down'], ['reverse', 'Reverse']] as [value, label]}
-            <button class:chosen={selectedView === value} disabled={!loaded} onclick={() => setView(value)}>{label}</button>
+          {#each [['isometric', 'overview'], ['top', 'topDown'], ['reverse', 'reverse']] as [value, label]}
+            <button class:chosen={selectedView === value} disabled={!loaded} onclick={() => setView(value)}>{$t(`renderLab.${label}`)}</button>
           {/each}
         </div>
-        <label class="exposure" for="exposure">Exposure <span>{exposure.toFixed(2)}</span></label>
+        <label class="exposure" for="exposure">{$t('renderLab.exposure')} <span>{exposure.toFixed(2)}</span></label>
         <input id="exposure" type="range" min="0.4" max="2" step="0.05" bind:value={exposure} oninput={() => viewer?.setExposure(exposure)} />
       </section>
       <section class="files">
-        <button class="export" disabled={!loaded || loading} onclick={() => viewer?.exportPNG()}>Save this view <span>↗</span></button>
-        <label class="open-file">Open a local GLB<input type="file" accept=".glb" disabled={loading} onchange={fileChanged} /></label>
-        <p class="hint">Files stay in your browser. No uploads, accounts, or cloud rendering.</p>
+        <button class="export" disabled={!loaded || loading} onclick={() => viewer?.exportPNG()} >{$t('renderLab.saveView')} <span>↗</span></button>
+        <label class="open-file">{$t('renderLab.openGlb')}<input type="file" accept=".glb" disabled={loading} onchange={fileChanged} /></label>
+        <p class="hint">{$t('renderLab.localPrivacy')}</p>
       </section>
-      <div class="footnote">EXPERIMENTAL PREVIEW<br /><span>Photo-informed materials. Modeled furniture. Not a measured reconstruction.</span></div>
+      <div class="footnote">{$t('renderLab.experimental')}<br /><span>{$t('renderLab.disclaimer')}</span></div>
     </aside>
     <div class="viewport">
       <div class="canvas-host" bind:this={host}></div>
-      <div class="scene-label"><span class="dot"></span>{name}<span class="model-count">{loaded ? `${Math.round(status.triangles / 1000)}k triangles` : 'No model loaded'}</span></div>
-      {#if loading}<div class="message" role="status"><span class="spinner"></span>Preparing your scene…</div>{/if}
-      {#if !loaded && !loading && !error}<div class="message">Open a local GLB to start exploring.</div>{/if}
+      <div class="scene-label"><span class="dot"></span>{name || $t('renderLab.localFloorplan')}<span class="model-count">{loaded ? `${Math.round(status.triangles / 1000)}k triangles` : $t('renderLab.noModel')}</span></div>
+      {#if loading}<div class="message" role="status"><span class="spinner"></span>{$t('renderLab.preparing')}</div>{/if}
+      {#if !loaded && !loading && !error}<div class="message">{$t('renderLab.openToExplore')}</div>{/if}
       {#if error}<div class="error" role="alert">{error}</div>{/if}
-      <div class="gesture">Drag to orbit <i>·</i> Scroll to zoom <i>·</i> Right-drag to pan</div>
-      <div class="corner">01 <span>/</span> SPATIAL STUDY</div>
+      <div class="gesture">{$t('renderLab.gesture')}</div>
+      <div class="corner">01 <span>/</span> {$t('renderLab.spatialStudy')}</div>
     </div>
   </main>
 </div>
