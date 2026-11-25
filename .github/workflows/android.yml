@@ -132,6 +132,9 @@ jobs:
       - name: Patch remaining Arabic UI messages
         run: python3 scripts/patch-arabic-localization-json.py third_party/SweetHome3D/SweetHome3DJS/lib/resources/localization_ar.json
 
+      - name: Audit generated Arabic UI strings
+        run: python3 scripts/audit-arabic-localization-json.py third_party/SweetHome3D/SweetHome3DJS/lib/resources/localization_ar.json
+
       - name: Package the upstream editor into Android assets
         shell: bash
         run: |
