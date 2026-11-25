@@ -40,12 +40,12 @@ Do not overwrite the repository root, Android wrapper, or existing Sweet Home 3D
 
 ## Current import progress
 
-The source archive is being transferred in sequential batches to branch `feat/openplan3d-import-arabic`, under `integrations/openPlan3D/`. The first four batches have committed **33 source/project files** so far, including:
+The source archive is being transferred in sequential batches to branch `feat/openplan3d-import-arabic`, under `integrations/openPlan3D/`. The first six batches have committed **53 source/project files** so far, including:
 
 - MIT license and runtime/package/build configuration
 - Svelte application shell and TypeScript declarations
 - Original locale engine and label maps
-- Selected geometry, export, canvas, camera, drawing-scheduler and image utility modules
+- Selected geometry, export, canvas, camera, drawing-scheduler, image utilities, deployment services and UI alert components
 
 The existing Arabic starter dictionary and this status report are additional integration files, not part of the 33 upstream source files. The upload is still partial: the archive contains 1,161 files. No claim is made that all assets, models, tests, documentation or application modules have been transferred.
 
