@@ -8,6 +8,7 @@ import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewConfiguration
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
@@ -30,6 +31,9 @@ class PlanCanvasView(context: Context) : View(context) {
     private var selectedFurnitureId: String? = null
     private var selectionStartX = 0f
     private var selectionStartY = 0f
+    private var selectionDownScreenX = 0f
+    private var selectionDownScreenY = 0f
+    private val touchSlopPx = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private var selectionMoved = false
     private data class EditorSnapshot(
         val walls: List<PlanWall>,
@@ -345,6 +349,8 @@ class PlanCanvasView(context: Context) : View(context) {
             MotionEvent.ACTION_DOWN -> {
                 lastFocusX = event.x
                 lastFocusY = event.y
+                selectionDownScreenX = event.x
+                selectionDownScreenY = event.y
                 val start = if (tool == PlanCanvasTool.WALL) snappedPoint(worldX(event.x), worldY(event.y)) else PlanPoint(worldX(event.x), worldY(event.y))
                 startX = start.x
                 startY = start.y
@@ -401,7 +407,7 @@ class PlanCanvasView(context: Context) : View(context) {
                 endX = current.x
                 endY = current.y
                 if (tool == PlanCanvasTool.SELECT && (selectedWallId != null || selectedFurnitureId != null)) {
-                    selectionMoved = kotlin.math.hypot(endX - selectionStartX, endY - selectionStartY) > 0.03f
+                    selectionMoved = kotlin.math.hypot(event.x - selectionDownScreenX, event.y - selectionDownScreenY) > touchSlopPx
                 }
                 invalidate()
                 return true
