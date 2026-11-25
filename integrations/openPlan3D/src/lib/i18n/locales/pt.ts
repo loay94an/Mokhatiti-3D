@@ -1618,6 +1618,7 @@ export const pt = {
   "renderLab.errorJson": "Os metadados GLB não são um JSON válido."
 
   "provider.errorAbsoluteUrl": "Insira uma URL absoluta do provedor, como https://api.openai.com/v1.",
+  "provider.errorRequestFailed": "A solicitação ao provedor falhou (HTTP {status})."
   "provider.errorHttps": "Use HTTPS para provedores remotos. HTTP é permitido apenas para localhost, 127.0.0.1 ou [::1].",
   "provider.errorCredentials": "A URL do provedor não pode conter credenciais, consulta ou fragmento. Insira a chave separadamente.",
   "provider.errorNoProxy": "Escolha a URL do seu provedor de IA. Este aplicativo não hospeda um proxy de IA.",
