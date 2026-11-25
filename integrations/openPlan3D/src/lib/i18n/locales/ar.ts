@@ -5,7 +5,7 @@ import type { TranslationKey } from '../index';
  * Keys not yet translated deliberately fall back to the source English string;
  * this keeps interpolation and application behavior intact while coverage grows.
  */
-export const ar: Partial<Record<TranslationKey, string>> = {
+export const ar: Record<TranslationKey, string> = {
   "settings.title": "الإعدادات",
   "settings.close": "إغلاق الإعدادات",
   "settings.tabProject": "المشروع",
