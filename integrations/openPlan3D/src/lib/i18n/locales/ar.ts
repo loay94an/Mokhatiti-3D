@@ -1583,6 +1583,8 @@ export const ar: Partial<Record<TranslationKey, string>> = {
   "customModelValidation.undeclaredExtension": "امتداد GLB غير مدعوم: لم يُدرج {name} ضمن extensionsUsed.",
 
   "renderLab.title": "مختبر التصيير",
+  "renderLab.localFloorplan": "مخطط محلي",
+  "renderLab.viewerCanvas": "تصيير تفاعلي للمخطط",
   "renderLab.browserRendering": "التصيير عبر المتصفح",
   "renderLab.localWorkspace": "مساحة عمل محلية",
   "renderLab.eyebrow": "دراسة التصيير / 01",
