@@ -698,7 +698,7 @@ export const en = {
   "catalogCategories.pathsLawns": "Paths & Lawns",
   "catalogCategories.poolSpa": "Pool & Spa",
   "roomPlanDialog.title": "Import RoomPlan",
-  "roomPlanDialog.captureProjectName": "Room capture {code}",
+  "roomPlanDialog.captureProjectName": "Room Capture {code}",
   "roomPlanDialog.importedProjectName": "RoomPlan Import",
   "roomPlanDialog.straighten": "Straighten walls",
   "roomPlanDialog.straightenHelp": "Snap near-horizontal/vertical walls to axis",
