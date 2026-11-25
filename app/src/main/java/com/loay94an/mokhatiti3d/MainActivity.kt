@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
+import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
@@ -15,9 +16,11 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.webkit.WebViewAssetLoader
 
 class MainActivity : ComponentActivity() {
     private lateinit var engineView: WebView
+    private lateinit var assetLoader: WebViewAssetLoader
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingSaveBytes: ByteArray? = null
 
@@ -49,6 +52,7 @@ class MainActivity : ComponentActivity() {
                 ?: throw IllegalStateException("تعذر فتح ملف الحفظ")
             Toast.makeText(this, "تم حفظ ملف المشروع", Toast.LENGTH_SHORT).show()
         } catch (error: Exception) {
+            Log.e(TAG, "Save project failed", error)
             Toast.makeText(this, "فشل حفظ المشروع: ${error.localizedMessage}", Toast.LENGTH_LONG).show()
         }
     }
@@ -60,10 +64,11 @@ class MainActivity : ComponentActivity() {
                 val bytes = Base64.decode(base64Data, Base64.DEFAULT)
                 runOnUiThread {
                     pendingSaveBytes = bytes
-                    val safeName = fileName.substringAfterLast('/').ifBlank { "مشروع.sh3d" }
+                    val safeName = fileName.substringAfterLast('/').ifBlank { "مشروع.sh3x" }
                     savePicker.launch(safeName)
                 }
             } catch (error: Exception) {
+                Log.e(TAG, "Prepare project save failed", error)
                 runOnUiThread {
                     Toast.makeText(
                         this@MainActivity,
@@ -80,14 +85,18 @@ class MainActivity : ComponentActivity() {
         window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
         setContentView(R.layout.activity_main)
 
+        assetLoader = WebViewAssetLoader.Builder()
+            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
+            .build()
+
         engineView = findViewById(R.id.engineView)
         engineView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
-            allowFileAccess = true
-            allowFileAccessFromFileURLs = true
-            allowUniversalAccessFromFileURLs = true
+            allowFileAccess = false
+            allowFileAccessFromFileURLs = false
+            allowUniversalAccessFromFileURLs = false
             allowContentAccess = true
             javaScriptCanOpenWindowsAutomatically = false
             setSupportMultipleWindows(false)
@@ -101,8 +110,22 @@ class MainActivity : ComponentActivity() {
         engineView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         engineView.addJavascriptInterface(AndroidFileBridge(), "AndroidFileBridge")
         engineView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest
+            ) = assetLoader.shouldInterceptRequest(request.url)
+
+            override fun shouldOverrideUrlLoading(
+                view: WebView,
+                request: WebResourceRequest
+            ): Boolean {
+                val uri = request.url
+                return uri.scheme != "https" || uri.host != ASSET_HOST
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                if (url != START_URL) return
                 view.evaluateJavascript(
                     """
                     (function() {
@@ -114,44 +137,65 @@ class MainActivity : ComponentActivity() {
                           if (!anchor || !anchor.href || anchor.href.indexOf('blob:') !== 0) return;
                           event.preventDefault();
                           event.stopImmediatePropagation();
-                          var name = anchor.getAttribute('download') || 'مشروع.sh3d';
-                          fetch(anchor.href).then(function(response) { return response.blob(); })
-                            .then(function(blob) {
-                              return new Promise(function(resolve, reject) {
-                                var reader = new FileReader();
-                                reader.onload = function() { resolve(String(reader.result).split(',')[1]); };
-                                reader.onerror = reject;
-                                reader.readAsDataURL(blob);
-                              });
-                            })
-                            .then(function(base64) { AndroidFileBridge.saveFile(name, base64); })
-                            .catch(function(error) { console.error('Native save failed', error); });
+                          var name = anchor.getAttribute('download') || 'مشروع.sh3x';
+                          fetch(anchor.href).then(function(response) {
+                            if (!response.ok) throw new Error('تعذر قراءة ملف المشروع');
+                            return response.blob();
+                          }).then(function(blob) {
+                            return new Promise(function(resolve, reject) {
+                              var reader = new FileReader();
+                              reader.onload = function() {
+                                resolve(String(reader.result).split(',')[1]);
+                              };
+                              reader.onerror = reject;
+                              reader.readAsDataURL(blob);
+                            });
+                          }).then(function(base64) {
+                            AndroidFileBridge.saveFile(name, base64);
+                          }).catch(function(error) {
+                            console.error('Native save failed', error);
+                            alert('تعذر حفظ المشروع: ' + error.message);
+                          });
                         }, true);
                       }
-                      var canvas = document.createElement('canvas');
-                      var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-                      var result = {
-                        application: typeof application === 'object',
-                        plan: !!document.getElementById('home-plan'),
-                        view3D: !!document.getElementById('home-3D-view'),
-                        webgl: !!gl,
-                        arabic: document.documentElement.lang === 'ar' && document.documentElement.dir === 'rtl'
-                      };
-                      console.log('MOKHATITI_SMOKE ' + JSON.stringify(result));
-                      return result;
-                    })()
+                      window.setTimeout(function() {
+                        var canvas3D = document.getElementById('home-3D-view');
+                        var gl = canvas3D && (canvas3D.getContext('webgl') ||
+                            canvas3D.getContext('experimental-webgl'));
+                        var homes = window.application && application.getHomes
+                            ? application.getHomes() : [];
+                        var plan = document.getElementById('home-plan');
+                        var result = {
+                          application: typeof application === 'object',
+                          homeCount: homes.length,
+                          plan: !!plan,
+                          view3D: !!canvas3D,
+                          webgl: !!gl,
+                          webglVersion: gl ? gl.getParameter(gl.VERSION) : '',
+                          arabic: document.documentElement.lang === 'ar' &&
+                                  document.documentElement.dir === 'rtl'
+                        };
+                        console.log('MOKHATITI_SMOKE ' + JSON.stringify(result));
+                      }, 5000);
+                    })();
                     """.trimIndent()
-                ) { result ->
-                    android.util.Log.i("MokhatitiSmoke", result ?: "null")
-                }
+                )
             }
 
-            override fun shouldOverrideUrlLoading(
+            override fun onReceivedError(
                 view: WebView,
-                request: WebResourceRequest
-            ): Boolean {
-                val uri = request.url
-                return uri.scheme != "file" && uri.scheme != "about"
+                request: WebResourceRequest,
+                error: android.webkit.WebResourceError
+            ) {
+                super.onReceivedError(view, request, error)
+                if (request.isForMainFrame) {
+                    Log.e(TAG, "Editor page load failed: ${error.description}")
+                    Toast.makeText(
+                        this@MainActivity,
+                        "تعذر تحميل محرر التصميم",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         }
         engineView.webChromeClient = object : WebChromeClient() {
@@ -166,15 +210,19 @@ class MainActivity : ComponentActivity() {
                     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "*/*"
-                        putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
-                            "application/x-sweethome3d",
-                            "application/octet-stream",
-                            "application/zip"
-                        ))
+                        putExtra(
+                            Intent.EXTRA_MIME_TYPES,
+                            arrayOf(
+                                "application/x-sweethome3d",
+                                "application/octet-stream",
+                                "application/zip"
+                            )
+                        )
                     }
                     filePicker.launch(intent)
                     true
-                } catch (_: Exception) {
+                } catch (error: Exception) {
+                    Log.e(TAG, "Open document picker failed", error)
                     filePathCallback = null
                     Toast.makeText(
                         this@MainActivity,
@@ -186,31 +234,33 @@ class MainActivity : ComponentActivity() {
             }
 
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
-                android.util.Log.d(
+                Log.d(
                     "MokhatitiEngine",
                     "${message.message()} — ${message.sourceId()}:${message.lineNumber()}"
                 )
                 return true
             }
         }
-
-        engineView.loadUrl("file:///android_asset/engine/test/testHome.html?skipTests=true")
-    }
-
-    override fun onBackPressed() {
-        if (::engineView.isInitialized && engineView.canGoBack()) {
-            engineView.goBack()
-        } else {
-            super.onBackPressed()
-        }
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+        engineView.loadUrl(START_URL)
     }
 
     override fun onDestroy() {
+        filePathCallback?.onReceiveValue(null)
+        filePathCallback = null
+        pendingSaveBytes = null
         if (::engineView.isInitialized) {
             engineView.stopLoading()
             engineView.removeJavascriptInterface("AndroidFileBridge")
             engineView.destroy()
         }
         super.onDestroy()
+    }
+
+    companion object {
+        private const val TAG = "Mokhatiti"
+        private const val ASSET_HOST = "appassets.androidplatform.net"
+        private const val START_URL =
+            "https://appassets.androidplatform.net/assets/engine/index.html"
     }
 }
