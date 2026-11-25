@@ -1854,3 +1854,30 @@ bim-panel-section > * { min-width: 0; max-width: 100%; }
   line-height: 1.45;
 }
 .obs-fcard__howto strong { color: var(--pg, #38bdf8); }
+
+
+/* Arabic and other RTL interface support.
+   The document direction is set by the locale service. Keep drawing
+   surfaces and numeric/technical input direction stable; only UI flow
+   and natural-language controls follow RTL. */
+html[dir="rtl"] body,
+html[dir="rtl"] #app {
+  direction: rtl;
+}
+html[dir="rtl"] canvas,
+html[dir="rtl"] input[type="number"],
+html[dir="rtl"] input[type="date"],
+html[dir="rtl"] input[type="time"],
+html[dir="rtl"] input[type="datetime-local"],
+html[dir="rtl"] [data-ltr],
+html[dir="rtl"] code,
+html[dir="rtl"] pre,
+html[dir="rtl"] kbd {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+html[dir="rtl"] input:not([type="number"]):not([type="date"]):not([type="time"]):not([type="datetime-local"]),
+html[dir="rtl"] textarea,
+html[dir="rtl"] select {
+  text-align: start;
+}
