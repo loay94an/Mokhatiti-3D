@@ -1,7 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
-// Use the real Node production build. Each test gets an empty browser profile;
-// no credentials or Firebase services are needed.
+// Use the real Node production build. Existing specs start in English for stable baselines;
+// Arabic RTL specs clear the stored locale explicitly. No credentials or Firebase services are needed.
 export default defineConfig({
   testDir: './tests/browser',
   testMatch: '**/*.spec.ts',
