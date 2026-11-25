@@ -6,6 +6,7 @@ on:
     branches:
       - feat/openplan3d-import-arabic
     paths:
+      - .github/workflows/complete-openplan3d-import.yml
       - integrations/openPlan3D/IMPORT-AND-ARABIC-STATUS.md
       - integrations/openPlan3D/src/lib/i18n/**
       - integrations/openPlan3D/src/app.css
