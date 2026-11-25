@@ -32,7 +32,7 @@ test('Arabic editor and render lab remain within a narrow mobile viewport', asyn
 
   await page.goto('/render-lab');
   await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
-  await expect(page.getByRole('heading', { name: 'منظور مختلف.' })).toBeVisible();
+  await expect(page.getByText('مختبر التصيير', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'تفاعلي', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'تتبع المسار', exact: true })).toBeVisible();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
