@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { locale } from '../src/lib/i18n';
 import { validateLocalGLB } from '../src/lib/renderLab/glb';
+beforeEach(() => locale.set('en'));
 function glb(json: object) {
   const text = JSON.stringify(json); const bytes = new TextEncoder().encode(text.padEnd(Math.ceil(text.length / 4) * 4, ' '));
   const buffer = new ArrayBuffer(20 + bytes.length); const v = new DataView(buffer);
