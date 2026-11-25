@@ -159,7 +159,7 @@
           loadProject(project);
           markClean();
         } else {
-          const p = createDefaultProject();
+          const p = createDefaultProject($t('library.untitled'));
           loadProject(p);
           await autoSave();
           replaceState(`${base}/editor?id=${p.id}`, page.state);
