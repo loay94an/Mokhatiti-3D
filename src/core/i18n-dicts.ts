@@ -39,14 +39,14 @@ export const DICTS: Record<string, Dict> = {
     "Create production sheets, plan views, schedules and saved views.":
       "أنشئ ألواح الإنتاج والمساقط المسطحة والجداول والمساقط المحفوظة.",
     "Focus the workspace on duct, pipe, tray, conduit and equipment delivery.":
-      "ركّز مساحة العمل على تسليم المجاري والأنابيب وأحويل الكابلات والمواسير والمعدات.",
+      "ركّز مساحة العمل على تسليم المجاري والأنابيب وحوامل الكابلات والمواسير والمعدات.",
     "Simulate 4D, calculate 5D takeoff and run delivery automation.":
       "حاكِ 4D واحسب كميات 5D وشغّل أتمتة التسليم.",
     "Run clash detection, IDS validation, issue review and model health checks.":
       "شغّل كشف التعارضات وتحقق IDS ومراجعة المشكلات وفحوصات صحة النموذج.",
     "Blank BIM": "BIM فارغ",
     "Clean authoring and open coordination workspace": "مساحة إنشاء وتنسيق مفتوحة نظيفة",
-    "Federation, alignment, clash and BCF review": "الاتحاد والمحاذاة والتعارضات ومراجعة BCF",
+    "Federation, alignment, clash and BCF review": "دمج النماذج ومحاذاتها وفحص التعارضات ومراجعة BCF",
     "MEP authoring, systems and coordination": "إنشاء MEP والأنظمة والتنسيق",
     "Views, sheets, schedules and production": "المساقط والألواح والجداول والإنتاج",
     "4D sequencing, 5D quantities and automation": "تسلسل 4D وكميات 5D وأتمتة",
@@ -66,7 +66,7 @@ export const DICTS: Record<string, Dict> = {
     "Native authored BIM elements": "عناصر BIM منشأة أصلًا",
     "No active projects": "لا توجد مشاريع نشطة",
     "Open BIM Studio · local project database · browser-first delivery":
-      "Open BIM Studio · قاعدة بيانات مشاريع محلية · تسليم أولًا عبر المتصفح",
+      "Open BIM Studio · قاعدة بيانات مشاريع محلية · تسليم يعتمد على المتصفح",
     "File": "ملف",
     "Architecture": "معماري",
     "Structure": "إنشائي",
