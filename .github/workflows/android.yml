@@ -127,27 +127,21 @@ jobs:
         run: |
           set -euo pipefail
           DEST="app/src/main/assets/engine"
-          mkdir -p "$DEST/test/resources" "$DEST/src" "$DEST/lib" "app/src/main/assets/licenses"
+          mkdir -p "$DEST/src" "$DEST/lib" "app/src/main/assets/licenses"
           cp -a third_party/SweetHome3D/SweetHome3DJS/src/. "$DEST/src/"
           cp -a third_party/SweetHome3D/SweetHome3DJS/lib/. "$DEST/lib/"
-          cp third_party/SweetHome3D/SweetHome3DJS/test/testHome.html "$DEST/test/"
-          cp third_party/SweetHome3D/SweetHome3DJS/test/resources/HomeTest.sh3d "$DEST/test/resources/"
+          python3 scripts/prepare-editor.py \
+            --source third_party/SweetHome3D/SweetHome3DJS/test/testHome.html \
+            --output "$DEST/index.html"
           cp third_party/SweetHome3D/SweetHome3DJS/COPYING.TXT "$DEST/"
           cp third_party/SweetHome3D/SweetHome3DJS/LICENSE.TXT "$DEST/"
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("app/src/main/assets/engine/test/testHome.html")
-          s = p.read_text(encoding="utf-8")
-          s = s.replace("<html>", '<html lang="ar" dir="rtl">', 1)
-          s = s.replace("</head>", '<link rel="stylesheet" href="arabic-overrides.css">\\n</head>', 1)
-          p.write_text(s, encoding="utf-8")
-          PY
           cp third_party/SweetHome3D/LICENSE app/src/main/assets/licenses/SweetHome3D-LICENSE.txt
           cp third_party/SweetHome3D/NOTICE.txt app/src/main/assets/licenses/SweetHome3D-NOTICE.txt
           cp third_party/SweetHome3D/SweetHome3DJS/THIRDPARTY-LICENSE-*.TXT app/src/main/assets/licenses/
           test -s "$DEST/lib/generated/SweetHome3D.js"
           test -s "$DEST/lib/resources/localization_ar.json"
-          test -s "$DEST/test/testHome.html"
+          test -s "$DEST/index.html"
+          ! grep -q "HomeTest.sh3d" "$DEST/index.html"
 
       - name: Switch to JDK 17 for Android Gradle
         uses: actions/setup-java@v4
@@ -178,17 +172,25 @@ jobs:
 
       - name: Smoke test APK on Android emulator
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          ANDROID_I_WANT_MY_TCG: "yes"
         with:
           api-level: 30
           target: google_apis
           arch: x86_64
           profile: pixel_2
+          emulator-boot-timeout: 900
           script: |
+            set -euo pipefail
+            adb wait-for-device
+            adb shell getprop sys.boot_completed | grep -q 1
             adb install -r app/build/outputs/apk/debug/app-debug.apk
+            adb shell am force-stop com.loay94an.mokhatiti3d || true
             adb shell am start -n com.loay94an.mokhatiti3d/.MainActivity
-            sleep 25
+            sleep 35
             adb logcat -d -s MokhatitiSmoke:I | tee /tmp/mokhatiti-smoke.log
             grep -q '"application":true' /tmp/mokhatiti-smoke.log
+            grep -q '"homeCount":1' /tmp/mokhatiti-smoke.log
             grep -q '"plan":true' /tmp/mokhatiti-smoke.log
             grep -q '"view3D":true' /tmp/mokhatiti-smoke.log
             grep -q '"webgl":true' /tmp/mokhatiti-smoke.log
@@ -198,4 +200,3 @@ jobs:
               cat /tmp/mokhatiti-runtime.log
               exit 1
             fi
-
