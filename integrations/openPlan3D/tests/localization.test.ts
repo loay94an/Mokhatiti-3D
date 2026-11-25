@@ -19,6 +19,8 @@ describe('locale preferences', () => {
     for (const key of Object.keys(en) as (keyof typeof en)[]) {
       expect(pt[key].trim()).not.toBe('');
       expect(pt[key].match(/\{\w+\}/g) ?? []).toEqual(en[key].match(/\{\w+\}/g) ?? []);
+      expect(ar[key].trim()).not.toBe('');
+      expect(ar[key].match(/\{\w+\}/g) ?? []).toEqual(en[key].match(/\{\w+\}/g) ?? []);
     }
   });
   it('updates subscribed text, persists the choice and sets document language', () => {
