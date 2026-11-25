@@ -656,6 +656,8 @@ export const ar: Record<TranslationKey, string> = {
   "catalogCategories.pathsLawns": "الممرات والمسطحات الخضراء",
   "catalogCategories.poolSpa": "المسبح والمنتجع",
   "roomPlanDialog.title": "استيراد RoomPlan",
+  "roomPlanDialog.captureProjectName": "مسح غرفة {code}",
+  "roomPlanDialog.importedProjectName": "استيراد مسح RoomPlan",
   "roomPlanDialog.straighten": "استقامة الجدران",
   "roomPlanDialog.straightenHelp": "محاذاة الجدران القريبة من الأفقية أو العمودية مع المحاور",
   "roomPlanDialog.orthogonal": "فرض الزوايا القائمة",
