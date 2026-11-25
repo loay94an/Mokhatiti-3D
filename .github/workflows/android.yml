@@ -42,6 +42,14 @@ jobs:
           test -s app/build/outputs/apk/debug/app-debug.apk
           sha256sum app/build/outputs/apk/debug/app-debug.apk
 
+      - name: Upload native APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mokhatiti-3D-native-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Install and launch on Android emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -61,11 +69,3 @@ jobs:
               cat /tmp/mokhatiti-runtime.log
               exit 1
             fi
-
-      - name: Upload native APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Mokhatiti-3D-native-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 14
