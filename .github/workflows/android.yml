@@ -185,7 +185,7 @@ jobs:
           profile: pixel_2
           emulator-boot-timeout: 900
           script: |
-            set -euo pipefail
+            set -eu
             adb wait-for-device
             adb shell getprop sys.boot_completed | grep -q 1
             adb install -r app/build/outputs/apk/debug/app-debug.apk
