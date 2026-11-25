@@ -1,4 +1,4 @@
-name: Complete OpenPlan3D source import
+name: OpenPlan3D import and validation
 
 on:
   workflow_dispatch:
@@ -7,17 +7,20 @@ on:
       - feat/openplan3d-import-arabic
     paths:
       - integrations/openPlan3D/IMPORT-AND-ARABIC-STATUS.md
+      - integrations/openPlan3D/src/lib/i18n/**
+      - integrations/openPlan3D/src/app.css
 
 permissions:
   contents: write
 
 concurrency:
-  group: openplan3d-source-import
+  group: openplan3d-import-validation
   cancel-in-progress: false
 
 jobs:
-  import:
+  import-and-validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout integration branch
         uses: actions/checkout@v4
@@ -38,14 +41,30 @@ jobs:
           rm -rf integrations/openPlan3D/.git
           test -f integrations/openPlan3D/package.json
           test -f integrations/openPlan3D/src/app.html
-          count="$(find integrations/openPlan3D -type f | wc -l)"
-          echo "Imported file count: $count"
+          imported_count="$(find integrations/openPlan3D -type f | wc -l)"
+          echo "Integration file count: $imported_count"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add integrations/openPlan3D
-          if git diff --cached --quiet; then
-            echo "No additional upstream files to import."
-            exit 0
+          if ! git diff --cached --quiet; then
+            git commit -m "Import remaining OpenPlan3D source snapshot"
+            git push origin HEAD:feat/openplan3d-import-arabic
           fi
-          git commit -m "Import remaining OpenPlan3D source snapshot"
-          git push origin HEAD:feat/openplan3d-import-arabic
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: integrations/openPlan3D/package-lock.json
+      - name: Install exact dependencies
+        working-directory: integrations/openPlan3D
+        run: npm ci
+      - name: Type and Svelte checks
+        working-directory: integrations/openPlan3D
+        run: npm run check
+      - name: Unit and regression tests
+        working-directory: integrations/openPlan3D
+        run: npm test
+      - name: Production build
+        working-directory: integrations/openPlan3D
+        run: npm run build
