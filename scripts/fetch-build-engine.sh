@@ -37,6 +37,8 @@ JS_ROOT="$(dirname "$JS_BUILD_XML")"
 JAVA_ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$JAVA_SRC")")")")"
 
 cd "$JS_ROOT"
+# build.xml expects the sibling source directory to be named SweetHome3D.
+ln -sfn "$JAVA_ROOT" "$(dirname "$JS_ROOT")/SweetHome3D"
 ant -noinput applicationLibraries
 ant -noinput applicationDistribution
 
