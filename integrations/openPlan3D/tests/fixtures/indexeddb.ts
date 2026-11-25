@@ -1,8 +1,9 @@
 import { beforeEach, vi } from 'vitest';
+import { locale } from '../../src/lib/i18n';
 import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
 import { withDatabase, transaction, request, records, type StoreName } from '$lib/services/localDatabase';
 
-beforeEach(() => { vi.stubGlobal('indexedDB', new IDBFactory()); });
+beforeEach(() => { locale.set('en'); vi.stubGlobal('indexedDB', new IDBFactory()); });
 
 export function mockStorage(data = new Map<string, string>()) {
   vi.stubGlobal('localStorage', {
