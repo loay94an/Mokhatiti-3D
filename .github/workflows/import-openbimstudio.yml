@@ -28,7 +28,7 @@ jobs:
         env:
           UPSTREAM_SHA: f68369659b027ab22dcda98bc62cf7b62a5bcc63
         run: |
-          rsync -a --delete --exclude='.git' /tmp/openBIMstudio/ "$GITHUB_WORKSPACE/"
+          rsync -a --delete --exclude='.git' --exclude='.github/workflows/***' /tmp/openBIMstudio/ "$GITHUB_WORKSPACE/"
           cat > UPSTREAM_IMPORT.md <<EOF
           # Upstream source import
 
