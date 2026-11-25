@@ -45,7 +45,9 @@ for root in ROOTS:
     if not root.exists():
         continue
     for english in root.rglob("*.properties"):
-        if re.search(r"_[a-z]{2}\.properties$", english.name):
+        if english.name == "package.properties" or english.name.startswith("package_"):
+            continue
+        if re.search(r"_[a-z]{2}(?:_[A-Z]{2})?\\.properties$", english.name):
             continue
         total += 1
         arabic = english.with_name(english.stem + "_ar.properties")
