@@ -181,7 +181,8 @@ class MainActivity : ComponentActivity() {
                         console.log('MOKHATITI_SMOKE ' + JSON.stringify(result));
                       }, 5000);
                     })();
-                    """.trimIndent()
+                    """.trimIndent(),
+                    null
                 )
             }
 
@@ -249,7 +250,6 @@ class MainActivity : ComponentActivity() {
                 return true
             }
         }
-        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         engineView.loadUrl(START_URL)
     }
 
