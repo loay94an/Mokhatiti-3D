@@ -292,7 +292,7 @@ class PlanCanvasView(context: Context) : View(context) {
         return try {
             rememberUndo()
             plan[index] = plan[index].copy(thickness = thicknessMetres, height = heightMetres)
-            rooms.clear()
+            rooms.removeAll { it.levelId == activeLevelId }
             savePlan()
             invalidate()
             true
@@ -372,7 +372,7 @@ class PlanCanvasView(context: Context) : View(context) {
                         rememberUndo()
                         plan.removeAll { it.id == hit.id }
                         openings.removeAll { it.wallId == hit.id }
-                        rooms.clear()
+                        rooms.removeAll { it.levelId == activeLevelId }
                         selectedWallId = null
                         savePlan()
                     }
@@ -414,13 +414,13 @@ class PlanCanvasView(context: Context) : View(context) {
                             x1 = plan[index].x1 + dx, y1 = plan[index].y1 + dy,
                             x2 = plan[index].x2 + dx, y2 = plan[index].y2 + dy
                         )
-                        rooms.clear()
+                        rooms.removeAll { it.levelId == activeLevelId }
                         savePlan()
                     }
                 } else if (tool == PlanCanvasTool.WALL && abs(endX - startX) + abs(endY - startY) >= .2f) {
                     rememberUndo()
                     plan.add(PlanWall(startX, startY, endX, endY, levelId = activeLevelId))
-                    rooms.clear()
+                    rooms.removeAll { it.levelId == activeLevelId }
                     savePlan()
                 }
                 drawing = false
