@@ -1655,4 +1655,8 @@ export const ar: Record<TranslationKey, string> = {
   "provider.errorCancelled": "تم إلغاء الطلب. قد يستمر المزوّد في التنفيذ ويفرض رسوماً على العمل الذي بدأ بالفعل.",
   "provider.errorConnection": "تعذر الاتصال بالمزوّد مباشرة. تحقق من عنوان URL وHTTPS وأذونات CORS أو الشبكة المحلية في المتصفح. لم يُستخدم وسيط أو إعادة محاولة تلقائية.",
   "provider.errorNoImage": "لم يتم إرجاع صورة. يجب أن يدعم المزوّد والنموذج POST /responses مع أداة image_generation. جرّب نموذجاً آخر."
+"floorName.ground": "الطابق الأرضي",
+  "floorName.basement": "القبو",
+  "floorName.basementNumber": "القبو {count}",
+  "floorName.levelNumber": "الطابق {count}",
 };
