@@ -1571,7 +1571,7 @@ export const en = {
   "renderLab.localFloorplan": "Local floorplan",
   "renderLab.viewerCanvas": "Interactive floorplan render",
   "renderLab.captureStudy": "Capture study",
-  "renderLab.loadFailed": "Could not load this model. Check the file and try again."
+  "renderLab.loadFailed": "Could not load this model. Check the file and try again.",
   "renderLab.browserRendering": "Browser rendering",
   "renderLab.localWorkspace": "Local workspace",
   "renderLab.eyebrow": "RENDER STUDY / 01",
@@ -1609,17 +1609,17 @@ export const en = {
   "renderLab.embeddedGlbRequired": "Use a self-contained GLB with embedded textures.",
   "renderLab.invalidBounds": "The model has invalid or empty bounds.",
   "renderLab.pathTracingUnavailable": "Path tracing unavailable: {error}. Interactive preview is available.",
-  "renderLab.pathTracingStopped": "Path tracing stopped: {error}"
+  "renderLab.pathTracingStopped": "Path tracing stopped: {error}",
 
   "renderLab.errorIncompleteGlb": "This is not a complete GLB file.",
   "renderLab.errorValidGlb": "Choose a valid glTF 2.0 binary (.glb) file.",
   "renderLab.errorMetadata": "Invalid or oversized GLB metadata.",
   "renderLab.errorEmbeddedAssets": "Use a self-contained GLB with embedded textures.",
   "renderLab.errorVertexLimit": "This viewer supports up to two million mesh vertices.",
-  "renderLab.errorJson": "The GLB metadata is not valid JSON."
+  "renderLab.errorJson": "The GLB metadata is not valid JSON.",
 
   "provider.errorAbsoluteUrl": "Enter an absolute provider URL, such as https://api.openai.com/v1.",
-  "provider.errorRequestFailed": "Provider request failed (HTTP {status})."
+  "provider.errorRequestFailed": "Provider request failed (HTTP {status}).",
   "provider.errorHttps": "Use HTTPS for remote providers. HTTP is allowed only for localhost, 127.0.0.1, or [::1].",
   "provider.errorCredentials": "The provider URL must not contain credentials, a query, or a fragment. Enter the key separately.",
   "provider.errorNoProxy": "Choose your AI provider URL. This app does not host an AI proxy.",
