@@ -12,6 +12,7 @@ test('first visit starts in Arabic RTL, preserves the editor, and switches back 
 
   await page.getByRole('button', { name: 'الإعدادات', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'الإعدادات', exact: true });
+  await dialog.getByRole('button', { name: 'المظهر', exact: true }).click();
   await expect(dialog.getByRole('combobox', { name: 'اللغة', exact: true })).toHaveValue('ar');
   await dialog.getByRole('combobox', { name: 'اللغة', exact: true }).selectOption('en');
   await expect(page.locator('html')).toHaveAttribute('lang', 'en');
