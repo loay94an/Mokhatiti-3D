@@ -40,6 +40,7 @@ class PlanCanvasView(context: Context) : View(context) {
         val activeLevelId: String
     )
     private val undoStack = ArrayDeque<EditorSnapshot>()
+    private val redoStack = ArrayDeque<EditorSnapshot>()
     private val prefs get() = context.getSharedPreferences("mokhatiti_native", Context.MODE_PRIVATE)
     private var pixelsPerMetre = 72f
     private var panX = 0f
@@ -261,12 +262,17 @@ class PlanCanvasView(context: Context) : View(context) {
         val height = if (type == PlanOpeningType.DOOR) 2.1f else 1.0f
         val sill = if (type == PlanOpeningType.DOOR) 0f else 0.9f
         if (wall.lengthMetres < width + 0.1f || sill + height > wall.height) return false
+        val offset = (wall.lengthMetres - width) / 2f
+        val overlaps = openings.filter { it.wallId == wall.id }.any { existing ->
+            offset < existing.offsetMetres + existing.widthMetres && offset + width > existing.offsetMetres
+        }
+        if (overlaps) return false
         rememberUndo()
         openings.add(
             PlanOpening(
                 wallId = wall.id,
                 type = type,
-                offsetMetres = (wall.lengthMetres - width) / 2f,
+                offsetMetres = offset,
                 widthMetres = width,
                 heightMetres = height,
                 sillHeightMetres = sill
@@ -428,31 +434,42 @@ class PlanCanvasView(context: Context) : View(context) {
     }
     override fun performClick(): Boolean { super.performClick(); return true }
 
-    private fun rememberUndo() {
-        undoStack.addLast(EditorSnapshot(plan.toList(), rooms.toList(), openings.toList(), furniture.toList(), levels.toList(), activeLevelId))
-        if (undoStack.size > 40) undoStack.removeFirst()
-    }
-    fun undo() {
-        if(undoStack.isNotEmpty()) {
-            val snapshot = undoStack.removeLast()
-            plan.clear(); plan.addAll(snapshot.walls)
-            rooms.clear(); rooms.addAll(snapshot.rooms)
-            openings.clear(); openings.addAll(snapshot.openings)
-            furniture.clear(); furniture.addAll(snapshot.furniture)
-            levels.clear(); levels.addAll(snapshot.levels)
-            activeLevelId = snapshot.activeLevelId.takeIf { id -> levels.any { it.id == id } } ?: levels.first().id
-        } else {
-            val lastActiveWall = plan.indexOfLast { it.levelId == activeLevelId }
-            if (lastActiveWall >= 0) {
-                val removed = plan.removeAt(lastActiveWall)
-                openings.removeAll { it.wallId == removed.id }
-                rooms.removeAll { it.levelId == activeLevelId }
-            }
-        }
+    private fun snapshot(): EditorSnapshot =
+        EditorSnapshot(plan.toList(), rooms.toList(), openings.toList(), furniture.toList(), levels.toList(), activeLevelId)
+
+    private fun restore(snapshot: EditorSnapshot) {
+        plan.clear(); plan.addAll(snapshot.walls)
+        rooms.clear(); rooms.addAll(snapshot.rooms)
+        openings.clear(); openings.addAll(snapshot.openings)
+        furniture.clear(); furniture.addAll(snapshot.furniture)
+        levels.clear(); levels.addAll(snapshot.levels)
+        activeLevelId = snapshot.activeLevelId.takeIf { id -> levels.any { it.id == id } } ?: levels.first().id
         selectedWallId = null
         selectedFurnitureId = null
-        savePlan();invalidate()
     }
+
+    private fun rememberUndo() {
+        undoStack.addLast(snapshot())
+        if (undoStack.size > 40) undoStack.removeFirst()
+        redoStack.clear()
+    }
+
+    fun undo() {
+        if (undoStack.isEmpty()) return
+        redoStack.addLast(snapshot())
+        restore(undoStack.removeLast())
+        savePlan()
+        invalidate()
+    }
+
+    fun redo() {
+        if (redoStack.isEmpty()) return
+        undoStack.addLast(snapshot())
+        restore(redoStack.removeLast())
+        savePlan()
+        invalidate()
+    }
+
     fun clearPlan() {
         val activeWallIds = plan.filter { it.levelId == activeLevelId }.map { it.id }.toSet()
         val hasItems = activeWallIds.isNotEmpty() || rooms.any { it.levelId == activeLevelId } || furniture.any { it.levelId == activeLevelId }
@@ -466,11 +483,17 @@ class PlanCanvasView(context: Context) : View(context) {
     }
 
     fun detectRooms(): Int {
-        rooms.removeAll { it.levelId == activeLevelId }
-        rooms.addAll(PlanRoomDetector.detectRooms(plan.filter { it.levelId == activeLevelId }).map { it.copy(id = activeLevelId + "-" + it.id, levelId = activeLevelId) })
+        val detected = PlanRoomDetector.detectRooms(plan.filter { it.levelId == activeLevelId })
+            .map { it.copy(id = activeLevelId + "-" + it.id, levelId = activeLevelId) }
+        val existing = rooms.filter { it.levelId == activeLevelId }
+        if (existing != detected) {
+            rememberUndo()
+            rooms.removeAll { it.levelId == activeLevelId }
+            rooms.addAll(detected)
+        }
         savePlan()
         invalidate()
-        return rooms.size
+        return detected.size
     }
 
     fun exportPlanJson(): String {
@@ -528,6 +551,11 @@ class PlanCanvasView(context: Context) : View(context) {
     fun importPlanJson(raw: String): Boolean {
         return try {
             val root = if (raw.trimStart().startsWith("{")) JSONObject(raw) else null
+            if (root != null) {
+                val format = root.optString("format", "mokhatiti-native")
+                val version = root.optInt("version", 2)
+                if (format != "mokhatiti-native" || version !in 2..5) return false
+            }
             val walls = root?.optJSONArray("walls") ?: JSONArray(raw)
             val loadedWalls = mutableListOf<PlanWall>()
             val loadedRooms = mutableListOf<PlanRoom>()
@@ -615,6 +643,8 @@ class PlanCanvasView(context: Context) : View(context) {
             }
             if (loadedLevels.isEmpty()) loadedLevels.add(PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "الطابق الأرضي"))
             PlanProject(walls = loadedWalls, rooms = loadedRooms, openings = loadedOpenings, furniture = loadedFurniture, levels = loadedLevels)
+            undoStack.clear()
+            redoStack.clear()
             plan.clear()
             plan.addAll(loadedWalls)
             selectedWallId = null
