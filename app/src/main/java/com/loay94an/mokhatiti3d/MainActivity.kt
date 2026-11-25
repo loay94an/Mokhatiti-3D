@@ -3,8 +3,10 @@ package com.loay94an.mokhatiti3d
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Base64
 import android.view.View
 import android.webkit.ConsoleMessage
+import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -17,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 class MainActivity : ComponentActivity() {
     private lateinit var engineView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var pendingSaveBytes: ByteArray? = null
 
     private val filePicker = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -35,6 +38,43 @@ class MainActivity : ComponentActivity() {
         filePathCallback = null
     }
 
+    private val savePicker = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        val bytes = pendingSaveBytes
+        pendingSaveBytes = null
+        if (uri == null || bytes == null) return@registerForActivityResult
+        try {
+            contentResolver.openOutputStream(uri, "wt")?.use { it.write(bytes) }
+                ?: throw IllegalStateException("تعذر فتح ملف الحفظ")
+            Toast.makeText(this, "تم حفظ ملف المشروع", Toast.LENGTH_SHORT).show()
+        } catch (error: Exception) {
+            Toast.makeText(this, "فشل حفظ المشروع: ${error.localizedMessage}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private inner class AndroidFileBridge {
+        @JavascriptInterface
+        fun saveFile(fileName: String, base64Data: String) {
+            try {
+                val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+                runOnUiThread {
+                    pendingSaveBytes = bytes
+                    val safeName = fileName.substringAfterLast('/').ifBlank { "مشروع.sh3d" }
+                    savePicker.launch(safeName)
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "تعذر تجهيز الملف للحفظ: ${error.localizedMessage}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
@@ -46,8 +86,6 @@ class MainActivity : ComponentActivity() {
             domStorageEnabled = true
             databaseEnabled = true
             allowFileAccess = true
-            // The upstream editor loads its bundled .sh3d sample through XMLHttpRequest
-            // from a file:// page. Android WebView blocks this unless explicitly enabled.
             allowFileAccessFromFileURLs = true
             allowUniversalAccessFromFileURLs = true
             allowContentAccess = true
@@ -61,11 +99,48 @@ class MainActivity : ComponentActivity() {
             mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
         engineView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        engineView.addJavascriptInterface(AndroidFileBridge(), "AndroidFileBridge")
         engineView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 view.evaluateJavascript(
-                    "(function(){var c=document.createElement('canvas');var gl=c.getContext('webgl')||c.getContext('experimental-webgl');return {application: typeof application === 'object', plan: !!document.getElementById('home-plan'), view3D: !!document.getElementById('home-3D-view'), webgl: !!gl, arabic: document.documentElement.lang === 'ar' && document.documentElement.dir === 'rtl'};})()"
+                    """
+                    (function() {
+                      if (!window.__mokhatitiSaveBridgeInstalled) {
+                        window.__mokhatitiSaveBridgeInstalled = true;
+                        document.addEventListener('click', function(event) {
+                          var anchor = event.target && event.target.closest
+                              ? event.target.closest('a[download]') : null;
+                          if (!anchor || !anchor.href || anchor.href.indexOf('blob:') !== 0) return;
+                          event.preventDefault();
+                          event.stopImmediatePropagation();
+                          var name = anchor.getAttribute('download') || 'مشروع.sh3d';
+                          fetch(anchor.href).then(function(response) { return response.blob(); })
+                            .then(function(blob) {
+                              return new Promise(function(resolve, reject) {
+                                var reader = new FileReader();
+                                reader.onload = function() { resolve(String(reader.result).split(',')[1]); };
+                                reader.onerror = reject;
+                                reader.readAsDataURL(blob);
+                              });
+                            })
+                            .then(function(base64) { AndroidFileBridge.saveFile(name, base64); })
+                            .catch(function(error) { console.error('Native save failed', error); });
+                        }, true);
+                      }
+                      var canvas = document.createElement('canvas');
+                      var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                      var result = {
+                        application: typeof application === 'object',
+                        plan: !!document.getElementById('home-plan'),
+                        view3D: !!document.getElementById('home-3D-view'),
+                        webgl: !!gl,
+                        arabic: document.documentElement.lang === 'ar' && document.documentElement.dir === 'rtl'
+                      };
+                      console.log('MOKHATITI_SMOKE ' + JSON.stringify(result));
+                      return result;
+                    })()
+                    """.trimIndent()
                 ) { result ->
                     android.util.Log.i("MokhatitiSmoke", result ?: "null")
                 }
@@ -88,8 +163,14 @@ class MainActivity : ComponentActivity() {
                 filePathCallback?.onReceiveValue(null)
                 filePathCallback = callback
                 return try {
-                    val intent = params.createIntent().apply {
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                        putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+                            "application/x-sweethome3d",
+                            "application/octet-stream",
+                            "application/zip"
+                        ))
                     }
                     filePicker.launch(intent)
                     true
@@ -127,6 +208,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         if (::engineView.isInitialized) {
             engineView.stopLoading()
+            engineView.removeJavascriptInterface("AndroidFileBridge")
             engineView.destroy()
         }
         super.onDestroy()
