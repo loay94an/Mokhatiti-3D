@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report coverage of Arabic Sweet Home 3D resource bundles."""
+"""Audit Java .properties bundle keys using Java-compatible continuation and separator rules."""
 from pathlib import Path
 import os
 import sys
@@ -9,31 +9,43 @@ ROOTS = [
     Path("third_party/SweetHome3D/SweetHome3DJS/src"),
 ]
 
-def property_keys(path: Path) -> set[str]:
+def logical_lines(path: Path):
     physical = path.read_text(encoding="ISO-8859-1").splitlines()
-    logical = []
     pending = ""
     for line in physical:
-        line = pending + line.lstrip() if pending else line
-        if line.endswith("\\"):
-            pending = line[:-1]
+        if pending:
+            line = line.lstrip()
+        # A continuation is triggered only by an odd number of trailing backslashes.
+        slash_count = len(line) - len(line.rstrip("\\"))
+        if slash_count % 2:
+            pending += line[:-1]
             continue
-        logical.append(line)
+        yield pending + line
         pending = ""
     if pending:
-        logical.append(pending)
-    keys = set()
-    for line in logical:
-        stripped = line.lstrip()
-        if not stripped or stripped.startswith(("#", "!")):
+        yield pending
+
+def property_key(line: str):
+    line = line.lstrip()
+    if not line or line[0] in "#!":
+        return None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
             continue
-        if "=" in stripped or ":" in stripped:
-            key = stripped.split("=", 1)[0].split(":", 1)[0].strip()
-        else:
-            key = stripped.split(None, 1)[0]
-        if key:
-            keys.add(key)
-    return keys
+        if char == "\\":
+            escaped = True
+            continue
+        if char in "=:" or char.isspace():
+            return line[:index]
+    return line
+
+def property_keys(path: Path) -> set[str]:
+    return {
+        key for line in logical_lines(path)
+        if (key := property_key(line)) is not None
+    }
 
 arabic_files = []
 for root in ROOTS:
@@ -64,9 +76,15 @@ print(summary)
 summary_path = Path(os.environ.get("GITHUB_STEP_SUMMARY", "/tmp/mokhatiti-arabic-summary.md"))
 summary_path.write_text("# Arabic translation audit\n\n" + summary + "\n", encoding="utf-8")
 if checked < 6:
-    print(f"Expected at least 6 source-matched Arabic resource bundles, found {checked}.", file=sys.stderr)
+    print(
+        f"Expected at least 6 source-matched Arabic resource bundles, found {checked}.",
+        file=sys.stderr,
+    )
     sys.exit(2)
 for failure in failures[:100]:
     print("::warning::" + failure)
 if failures:
-    print("Arabic resources are incomplete for this engine version; continuing debug build with explicit warning.", file=sys.stderr)
+    print(
+        "Arabic resources are incomplete for this engine version; continuing debug build with explicit warning.",
+        file=sys.stderr,
+    )
