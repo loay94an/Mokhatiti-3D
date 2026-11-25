@@ -154,3 +154,20 @@ dialog.modal-overlay::backdrop { background: transparent; }
     break-inside: avoid;
   }
 }
+
+/* Arabic UI direction: keep drawing surfaces and technical values LTR. */
+html[dir="rtl"] .text-left {
+  text-align: right;
+}
+
+html[dir="rtl"] canvas {
+  direction: ltr;
+}
+
+html[dir="rtl"] input[type="url"],
+html[dir="rtl"] input[type="email"],
+html[dir="rtl"] input[type="password"],
+html[dir="rtl"] input[type="number"] {
+  direction: ltr;
+  text-align: left;
+}
