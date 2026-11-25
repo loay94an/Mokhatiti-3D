@@ -1194,6 +1194,7 @@ export const en = {
   "aiRenderMessage.failed": "Rendering failed.",
   "aiRenderMessage.key": "Please add your Gemini API key in Settings → AI first.",
   "aiRenderMessage.noImage": "No image returned. Try a different model or prompt.",
+  "aiRenderMessage.apiError": "The image provider returned an error (HTTP {status}). Check the provider account and try again.",
   "canvasStatus.roomsOne": "{count} room",
   "canvasStatus.roomsMany": "{count} rooms",
   "canvasStatus.wallsOne": "{count} wall",
