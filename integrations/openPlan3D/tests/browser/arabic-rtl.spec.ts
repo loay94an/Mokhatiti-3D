@@ -6,6 +6,8 @@ test('first visit starts in Arabic RTL, preserves the editor, and switches back 
   await expect(page.locator('html')).toHaveAttribute('lang', 'ar');
   await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
   await expect(page.getByRole('button', { name: 'الإعدادات', exact: true })).toBeVisible();
+  const canvas = page.locator('canvas').first();
+  if (await canvas.count()) expect(await canvas.evaluate(element => getComputedStyle(element).direction)).toBe('ltr');
 
   const bodyText = await page.locator('body').innerText();
   expect(bodyText).not.toMatch(/\b(Settings|Projects|New project|Undo|Redo|Wall|Door|Window|Furniture|Floor|Export|Import|Save|Loading|Welcome|Start|Select)\b/);
