@@ -57,8 +57,10 @@ class PlanCanvasView(context: Context) : View(context) {
             val newScale = (oldScale * detector.scaleFactor).coerceIn(20f, 300f)
             if (newScale != oldScale) {
                 // Keep the world point beneath the pinch centroid stationary while zooming.
-                val focusX = detector.focusX
-                val focusY = detector.focusY
+                // Use the previous centroid; the touch handler applies centroid translation
+                // separately, avoiding a doubled pan while the two fingers move.
+                val focusX = lastFocusX
+                val focusY = lastFocusY
                 val worldAtFocusX = (focusX - originX()) / oldScale
                 val worldAtFocusY = (originY() - focusY) / oldScale
                 pixelsPerMetre = newScale
