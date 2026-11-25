@@ -85,7 +85,9 @@ function registerLocaleOptions(): void {
         // the list instead of implying a complete translation.
         label: l.id === "en"
           ? `${l.meta.nativeName}  ·  ${l.meta.name}`
-          : `${l.meta.nativeName}  ·  ${l.meta.name}  (partial translation)`,
+          : l.id === "ar"
+            ? `${l.meta.nativeName}  ·  ${l.meta.name}  (ترجمة قيد المراجعة)`
+            : `${l.meta.nativeName}  ·  ${l.meta.name}  (partial translation)`,
       })),
     apply: (v) => i18n.setLocale(v as Locale),
   });
