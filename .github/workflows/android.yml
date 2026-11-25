@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: mokhatiti-android-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -192,6 +196,7 @@ jobs:
             grep -q '"application":true' /tmp/mokhatiti-smoke.log
             grep -q '"homeCount":1' /tmp/mokhatiti-smoke.log
             grep -q '"plan":true' /tmp/mokhatiti-smoke.log
+            grep -q '"plan2D":true' /tmp/mokhatiti-smoke.log
             grep -q '"view3D":true' /tmp/mokhatiti-smoke.log
             grep -q '"webgl":true' /tmp/mokhatiti-smoke.log
             grep -q '"arabic":true' /tmp/mokhatiti-smoke.log
