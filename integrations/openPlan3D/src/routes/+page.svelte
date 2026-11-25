@@ -86,7 +86,7 @@
   }
 
   function createFromTemplate(index: number) { return createProject(houseTemplates[index].create); }
-  function newProject() { return createProject(() => createDefaultProject('Untitled Project')); }
+  function newProject() { return createProject(() => createDefaultProject()); }
 
   /** The last copy Duplicate made: named in a status line and outlined in the list. */
   let duplicatedId = $state<string | null>(null);
@@ -112,7 +112,7 @@
   }
 
   function openAction(type: 'rename' | 'delete', project: { id: string; name: string }) {
-    actionDialog = { type, id: project.id, name: project.name || 'Untitled Project' };
+    actionDialog = { type, id: project.id, name: project.name || $t('library.untitled') };
     renameValue = project.name;
     actionError = null;
   }
