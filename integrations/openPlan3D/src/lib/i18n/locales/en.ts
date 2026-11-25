@@ -1569,6 +1569,8 @@ export const en = {
   "renderLab.title": "Render lab",
   "renderLab.localFloorplan": "Local floorplan",
   "renderLab.viewerCanvas": "Interactive floorplan render",
+  "renderLab.captureStudy": "Capture study",
+  "renderLab.loadFailed": "Could not load this model. Check the file and try again."
   "renderLab.browserRendering": "Browser rendering",
   "renderLab.localWorkspace": "Local workspace",
   "renderLab.eyebrow": "RENDER STUDY / 01",
