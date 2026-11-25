@@ -165,10 +165,13 @@ class MainActivity : ComponentActivity() {
                         var homes = window.application && application.getHomes
                             ? application.getHomes() : [];
                         var plan = document.getElementById('home-plan');
+                        var planCanvas = plan && plan.querySelector('canvas');
+                        var planContext = planCanvas && planCanvas.getContext('2d');
                         var result = {
                           application: typeof application === 'object',
                           homeCount: homes.length,
                           plan: !!plan,
+                          plan2D: !!planCanvas && !!planContext,
                           view3D: !!canvas3D,
                           webgl: !!gl,
                           webglVersion: gl ? gl.getParameter(gl.VERSION) : '',
