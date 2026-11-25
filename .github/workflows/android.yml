@@ -180,6 +180,8 @@ jobs:
             grep -q '"application":true' /tmp/mokhatiti-smoke.log
             grep -q '"plan":true' /tmp/mokhatiti-smoke.log
             grep -q '"view3D":true' /tmp/mokhatiti-smoke.log
+            grep -q '"webgl":true' /tmp/mokhatiti-smoke.log
+            grep -q '"arabic":true' /tmp/mokhatiti-smoke.log
             adb logcat -d -s AndroidRuntime:E > /tmp/mokhatiti-runtime.log
             if grep -q 'FATAL EXCEPTION' /tmp/mokhatiti-runtime.log; then
               cat /tmp/mokhatiti-runtime.log
