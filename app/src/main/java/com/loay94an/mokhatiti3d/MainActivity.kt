@@ -64,7 +64,7 @@ class MainActivity : ComponentActivity() {
                 val bytes = Base64.decode(base64Data, Base64.DEFAULT)
                 runOnUiThread {
                     pendingSaveBytes = bytes
-                    val safeName = fileName.substringAfterLast('/').ifBlank { "مشروع.sh3x" }
+                    val safeName = fileName.substringAfterLast('/').ifBlank { "مشروع.sh3d" }
                     savePicker.launch(safeName)
                 }
             } catch (error: Exception) {
@@ -137,7 +137,7 @@ class MainActivity : ComponentActivity() {
                           if (!anchor || !anchor.href || anchor.href.indexOf('blob:') !== 0) return;
                           event.preventDefault();
                           event.stopImmediatePropagation();
-                          var name = anchor.getAttribute('download') || 'مشروع.sh3x';
+                          var name = anchor.getAttribute('download') || 'مشروع.sh3d';
                           fetch(anchor.href).then(function(response) {
                             if (!response.ok) throw new Error('تعذر قراءة ملف المشروع');
                             return response.blob();
