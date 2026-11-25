@@ -13,7 +13,7 @@
   async function load(buffer: ArrayBuffer, title: string) {
     loading = true; error = '';
     try { if (!viewer) throw new Error($t('renderLab.rendererUnavailable')); await viewer.load(buffer); loaded = true; name = title; selectedView = 'isometric'; }
-    catch (e) { error = e instanceof Error ? e.message : String(e); }
+    catch (e) { console.error(e); error = $t('renderLab.loadFailed'); }
     finally { loading = false; }
   }
   async function fileChanged(event: Event) {
@@ -34,10 +34,10 @@
         if (dev || startupModel) {
           const response = await fetch(startupModel || '/__render-lab/scene.glb');
           if (response.ok && (startupModel || response.headers.get('content-type')?.includes('model/gltf-binary'))) {
-            await load(await response.arrayBuffer(), 'Capture study');
+            await load(await response.arrayBuffer(), $t('renderLab.captureStudy'));
           }
         }
-      } catch (e) { error = e instanceof Error ? e.message : String(e); }
+      } catch (e) { console.error(e); error = $t('renderLab.loadFailed'); }
       finally { loading = false; }
     })();
     return () => { canceled = true; viewer?.dispose(); };
