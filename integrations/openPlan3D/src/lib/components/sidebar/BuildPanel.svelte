@@ -310,7 +310,7 @@
         selectAddedContent(added);
       } else {
         // Create a new project for the imported data instead of merging into current
-        const projectName = interchangeProjectName(input, importFileName ? importFileName.replace(/\.(json|zip)$/i, '') : 'RoomPlan Import');
+        const projectName = interchangeProjectName(input, importFileName ? importFileName.replace(/\.(json|zip)$/i, '')  : $t('roomPlanDialog.importedProjectName'));
         await openProject(() => createProjectFromRoomPlan(input, projectName, options), 'import', openingLifetime.signal);
       }
     } catch (e: any) {
