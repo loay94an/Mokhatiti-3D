@@ -65,7 +65,7 @@ class MainActivity : ComponentActivity() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 view.evaluateJavascript(
-                    "(function(){return {application: typeof application === 'object', plan: !!document.getElementById('home-plan'), view3D: !!document.getElementById('home-3D-view')};})()"
+                    "(function(){var c=document.createElement('canvas');var gl=c.getContext('webgl')||c.getContext('experimental-webgl');return {application: typeof application === 'object', plan: !!document.getElementById('home-plan'), view3D: !!document.getElementById('home-3D-view'), webgl: !!gl, arabic: document.documentElement.lang === 'ar' && document.documentElement.dir === 'rtl'};})()"
                 ) { result ->
                     android.util.Log.i("MokhatitiSmoke", result ?: "null")
                 }
