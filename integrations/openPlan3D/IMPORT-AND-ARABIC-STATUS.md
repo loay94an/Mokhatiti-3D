@@ -63,3 +63,14 @@ The existing Arabic starter dictionary and this status report are additional int
 ## Import transport limitation
 
 The supplied ZIP is available for local inspection, but the current GitHub connection exposes individual Git object/file operations and no archive upload or bulk directory import operation. The execution container also cannot resolve `github.com` for a direct Git clone/push. Therefore the transfer is being performed through individual file commits in batches. Build and test validation have not yet been run against a complete imported tree.
+
+
+## 2026-11-25 continuation
+
+A resumable GitHub Actions import workflow was added at
+`.github/workflows/complete-openplan3d-import.yml`. It checks out the pinned
+upstream snapshot `771c9e1ad30bd1c3cc7584d6eca74deb2e14943d`, copies only files
+that are not already present, and pushes the remaining source/assets/tests to
+this integration branch. Existing localization work is preserved. This import
+must finish and its resulting file count must be audited before localization
+and build validation proceed.
