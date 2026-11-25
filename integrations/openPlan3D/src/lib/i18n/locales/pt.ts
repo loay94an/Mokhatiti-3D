@@ -1571,7 +1571,7 @@ export const pt = {
   "renderLab.localFloorplan": "Planta local",
   "renderLab.viewerCanvas": "Renderização interativa da planta",
   "renderLab.captureStudy": "Estudo de captura",
-  "renderLab.loadFailed": "Não foi possível carregar este modelo. Verifique o arquivo e tente novamente."
+  "renderLab.loadFailed": "Não foi possível carregar este modelo. Verifique o arquivo e tente novamente.",
   "renderLab.browserRendering": "Renderização no navegador",
   "renderLab.localWorkspace": "Espaço de trabalho local",
   "renderLab.eyebrow": "ESTUDO DE RENDERIZAÇÃO / 01",
@@ -1609,17 +1609,17 @@ export const pt = {
   "renderLab.embeddedGlbRequired": "Use um GLB independente com texturas incorporadas.",
   "renderLab.invalidBounds": "O modelo possui limites inválidos ou vazios.",
   "renderLab.pathTracingUnavailable": "Traçado de caminhos indisponível: {error}. A prévia interativa está disponível.",
-  "renderLab.pathTracingStopped": "O traçado de caminhos foi interrompido: {error}"
+  "renderLab.pathTracingStopped": "O traçado de caminhos foi interrompido: {error}",
 
   "renderLab.errorIncompleteGlb": "Este arquivo GLB está incompleto.",
   "renderLab.errorValidGlb": "Escolha um arquivo binário glTF 2.0 (.glb) válido.",
   "renderLab.errorMetadata": "Metadados GLB inválidos ou muito grandes.",
   "renderLab.errorEmbeddedAssets": "Use um GLB independente com texturas incorporadas.",
   "renderLab.errorVertexLimit": "Este visualizador aceita até dois milhões de vértices de malha.",
-  "renderLab.errorJson": "Os metadados GLB não são um JSON válido."
+  "renderLab.errorJson": "Os metadados GLB não são um JSON válido.",
 
   "provider.errorAbsoluteUrl": "Insira uma URL absoluta do provedor, como https://api.openai.com/v1.",
-  "provider.errorRequestFailed": "A solicitação ao provedor falhou (HTTP {status})."
+  "provider.errorRequestFailed": "A solicitação ao provedor falhou (HTTP {status}).",
   "provider.errorHttps": "Use HTTPS para provedores remotos. HTTP é permitido apenas para localhost, 127.0.0.1 ou [::1].",
   "provider.errorCredentials": "A URL do provedor não pode conter credenciais, consulta ou fragmento. Insira a chave separadamente.",
   "provider.errorNoProxy": "Escolha a URL do seu provedor de IA. Este aplicativo não hospeda um proxy de IA.",
