@@ -1569,6 +1569,8 @@ export const pt = {
   "renderLab.title": "Laboratório de renderização",
   "renderLab.localFloorplan": "Planta local",
   "renderLab.viewerCanvas": "Renderização interativa da planta",
+  "renderLab.captureStudy": "Estudo de captura",
+  "renderLab.loadFailed": "Não foi possível carregar este modelo. Verifique o arquivo e tente novamente."
   "renderLab.browserRendering": "Renderização no navegador",
   "renderLab.localWorkspace": "Espaço de trabalho local",
   "renderLab.eyebrow": "ESTUDO DE RENDERIZAÇÃO / 01",
