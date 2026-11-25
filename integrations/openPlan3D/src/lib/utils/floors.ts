@@ -1,4 +1,6 @@
 import type { Floor, Project } from '$lib/models/types';
+import { get } from 'svelte/store';
+import { t } from '$lib/i18n';
 
 export const DEFAULT_FLOOR_SPACING = 300;
 
@@ -31,9 +33,10 @@ export function floorLevelBelow(floors: Floor[]): number {
 
 /** Ground Floor, Floor 1, Floor 2… above ground; Basement, Basement 2… below, as scanned storeys are named. */
 export function defaultFloorName(level: number): string {
-  if (level === 0) return 'Ground Floor';
-  if (level < 0) return level === -1 ? 'Basement' : `Basement ${-level}`;
-  return `Floor ${level}`;
+  const translate = get(t);
+  if (level === 0) return translate('floorName.ground');
+  if (level < 0) return level === -1 ? translate('floorName.basement') : translate('floorName.basementNumber', { count: -level });
+  return translate('floorName.levelNumber', { count: level });
 }
 
 /** Longest floor name the editor accepts. */
