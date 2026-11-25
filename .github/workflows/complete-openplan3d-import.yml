@@ -10,6 +10,11 @@ on:
       - integrations/openPlan3D/IMPORT-AND-ARABIC-STATUS.md
       - integrations/openPlan3D/src/lib/i18n/**
       - integrations/openPlan3D/src/app.css
+      - integrations/openPlan3D/src/**
+      - integrations/openPlan3D/tests/**
+      - integrations/openPlan3D/tooling/**
+      - integrations/openPlan3D/package.json
+      - integrations/openPlan3D/package-lock.json
 
 permissions:
   contents: write
