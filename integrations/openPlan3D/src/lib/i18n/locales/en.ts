@@ -1616,4 +1616,23 @@ export const en = {
   "renderLab.errorEmbeddedAssets": "Use a self-contained GLB with embedded textures.",
   "renderLab.errorVertexLimit": "This viewer supports up to two million mesh vertices.",
   "renderLab.errorJson": "The GLB metadata is not valid JSON."
+
+  "provider.errorAbsoluteUrl": "Enter an absolute provider URL, such as https://api.openai.com/v1.",
+  "provider.errorHttps": "Use HTTPS for remote providers. HTTP is allowed only for localhost, 127.0.0.1, or [::1].",
+  "provider.errorCredentials": "The provider URL must not contain credentials, a query, or a fragment. Enter the key separately.",
+  "provider.errorNoProxy": "Choose your AI provider URL. This app does not host an AI proxy.",
+  "provider.errorApiKey": "Add your OpenAI API key in Settings → AI first. Custom providers can be used without a key.",
+  "provider.errorResponsesModel": "Choose a Responses model such as gpt-4.1. GPT Image and DALL·E models cannot be used as the Responses model.",
+  "provider.errorModelList": "The provider returned an unsupported model list. Enter a model ID manually.",
+  "provider.errorTooLarge": "The provider response is too large. Try a smaller output.",
+  "provider.errorEmpty": "The provider returned an empty response.",
+  "provider.errorMalformedJson": "The provider returned malformed JSON. Check its API compatibility.",
+  "provider.errorUnauthorized": "Check the provider key and account access.",
+  "provider.errorRateLimit": "The provider rate or spending limit was reached. Try again later.",
+  "provider.errorBadRequest": "Check the base URL and model. Rendering requires POST /responses with the image_generation tool.",
+  "provider.errorStatus": "Check the provider status and try again.",
+  "provider.errorTimeout": "The provider request timed out. It was not retried; check the provider before generating again.",
+  "provider.errorCancelled": "Request cancelled. The provider may still finish and charge for work already started.",
+  "provider.errorConnection": "Cannot connect directly to the provider. Check its URL, HTTPS and browser CORS/local-network permissions. No proxy or automatic retry was used.",
+  "provider.errorNoImage": "No image returned. This provider and model must support POST /responses with the image_generation tool. Try another model."
 } as const;
