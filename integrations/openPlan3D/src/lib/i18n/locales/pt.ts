@@ -698,6 +698,8 @@ export const pt = {
   "catalogCategories.pathsLawns": "Caminhos e gramados",
   "catalogCategories.poolSpa": "Piscinas e spas",
   "roomPlanDialog.title": "Importar RoomPlan",
+  "roomPlanDialog.captureProjectName": "Captura de ambiente {code}",
+  "roomPlanDialog.importedProjectName": "Importação do RoomPlan",
   "roomPlanDialog.straighten": "Alinhar paredes",
   "roomPlanDialog.straightenHelp": "Alinhar aos eixos as paredes quase horizontais ou verticais",
   "roomPlanDialog.orthogonal": "Aplicar ângulos retos",
