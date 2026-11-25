@@ -234,10 +234,15 @@ class MainActivity : ComponentActivity() {
             }
 
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
-                Log.d(
-                    "MokhatitiEngine",
-                    "${message.message()} — ${message.sourceId()}:${message.lineNumber()}"
-                )
+                val line = message.message()
+                if (line.startsWith("MOKHATITI_SMOKE ")) {
+                    Log.i("MokhatitiSmoke", line.removePrefix("MOKHATITI_SMOKE "))
+                } else {
+                    Log.d(
+                        "MokhatitiEngine",
+                        "$line — ${message.sourceId()}:${message.lineNumber()}"
+                    )
+                }
                 return true
             }
         }
