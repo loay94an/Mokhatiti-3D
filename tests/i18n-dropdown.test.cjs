@@ -90,11 +90,13 @@ try {
   for (const c of choices) {
     if (c.value === "en") {
       ok(!/partial|untranslated/i.test(c.label), `en label carries no translation marker: ${c.label}`);
+    } else if (c.value === "ar") {
+      ok(c.label.includes("(ترجمة قيد المراجعة)"), `ar label shows its review status: ${c.label}`);
     } else {
       ok(c.label.includes("(partial translation)"), `${c.value} label marks partial translation: ${c.label}`);
     }
   }
-  ok(option.default === "en", `default locale is en, got ${option.default}`);
+  ok(option.default === "ar", `default locale is Arabic, got ${option.default}`);
 
   console.log(`i18n-dropdown: ${n} assertions passed`);
 } finally {
