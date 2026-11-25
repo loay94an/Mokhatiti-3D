@@ -56,4 +56,29 @@ class PlanRoomDetectorTest {
         assertEquals(16f, rooms.sumOf { it.areaSquareMetres.toDouble() }.toFloat(), 0.001f)
     }
 
+    @Test fun mergesCollinearOverlappingWallSegmentsWithoutDuplicateRooms() {
+        val walls = listOf(
+            PlanWall(0f, 0f, 2.5f, 0f),
+            PlanWall(1.5f, 0f, 4f, 0f),
+            PlanWall(4f, 0f, 4f, 3f),
+            PlanWall(4f, 3f, 0f, 3f),
+            PlanWall(0f, 3f, 0f, 0f)
+        )
+        val rooms = PlanRoomDetector.detectRooms(walls)
+        assertEquals(1, rooms.size)
+        assertEquals(12f, rooms.single().areaSquareMetres, 0.001f)
+    }
+
+    @Test fun ignoresDanglingTJunctionWithoutCreatingFalseRoom() {
+        val walls = listOf(
+            PlanWall(0f, 0f, 4f, 0f),
+            PlanWall(4f, 0f, 4f, 3f),
+            PlanWall(4f, 3f, 0f, 3f),
+            PlanWall(0f, 3f, 0f, 0f),
+            PlanWall(2f, 0f, 2f, 1.5f)
+        )
+        val rooms = PlanRoomDetector.detectRooms(walls)
+        assertEquals(1, rooms.size)
+        assertEquals(12f, rooms.single().areaSquareMetres, 0.001f)
+    }
 }
