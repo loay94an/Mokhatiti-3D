@@ -246,7 +246,7 @@
   async function runGeminiRender(signal: AbortSignal): Promise<string> {
     const geminiKey = localStorage.getItem('o3d_gemini_key');
     if (!geminiKey) {
-      throw new Error('Please add your Gemini API key in Settings → AI first.');
+      throw new Error($t('aiRenderMessage.key'));
     }
 
     const imageDataUrl = captureSceneBase64(1024, 576);
@@ -2261,16 +2261,16 @@
 
   function exportBlenderScene() {
     try {
-      if (!wallGroup) throw new Error('The 3D scene is not ready.');
+      if (!wallGroup) throw new Error($t('viewerExport.notReady'));
       const json = portableRenderSceneJSON(wallGroup, showAllFloors ? 'stacked-floors' : 'active-floor');
       const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
       try {
         const link = document.createElement('a');
         link.href = url; link.download = 'openplan3d-render-scene.json'; link.click();
       } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
-      renderExportMessage = 'Exported neutral geometry for the local Blender worker. Textures and photo cameras are omitted.';
+      renderExportMessage = $t('viewerExport.success');
     } catch (error) {
-      renderExportMessage = error instanceof Error ? error.message : 'Could not export the render scene.';
+      console.error(error); renderExportMessage = $t('viewerExport.failed');
     }
   }
 
