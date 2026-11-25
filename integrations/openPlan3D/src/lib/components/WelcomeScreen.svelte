@@ -45,14 +45,7 @@
   }
 
   function startFromScratch() { return createProject(() => createDefaultProject($t('library.untitled'))); }
-  function useHouseTemplate(index: number) {
-    return createProject(() => {
-      const project = houseTemplates[index].create();
-      const labels = templateLabels[project.name];
-      if (labels) project.name = $t(labels.name);
-      return project;
-    });
-  }
+  function useHouseTemplate(index: number) { return createProject(houseTemplates[index].create); }
 
   let showTemplates = $state(false);
   let showImport = $state(false);
