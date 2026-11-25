@@ -201,6 +201,8 @@ jobs:
             adb shell am force-stop com.loay94an.mokhatiti3d || true
             adb shell am start -n com.loay94an.mokhatiti3d/.MainActivity
             sleep 35
+            adb shell screencap -p /sdcard/mokhatiti-home.png || true
+            adb pull /sdcard/mokhatiti-home.png /tmp/mokhatiti-home.png || true
             adb logcat -d -s MokhatitiSmoke:I | tee /tmp/mokhatiti-smoke.log
             grep -q '"application":true' /tmp/mokhatiti-smoke.log
             grep -q '"homeCount":1' /tmp/mokhatiti-smoke.log
@@ -214,3 +216,15 @@ jobs:
               cat /tmp/mokhatiti-runtime.log
               exit 1
             fi
+
+      - name: Upload Android visual smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mokhatiti-3D-android-smoke-evidence
+          path: |
+            /tmp/mokhatiti-smoke.log
+            /tmp/mokhatiti-runtime.log
+            /tmp/mokhatiti-home.png
+          if-no-files-found: ignore
+          retention-days: 7
