@@ -285,7 +285,7 @@
   async function newProject() {
     importError = null;
     exportOpen = false;
-    try { await openProject(() => createDefaultProject(), 'new', openingLifetime.signal); }
+    try { await openProject(() => createDefaultProject($t('library.untitled')), 'new', openingLifetime.signal); }
     catch (error) { importError = error instanceof Error ? error.message : 'Could not open a new project.'; }
   }
 
