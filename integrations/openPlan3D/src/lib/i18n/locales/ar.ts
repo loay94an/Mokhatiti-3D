@@ -1154,6 +1154,7 @@ export const ar: Partial<Record<TranslationKey, string>> = {
   "aiRenderMessage.failed": "فشل التصيير.",
   "aiRenderMessage.key": "أضف مفتاح Gemini API من الإعدادات ← الذكاء الاصطناعي أولاً.",
   "aiRenderMessage.noImage": "لم يتم إرجاع صورة. جرّب نموذجاً أو طلباً مختلفاً.",
+  "aiRenderMessage.apiError": "أعاد مزوّد الصور خطأً (HTTP {status}). تحقق من حساب المزوّد وحاول مجدداً.",
   "canvasStatus.roomsOne": "{count} غرفة",
   "canvasStatus.roomsMany": "{count} غرف",
   "canvasStatus.wallsOne": "{count} جدار",
