@@ -13,7 +13,7 @@ export function translate(language: Locale, key: TranslationKey, variables: Reco
   // Arabic is completed in reviewed batches; untranslated keys retain the source wording.
   const message = language === 'ar' ? (ar[key] ?? en[key]) : dictionaries[language][key];
   // Single-pass substitution preserves literal braces in user-provided values.
-  return message.replace(/\\{(\\w+)\\}/g, (token, name) =>
+  return message.replace(/\{(\w+)\}/g, (token, name) =>
     Object.hasOwn(variables, name) ? String(variables[name]) : token);
 }
 
