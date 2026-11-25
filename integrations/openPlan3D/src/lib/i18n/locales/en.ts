@@ -1607,4 +1607,11 @@ export const en = {
   "renderLab.invalidBounds": "The model has invalid or empty bounds.",
   "renderLab.pathTracingUnavailable": "Path tracing unavailable: {error}. Interactive preview is available.",
   "renderLab.pathTracingStopped": "Path tracing stopped: {error}"
+
+  "renderLab.errorIncompleteGlb": "This is not a complete GLB file.",
+  "renderLab.errorValidGlb": "Choose a valid glTF 2.0 binary (.glb) file.",
+  "renderLab.errorMetadata": "Invalid or oversized GLB metadata.",
+  "renderLab.errorEmbeddedAssets": "Use a self-contained GLB with embedded textures.",
+  "renderLab.errorVertexLimit": "This viewer supports up to two million mesh vertices.",
+  "renderLab.errorJson": "The GLB metadata is not valid JSON."
 } as const;
