@@ -1616,4 +1616,23 @@ export const pt = {
   "renderLab.errorEmbeddedAssets": "Use um GLB independente com texturas incorporadas.",
   "renderLab.errorVertexLimit": "Este visualizador aceita até dois milhões de vértices de malha.",
   "renderLab.errorJson": "Os metadados GLB não são um JSON válido."
+
+  "provider.errorAbsoluteUrl": "Insira uma URL absoluta do provedor, como https://api.openai.com/v1.",
+  "provider.errorHttps": "Use HTTPS para provedores remotos. HTTP é permitido apenas para localhost, 127.0.0.1 ou [::1].",
+  "provider.errorCredentials": "A URL do provedor não pode conter credenciais, consulta ou fragmento. Insira a chave separadamente.",
+  "provider.errorNoProxy": "Escolha a URL do seu provedor de IA. Este aplicativo não hospeda um proxy de IA.",
+  "provider.errorApiKey": "Adicione primeiro sua chave de API OpenAI em Configurações → IA. Provedores personalizados podem ser usados sem chave.",
+  "provider.errorResponsesModel": "Escolha um modelo Responses, como gpt-4.1. Modelos GPT Image e DALL·E não podem ser usados como modelo Responses.",
+  "provider.errorModelList": "O provedor retornou uma lista de modelos incompatível. Insira manualmente o ID do modelo.",
+  "provider.errorTooLarge": "A resposta do provedor é muito grande. Tente uma saída menor.",
+  "provider.errorEmpty": "O provedor retornou uma resposta vazia.",
+  "provider.errorMalformedJson": "O provedor retornou JSON malformado. Verifique a compatibilidade da API.",
+  "provider.errorUnauthorized": "Verifique a chave do provedor e o acesso à conta.",
+  "provider.errorRateLimit": "O limite de solicitações ou gastos do provedor foi atingido. Tente novamente mais tarde.",
+  "provider.errorBadRequest": "Verifique a URL base e o modelo. A renderização exige POST /responses com a ferramenta image_generation.",
+  "provider.errorStatus": "Verifique o status do provedor e tente novamente.",
+  "provider.errorTimeout": "A solicitação ao provedor expirou. Ela não foi repetida; verifique o provedor antes de gerar novamente.",
+  "provider.errorCancelled": "Solicitação cancelada. O provedor ainda pode concluir e cobrar pelo trabalho já iniciado.",
+  "provider.errorConnection": "Não foi possível conectar diretamente ao provedor. Verifique a URL, HTTPS e as permissões CORS/rede local do navegador. Nenhum proxy ou nova tentativa automática foi usado.",
+  "provider.errorNoImage": "Nenhuma imagem foi retornada. Este provedor e modelo precisam oferecer suporte a POST /responses com a ferramenta image_generation. Tente outro modelo."
 } as const;
