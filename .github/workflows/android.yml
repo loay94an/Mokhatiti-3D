@@ -119,6 +119,9 @@ jobs:
           p.write_text(s, encoding="utf-8")
           PY
 
+      - name: Complete visible Arabic catalog and unit labels
+        run: python3 scripts/complete-arabic-properties.py
+
       - name: Audit Arabic translation coverage
         run: python3 scripts/audit-arabic-properties.py
 
