@@ -2,7 +2,7 @@ name: Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/sweethome3d-js-arabic-android]
   workflow_dispatch:
 
 permissions:
