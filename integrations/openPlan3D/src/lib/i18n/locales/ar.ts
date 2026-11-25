@@ -1623,4 +1623,11 @@ export const ar: Partial<Record<TranslationKey, string>> = {
   "renderLab.invalidBounds": "حدود النموذج غير صالحة أو فارغة.",
   "renderLab.pathTracingUnavailable": "تتبع المسار غير متاح: {error}. لا تزال المعاينة التفاعلية متاحة.",
   "renderLab.pathTracingStopped": "توقف تتبع المسار: {error}"
+
+  "renderLab.errorIncompleteGlb": "ملف GLB غير مكتمل.",
+  "renderLab.errorValidGlb": "اختر ملف glTF 2.0 ثنائياً صالحاً بامتداد .glb.",
+  "renderLab.errorMetadata": "بيانات GLB الوصفية غير صالحة أو يتجاوز حجمها الحد المسموح.",
+  "renderLab.errorEmbeddedAssets": "استخدم ملف GLB مستقلاً يحتوي على خامات مضمّنة.",
+  "renderLab.errorVertexLimit": "يدعم هذا العارض مليوني رأس شبكة كحد أقصى.",
+  "renderLab.errorJson": "بيانات GLB الوصفية ليست JSON صالحاً."
 };
