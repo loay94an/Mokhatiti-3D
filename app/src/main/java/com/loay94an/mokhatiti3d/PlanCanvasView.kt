@@ -31,7 +31,14 @@ class PlanCanvasView(context: Context) : View(context) {
     private var selectionStartX = 0f
     private var selectionStartY = 0f
     private var selectionMoved = false
-    private data class EditorSnapshot(val walls: List<PlanWall>, val openings: List<PlanOpening>, val furniture: List<PlanFurniture>)
+    private data class EditorSnapshot(
+        val walls: List<PlanWall>,
+        val rooms: List<PlanRoom>,
+        val openings: List<PlanOpening>,
+        val furniture: List<PlanFurniture>,
+        val levels: List<PlanLevel>,
+        val activeLevelId: String
+    )
     private val undoStack = ArrayDeque<EditorSnapshot>()
     private val prefs get() = context.getSharedPreferences("mokhatiti_native", Context.MODE_PRIVATE)
     private var pixelsPerMetre = 72f
@@ -206,6 +213,7 @@ class PlanCanvasView(context: Context) : View(context) {
     fun activeWalls(): List<PlanWall> = plan.filter { it.levelId == activeLevelId }
 
     fun addLevel(name: String): String {
+        rememberUndo()
         val nextElevation = levels.maxOfOrNull { it.elevationMetres + it.heightMetres + it.floorThicknessMetres } ?: 0f
         val level = PlanLevel(id = java.util.UUID.randomUUID().toString(), name = name.ifBlank { "طابق ${levels.size + 1}" }, elevationMetres = nextElevation)
         levels.add(level)
@@ -404,18 +412,26 @@ class PlanCanvasView(context: Context) : View(context) {
     }
     override fun performClick(): Boolean { super.performClick(); return true }
 
-    private fun rememberUndo() { undoStack.addLast(EditorSnapshot(plan.toList(), openings.toList(), furniture.toList())); if(undoStack.size>40) undoStack.removeFirst() }
+    private fun rememberUndo() {
+        undoStack.addLast(EditorSnapshot(plan.toList(), rooms.toList(), openings.toList(), furniture.toList(), levels.toList(), activeLevelId))
+        if (undoStack.size > 40) undoStack.removeFirst()
+    }
     fun undo() {
         if(undoStack.isNotEmpty()) {
             val snapshot = undoStack.removeLast()
             plan.clear(); plan.addAll(snapshot.walls)
+            rooms.clear(); rooms.addAll(snapshot.rooms)
             openings.clear(); openings.addAll(snapshot.openings)
             furniture.clear(); furniture.addAll(snapshot.furniture)
+            levels.clear(); levels.addAll(snapshot.levels)
+            activeLevelId = snapshot.activeLevelId.takeIf { id -> levels.any { it.id == id } } ?: levels.first().id
         } else if(plan.isNotEmpty()) {
             val removed = plan.removeAt(plan.lastIndex)
             openings.removeAll { it.wallId == removed.id }
+            rooms.clear()
         }
-        rooms.clear()
+        selectedWallId = null
+        selectedFurnitureId = null
         savePlan();invalidate()
     }
     fun clearPlan() {
