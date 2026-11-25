@@ -275,8 +275,9 @@
     });
 
     if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`API error: ${response.status} — ${err}`);
+      const detail = await response.text();
+      console.error('Gemini API response', response.status, detail);
+      throw new Error($t('aiRenderMessage.apiError', { status: response.status }));
     }
 
     const data = await response.json();
@@ -286,7 +287,8 @@
       return `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`;
     } else {
       const textPart = parts.find((p: any) => p.text && !p.thought);
-      throw new Error(textPart?.text || 'No image returned. Try a different model or prompt.');
+      if (textPart?.text) console.warn('Gemini returned no image:', textPart.text);
+      throw new Error($t('aiRenderMessage.noImage'));
     }
   }
 
