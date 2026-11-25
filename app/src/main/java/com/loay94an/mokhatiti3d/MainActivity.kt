@@ -82,7 +82,11 @@ class MainActivity : Activity() {
         tool("غرف") { val count = workspace.detectRooms(); preview.refresh(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
         tool("مسح") { workspace.clearPlan(); preview.refresh() }
         tool("حفظ") { workspace.savePlan(); Toast.makeText(this, "تم حفظ المشروع محلياً", Toast.LENGTH_SHORT).show() }
-        tool("فتح محلي") { workspace.loadPlan(); preview.refresh(); Toast.makeText(this, "تم تحميل المشروع المحلي", Toast.LENGTH_SHORT).show() }
+        tool("فتح محلي") {
+            val loaded = workspace.loadPlan()
+            preview.refresh()
+            Toast.makeText(this, if (loaded) "تم تحميل المشروع المحلي" else "لا يوجد مشروع محلي محفوظ أو تعذر تحميله", Toast.LENGTH_SHORT).show()
+        }
         tool("تصدير JSON") { exportProject() }
         tool("استيراد JSON") { importProject() }
         tool("عرض 3D") { show3d(true) }
