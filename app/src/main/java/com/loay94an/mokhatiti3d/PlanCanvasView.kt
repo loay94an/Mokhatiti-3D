@@ -53,7 +53,8 @@ class PlanCanvasView(context: Context) : View(context) {
     })
 
     private val roomPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(42, 22, 163, 148); style = Paint.Style.FILL }
-    private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(226,233,241); strokeWidth = 1f }
+    private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(235,240,246); strokeWidth = 1f }
+    private val majorGridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(218,227,237); strokeWidth = 1.25f }
     private val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(193,205,219); strokeWidth = 2f }
     private val wallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(25,48,75); strokeWidth = 10f; strokeCap = Paint.Cap.ROUND }
     private val furniturePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(224, 171, 92); style = Paint.Style.FILL }
@@ -159,13 +160,38 @@ class PlanCanvasView(context: Context) : View(context) {
     }
 
     private fun drawGrid(canvas: Canvas) {
-        val step=pixelsPerMetre*.5f
-        var x=originX()%step
-        while(x<width){canvas.drawLine(x,0f,x,height.toFloat(),gridPaint);x+=step}
-        var y=originY()%step
-        while(y<height){canvas.drawLine(0f,y,width.toFloat(),y,gridPaint);y+=step}
-        canvas.drawLine(originX(),0f,originX(),height.toFloat(),axisPaint)
-        canvas.drawLine(0f,originY(),width.toFloat(),originY(),axisPaint)
+        // Geometry snaps to 10 cm. Keep the visual grid on the same metric interval;
+        // hide the fine grid when zoomed out enough that it would become visual noise.
+        val minorStep = pixelsPerMetre * 0.1f
+        val majorStep = pixelsPerMetre * 0.5f
+        if (minorStep >= 5f) {
+            var x = originX() % minorStep
+            while (x < 0f) x += minorStep
+            while (x < width) {
+                canvas.drawLine(x, 0f, x, height.toFloat(), gridPaint)
+                x += minorStep
+            }
+            var y = originY() % minorStep
+            while (y < 0f) y += minorStep
+            while (y < height) {
+                canvas.drawLine(0f, y, width.toFloat(), y, gridPaint)
+                y += minorStep
+            }
+        }
+        var majorX = originX() % majorStep
+        while (majorX < 0f) majorX += majorStep
+        while (majorX < width) {
+            canvas.drawLine(majorX, 0f, majorX, height.toFloat(), majorGridPaint)
+            majorX += majorStep
+        }
+        var majorY = originY() % majorStep
+        while (majorY < 0f) majorY += majorStep
+        while (majorY < height) {
+            canvas.drawLine(0f, majorY, width.toFloat(), majorY, majorGridPaint)
+            majorY += majorStep
+        }
+        canvas.drawLine(originX(), 0f, originX(), height.toFloat(), axisPaint)
+        canvas.drawLine(0f, originY(), width.toFloat(), originY(), axisPaint)
     }
 
     fun setTool(next: PlanCanvasTool) {
