@@ -3,6 +3,7 @@ import { get } from 'svelte/store';
 import { initializeLocale, locale, t, translate, type Locale } from '../src/lib/i18n';
 import { en } from '../src/lib/i18n/locales/en';
 import { pt } from '../src/lib/i18n/locales/pt';
+import { ar } from '../src/lib/i18n/locales/ar';
 
 afterEach(() => { vi.unstubAllGlobals(); locale.set('en'); });
 
@@ -14,6 +15,7 @@ describe('locale preferences', () => {
   });
   it('keeps dictionary keys and substitution tokens in agreement', () => {
     expect(Object.keys(pt).sort()).toEqual(Object.keys(en).sort());
+    expect(Object.keys(ar).sort()).toEqual(Object.keys(en).sort());
     for (const key of Object.keys(en) as (keyof typeof en)[]) {
       expect(pt[key].trim()).not.toBe('');
       expect(pt[key].match(/\{\w+\}/g) ?? []).toEqual(en[key].match(/\{\w+\}/g) ?? []);
@@ -30,6 +32,7 @@ describe('locale preferences', () => {
     expect(values).toEqual(['Settings', 'Configurações']);
     expect(setItem).toHaveBeenCalledWith('o3d_locale', 'pt');
     expect(document.documentElement.lang).toBe('pt');
+    expect(document.documentElement.dir).toBe('ltr');
   });
   it('restores valid preferences and ignores unknown persisted locales', () => {
     const getItem = vi.fn().mockReturnValue('pt');
@@ -38,9 +41,9 @@ describe('locale preferences', () => {
     expect(get(locale)).toBe('pt');
     getItem.mockReturnValue('fr');
     initializeLocale();
-    expect(get(locale)).toBe('en');
+    expect(get(locale)).toBe('ar');
     locale.set('fr' as Locale);
-    expect(get(locale)).toBe('en');
+    expect(get(locale)).toBe('ar');
   });
   it('works in memory when storage access throws', () => {
     vi.stubGlobal('localStorage', { getItem() { throw new Error('denied'); }, setItem() { throw new Error('quota'); } });
