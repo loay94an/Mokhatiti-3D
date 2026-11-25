@@ -10,13 +10,9 @@
 - Automated test files: 361 matching test/spec naming patterns across the archive
 - License file: MIT, copyright notice `theLodgeStudio (2026)`
 
-## Provenance discrepancy — must remain visible
+## Provenance verification
 
-The archive README identifies the application as **openplan3d**, but its `package.json` identifies the package as `open3dfloorplan` and declares this repository URL:
-
-`https://github.com/theLodgeBots/open3dFloorplan.git`
-
-This differs from the previously documented upstream URL `https://github.com/laanlabs/openPlan3D`. The archive itself does not include Git history, so its exact commit and relationship to either GitHub repository cannot be verified from the ZIP alone. Do not silently rewrite this metadata or claim a verified upstream commit. Preserve the supplied LICENSE and source notices.
+The package metadata contains the legacy repository URL `https://github.com/theLodgeBots/open3dFloorplan.git`. A GitHub repository lookup for that URL resolves to the canonical upstream `laanlabs/openPlan3D`. The uploaded archive's `package.json`, `src/lib/i18n/index.ts`, and `src/app.html` were each compared with the files at upstream commit `771c9e1ad30bd1c3cc7584d6eca74deb2e14943d`; all three match exactly. This verifies the archive's documented baseline for those key files and resolves the apparent URL discrepancy. The ZIP does not contain `.git` history, so its full-tree provenance cannot be independently proven by archive metadata alone. Preserve the supplied LICENSE and source notices.
 
 ## Localization architecture found in the archive
 
