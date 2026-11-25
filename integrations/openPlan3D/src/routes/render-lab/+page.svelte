@@ -70,7 +70,7 @@
         <div class="section-title">{$t('renderLab.camera')}</div>
         <div class="views">
           {#each [['isometric', 'overview'], ['top', 'topDown'], ['reverse', 'reverse']] as [value, label]}
-            <button class:chosen={selectedView === value} disabled={!loaded} onclick={() => setView(value)}>{$t(`renderLab.${label}`)}</button>
+            <button class:chosen={selectedView === value} disabled={!loaded} onclick={() => setView(value)}>{label === 'overview' ? $t('renderLab.overview') : label === 'topDown' ? $t('renderLab.topDown') : $t('renderLab.reverse')}</button>
           {/each}
         </div>
         <label class="exposure" for="exposure">{$t('renderLab.exposure')} <span>{exposure.toFixed(2)}</span></label>
