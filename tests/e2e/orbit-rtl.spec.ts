@@ -1,0 +1,1567 @@
+import { test, expect } from '@playwright/test';
+import zlib from 'node:zlib';
+import { openPaletteWith } from './palette';
+
+// Real-browser checks for two things that were only unit-tested: Shift+drag orbit, and Arabic (right-to-left) boot.
+// Run on CI by the browser-smoke job in .github/workflows/unit-tests.yml (not part of the unit-test job).
+
+test('Shift+drag orbit restores an upright camera and never applies more camera updates than pointer events', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect(page.locator('canvas').first()).toBeVisible({ timeout: 30000 });
+  await page.waitForFunction(() => !!(window as any).__OBS_CTX__?.world?.camera?.controls, null, { timeout: 30000 });
+
+  // Leave the camera tilted (as a Top / saved view can) and count camera-controls updates during the drag.
+  await page.evaluate(() => {
+    const c = (window as any).__OBS_CTX__.world.camera;
+    c.three.up.set(0, 0, -1);
+    const orig = c.controls.setLookAt.bind(c.controls);
+    (window as any).__orbitCalls = 0;
+    c.controls.setLookAt = (...a: unknown[]) => { (window as any).__orbitCalls++; return orig(...a); };
+  });
+
+  const box = (await page.locator('canvas').first().boundingBox())!;
+  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  await page.mouse.move(cx, cy);
+  await page.keyboard.down('Shift');
+  await page.mouse.down();
+  const EVENTS = 40;
+  await page.mouse.move(cx + 240, cy + 90, { steps: EVENTS });
+  await page.mouse.up();
+  await page.keyboard.up('Shift');
+  await page.waitForTimeout(200);
+
+  const r = await page.evaluate(() => {
+    const cam = (window as any).__OBS_CTX__.world.camera.three;
+    return { up: [cam.up.x, cam.up.y, cam.up.z], calls: (window as any).__orbitCalls as number };
+  });
+  expect(r.up[1], `camera.up after orbit: ${r.up}`).toBeGreaterThan(0.999);
+  expect(r.calls, 'orbit moved the camera').toBeGreaterThan(0);
+  // Never more camera updates than pointer events. Strict coalescing is proven by tests/orbit-frame.test.cjs; whether a
+  // headless run merges events depends on how fast it renders frames, so it is not asserted here.
+  expect(r.calls, `camera updates (${r.calls}) must not exceed pointer events (${EVENTS})`).toBeLessThanOrEqual(EVENTS);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('Arabic locale boots right-to-left without uncaught errors', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.addInitScript(() => { try { localStorage.setItem('obs.locale', 'ar'); } catch { /* */ } });
+  await page.goto('/');
+  await expect(page.locator('.obs-ribbon')).toBeVisible({ timeout: 30000 });
+  expect(await page.evaluate(() => document.documentElement.dir)).toBe('rtl');
+  // No horizontal page overflow introduced by the mirrored layout.
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow, 'horizontal overflow in px').toBeLessThanOrEqual(1);
+  await page.screenshot({ path: 'test-results/rtl-ar.png' });
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+/**
+ * Wait until the canvas box stops moving. Selecting an element schedules the
+ * properties palette auto-open 400 ms later (G5), which docks a 320 px flex
+ * column on the left and shifts the centred canvas right by 160 px — every
+ * screen position computed before it settles is stale, and the grip (a
+ * 0.15 m sphere, sub-pixel on screen at this zoom) is missed entirely: the
+ * hover stays empty, the press captures no grip, and the drag never
+ * engages. The wait starts past the 400 ms defer, then requires two
+ * identical reads, so a mid-slide sample cannot pass.
+ */
+async function waitForCanvasSettled(page: import('@playwright/test').Page): Promise<void> {
+  const box = () => page.evaluate(() => {
+    const r = document.querySelector('canvas')!.getBoundingClientRect();
+    return [r.left, r.top, r.width, r.height].map((n) => n.toFixed(1)).join(',');
+  });
+  await page.waitForTimeout(700); // past the 400 ms deferred auto-open (G5) and its slide-in
+  let prev = await box();
+  for (let i = 0; i < 30; i++) {
+    await page.waitForTimeout(300);
+    const cur = await box();
+    if (cur === prev) return;
+    prev = cur;
+  }
+  throw new Error(`canvas box never settled (last ${prev})`);
+}
+
+/**
+ * Enter the platform, tolerating the hero click timing out when the renderer
+ * is starved (loaded VM, software GL): the element is visible and stable
+ * but the click cannot be processed in 30 s — and a click that lands as the
+ * overlay unmounts can time out in Playwright even though entry succeeded.
+ * Same pattern as enterPlatform in import-timeout.spec.ts.
+ */
+async function enterPlatform(page: import('@playwright/test').Page): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await page.locator('#obs-hero-3d').click({ timeout: 60000 });
+      break;
+    } catch (e) {
+      if ((await page.locator('.obs-home.is-open').count()) === 0) break;
+      if (attempt === 1) throw e;
+      await page.waitForTimeout(5000);
+    }
+  }
+  await expect(page.locator('.obs-home.is-open')).toHaveCount(0, { timeout: 15000 });
+}
+
+test('editable grips show an open hand on hover and a closed hand while dragging, and the drag moves the vertex', async ({ page }) => {
+  // Full boot + draw + select + drag under software GL: the 60 s default is
+  // too tight on a loaded VM (boots alone take 25–40 s here). The other heavy
+  // tests in this file set 120 s; this one does the same work and gets it too.
+  test.setTimeout(120000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await enterPlatform(page);
+  await page.waitForFunction(() => !!(window as any).__obsAuthoring && !!(window as any).__OBS_CTX__?.world?.camera?.three, null, { timeout: 30000 });
+
+  // Draw a slab by clicking four corners on the ground, then Enter, then select it.
+  const box = (await page.locator('canvas').first().boundingBox())!;
+  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  await page.evaluate(() => (window as any).__obsAuthoring.setAuthoringTool('slab'));
+  for (const [dx, dy] of [[-120, -80], [120, -80], [120, 80], [-120, 80]]) { await page.mouse.move(cx + dx, cy + dy); await page.mouse.click(cx + dx, cy + dy); }
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => (window as any).__obsAuthoring.getElementCount() >= 1, null, { timeout: 10000 });
+  await page.evaluate(() => (window as any).__obsAuthoring.setAuthoringTool('select'));
+  await page.mouse.move(cx, cy); await page.mouse.click(cx, cy);
+
+  // The select click schedules the palette auto-open (400 ms, G5), which
+  // shifts the canvas 160 px: no screen position is trustworthy until the
+  // layout has settled, or the hover and the drag both miss the grip.
+  await waitForCanvasSettled(page);
+
+  const gripPos = () => page.evaluate(() => {
+    const a = (window as any).__obsAuthoring, cam = (window as any).__OBS_CTX__.world.camera.three;
+    const el = a.getElements().find((e: any) => e.type === 'slab');
+    const v = el.params.polygon[0];
+    const p = { x: v[0], y: el.params.elevation, z: v[1] };
+    const w = cam.position.constructor; const vec = new w(p.x, p.y, p.z).project(cam);
+    const r = document.querySelector('canvas')!.getBoundingClientRect();
+    return { id: el.id, v, sx: r.left + (vec.x + 1) / 2 * r.width, sy: r.top + (1 - vec.y) / 2 * r.height };
+  });
+  const info = await gripPos();
+  const host = () => page.evaluate(() => (document.querySelector('canvas')!.parentElement as HTMLElement).style.cursor);
+  await page.mouse.move(info.sx + 40, info.sy + 40); await page.mouse.move(info.sx, info.sy);
+  const hostCursor = () => page.evaluate(() => ((window as any).__OBS_CTX__.rightHost as HTMLElement).style.cursor);
+  const selected = await page.evaluate(() => (window as any).__obsAuthoring.getSelectedIds());
+  expect(await hostCursor(), `open hand over the grip (selected: ${JSON.stringify(selected)}, grip at ${info.sx.toFixed(0)},${info.sy.toFixed(0)})`).toBe('grab');
+  // Re-project immediately before the drag: any layout shift after the hover
+  // (palette, ribbon, toast) moves the sub-pixel grip off the stale point,
+  // and the press captures nothing — the drag never engages.
+  const fresh = await gripPos();
+  await page.mouse.move(fresh.sx, fresh.sy);
+  await page.mouse.down();
+  const cursors: string[] = [];
+  const sample = hostCursor;
+  for (let i = 1; i <= 8; i++) { await page.mouse.move(fresh.sx + i * 4, fresh.sy + i * 3); cursors.push(await sample()); }
+  const mid = await page.evaluate((id) => (window as any).__obsAuthoring.getElementById(id).params.polygon[0], info.id);
+  await page.mouse.up();
+  const after = await page.evaluate((id) => (window as any).__obsAuthoring.getElementById(id).params.polygon[0], info.id);
+  const moved = Math.hypot(after[0] - info.v[0], after[1] - info.v[1]);
+  const poly = await page.evaluate((id) => JSON.stringify((window as any).__obsAuthoring.getElementById(id).params.polygon), info.id);
+  const diag = `polygon ${poly}; cursors during drag: ${JSON.stringify(cursors)}; vertex before ${info.v} mid ${mid} after ${after}; grip screen pos ${fresh.sx.toFixed(0)},${fresh.sy.toFixed(0)};`;
+  expect(cursors.some((c) => c === 'grabbing'), 'grabbing cursor during the drag. ' + diag).toBe(true);
+  expect(moved, 'vertex moved. ' + diag).toBeGreaterThan(0.05);
+  void host;
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('Export > Views to CAD: dialog creates standard views and downloads real DXF files', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await page.waitForFunction(() => !!(window as any).__obsAuthoring, null, { timeout: 30000 });
+
+  // A wall so the views have something to draw.
+  await page.evaluate(() => (window as any).__obsAuthoring.setAuthoringTool('wall'));
+  const box = (await page.locator('canvas').first().boundingBox())!;
+  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  await page.mouse.move(cx - 100, cy); await page.mouse.click(cx - 100, cy);
+  await page.mouse.move(cx + 100, cy); await page.mouse.click(cx + 100, cy);
+  await page.keyboard.press('Enter'); await page.keyboard.press('Escape');
+
+  await openPaletteWith(page, 'Views to CAD');
+  await page.keyboard.press('Enter');
+  const dlg = page.locator('#obs-export-cad');
+  await expect(dlg).toBeVisible({ timeout: 10000 });
+  if (await dlg.locator('[data-make]').count()) await dlg.locator('[data-make]').click();
+  await expect(dlg.locator('[data-view]').first()).toBeVisible();
+  await dlg.locator('[data-format]').selectOption('dxf');
+  const dl = page.waitForEvent('download', { timeout: 30000 });
+  await dlg.locator('[data-go]').click();
+  const d = await dl;
+  const name = d.suggestedFilename();
+  expect(name.endsWith('.zip') || name.endsWith('.dxf'), `downloaded ${name}`).toBe(true);
+  const msg = await dlg.locator('[data-msg]').innerText();
+  expect(msg, msg).toMatch(/Exported \d+ DXF file/);
+  const dl3 = page.waitForEvent('download', { timeout: 30000 });
+  await dlg.locator('[data-go3d]').click();
+  const d3 = await dl3;
+  expect(d3.suggestedFilename()).toBe('openbimstudio-model-3d.dxf');
+  const text3 = (await import('fs')).readFileSync((await d3.path())!, 'utf8');
+  expect(text3, 'real 3D DXF content').toContain('3DFACE');
+  expect(text3.trimEnd().endsWith('EOF')).toBe(true);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+const WALL_IFC = `ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');
+FILE_NAME('wall.ifc','2026-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'P',$,$,$,$,(#20),#10);
+#10=IFCUNITASSIGNMENT((#11));
+#11=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#20=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#21,$);
+#21=IFCAXIS2PLACEMENT3D(#22,$,$);
+#22=IFCCARTESIANPOINT((0.,0.,0.));
+#30=IFCSITE('2VqzM6bXH7ugTO1ZoXRFzp',$,'S',$,$,#31,$,$,.ELEMENT.,$,$,$,$,$);
+#31=IFCLOCALPLACEMENT($,#21);
+#40=IFCRELAGGREGATES('3VqzM6bXH7ugTO1ZoXRFzq',$,$,$,#1,(#30));
+#50=IFCWALL('1VqzM6bXH7ugTO1ZoXRFzr',$,'Wall 1',$,$,#51,#60,$,.STANDARD.);
+#51=IFCLOCALPLACEMENT(#31,#21);
+#60=IFCPRODUCTDEFINITIONSHAPE($,$,(#61));
+#61=IFCSHAPEREPRESENTATION(#20,'Body','SweptSolid',(#62));
+#62=IFCEXTRUDEDAREASOLID(#63,#21,#64,3.);
+#63=IFCRECTANGLEPROFILEDEF(.AREA.,$,#65,5.,0.2);
+#64=IFCDIRECTION((0.,0.,1.));
+#65=IFCAXIS2PLACEMENT2D(#66,$);
+#66=IFCCARTESIANPOINT((0.,0.));
+#70=IFCRELCONTAINEDINSPATIALSTRUCTURE('4VqzM6bXH7ugTO1ZoXRFzs',$,$,$,(#50),#30);
+ENDSEC;
+END-ISO-10303-21;
+`;
+
+test('3D export includes an imported IFC model, with the wall on layer A-WALL', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.fragments), { timeout: 30000 }).toBe(true);
+
+  // Drop the IFC file onto the viewport, as a user would.
+  await page.evaluate(async (text) => {
+    const host = (window as any).__OBS_CTX__.rightHost as HTMLElement;
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], 'wall.ifc', { type: 'application/octet-stream' }));
+    host.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, WALL_IFC);
+  await expect.poll(() => page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size), { timeout: 90000, message: 'IFC model loaded into the scene' }).toBeGreaterThanOrEqual(1);
+  await page.waitForTimeout(1500);
+
+  await openPaletteWith(page, 'Views to CAD');
+  await page.keyboard.press('Enter');
+  const dlg = page.locator('#obs-export-cad');
+  await expect(dlg).toBeVisible({ timeout: 10000 });
+  const dl = page.waitForEvent('download', { timeout: 60000 });
+  await dlg.locator('[data-go3d]').click();
+  const d = await dl;
+  const text = (await import('fs')).readFileSync((await d.path())!, 'utf8');
+  const msg = await dlg.locator('[data-msg]').innerText();
+  expect(text, `3D DXF from IFC. Dialog said: ${msg}`).toContain('3DFACE');
+  expect(text, msg).toContain('A-WALL');
+  // The wall is 5 m x 0.2 m x 3 m: the exported extents should be about that, in millimetres.
+  const xs = Array.from(text.matchAll(/\n10\n(-?[\d.]+)\n/g)).map((m) => parseFloat(m[1]));
+  const zs = Array.from(text.matchAll(/\n30\n(-?[\d.]+)\n/g)).map((m) => parseFloat(m[1]));
+  expect(Math.max(...zs) - Math.min(...zs), `height span (mm). ${msg}`).toBeGreaterThan(2900);
+  expect(Math.max(...zs) - Math.min(...zs)).toBeLessThan(3100);
+  expect(Math.max(...xs) - Math.min(...xs)).toBeGreaterThan(4900);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+/** An IFC with a grid of walls (n x n), to give the viewport a realistic amount of geometry. */
+function manyWallsIfc(n: number): string {
+  const head = `ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');
+FILE_NAME('walls.ifc','2026-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'P',$,$,$,$,(#20),#10);
+#10=IFCUNITASSIGNMENT((#11));
+#11=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#20=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#21,$);
+#21=IFCAXIS2PLACEMENT3D(#22,$,$);
+#22=IFCCARTESIANPOINT((0.,0.,0.));
+#30=IFCSITE('2VqzM6bXH7ugTO1ZoXRFzp',$,'S',$,$,#31,$,$,.ELEMENT.,$,$,$,$,$);
+#31=IFCLOCALPLACEMENT($,#21);
+#40=IFCRELAGGREGATES('3VqzM6bXH7ugTO1ZoXRFzq',$,$,$,#1,(#30));
+#63=IFCRECTANGLEPROFILEDEF(.AREA.,$,#65,4.,0.2);
+#64=IFCDIRECTION((0.,0.,1.));
+#65=IFCAXIS2PLACEMENT2D(#66,$);
+#66=IFCCARTESIANPOINT((0.,0.));
+`;
+  const body: string[] = []; const ids: string[] = [];
+  let id = 100;
+  const guid = (i: number) => { const a = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$'; let s = ''; let v = i + 12345; for (let k = 0; k < 22; k++) { s += a[v % 64]; v = Math.floor(v / 64) + k * 7 + 1; } return s; };
+  for (let x = 0; x < n; x++) for (let y = 0; y < n; y++) {
+    const pt = id++, ax = id++, lp = id++, solid = id++, rep = id++, pds = id++, wall = id++;
+    body.push(`#${pt}=IFCCARTESIANPOINT((${x * 6}.,${y * 6}.,0.));`);
+    body.push(`#${ax}=IFCAXIS2PLACEMENT3D(#${pt},$,$);`);
+    body.push(`#${lp}=IFCLOCALPLACEMENT(#31,#${ax});`);
+    body.push(`#${solid}=IFCEXTRUDEDAREASOLID(#63,#21,#64,3.);`);
+    body.push(`#${rep}=IFCSHAPEREPRESENTATION(#20,'Body','SweptSolid',(#${solid}));`);
+    body.push(`#${pds}=IFCPRODUCTDEFINITIONSHAPE($,$,(#${rep}));`);
+    body.push(`#${wall}=IFCWALL('${guid(wall)}',$,'W${wall}',$,$,#${lp},#${pds},$,.STANDARD.);`);
+    ids.push(`#${wall}`);
+  }
+  const rel = `#${id}=IFCRELCONTAINEDINSPATIALSTRUCTURE('4VqzM6bXH7ugTO1ZoXRFzs',$,$,$,(${ids.join(',')}),#30);`;
+  return head + body.join('\n') + '\n' + rel + '\nENDSEC;\nEND-ISO-10303-21;\n';
+}
+
+test('PROFILE: orbit a 1,600-wall model with the CPU profiler on (prints the hottest functions)', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'uses the Chrome DevTools Protocol CPU profiler (Chromium-only API); not a product limitation');
+  test.setTimeout(240000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.fragments), { timeout: 30000 }).toBe(true);
+  const ifc = manyWallsIfc(40);
+  await page.evaluate(async (text) => {
+    const host = (window as any).__OBS_CTX__.rightHost as HTMLElement;
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], 'walls.ifc', { type: 'application/octet-stream' }));
+    host.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, ifc);
+  await expect.poll(() => page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size), { timeout: 180000, message: 'model loaded' }).toBeGreaterThanOrEqual(1);
+  await page.waitForTimeout(3000);
+
+  const box = (await page.locator('canvas').first().boundingBox())!;
+  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  await page.mouse.move(cx, cy);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Profiler.enable');
+  await cdp.send('Profiler.setSamplingInterval', { interval: 500 });
+  await page.evaluate(() => {
+    (window as any).__long = [];
+    new PerformanceObserver((l) => { for (const e of l.getEntries()) (window as any).__long.push(Math.round(e.duration)); }).observe({ entryTypes: ['longtask'] });
+  });
+  await cdp.send('Profiler.start');
+  const t0 = Date.now();
+  await page.keyboard.down('Shift');
+  await page.mouse.down();
+  for (let i = 0; i < 6; i++) { await page.mouse.move(cx + 200 * Math.sin(i), cy + 80 * Math.cos(i), { steps: 40 }); }
+  await page.mouse.up();
+  await page.keyboard.up('Shift');
+  const wall = Date.now() - t0;
+  const { profile } = await cdp.send('Profiler.stop');
+
+  // Self time per function.
+  const nodes = new Map<number, any>(profile.nodes.map((n: any) => [n.id, n]));
+  const self = new Map<string, number>();
+  const dt: number[] = profile.timeDeltas;
+  profile.samples.forEach((id: number, i: number) => {
+    const n = nodes.get(id)!; const f = n.callFrame;
+    const key = `${f.functionName || '(anonymous)'}  ${f.url.split('/').slice(-2).join('/')}:${f.lineNumber + 1}`;
+    self.set(key, (self.get(key) ?? 0) + (dt[i] ?? 0));
+  });
+  const total = Array.from(self.values()).reduce((a, b) => a + b, 0);
+  const top = Array.from(self.entries()).sort((a, b) => b[1] - a[1]).slice(0, 18).map(([k, v]) => `${(v / 1000).toFixed(0).padStart(6)} ms  ${(100 * v / total).toFixed(1).padStart(5)}%  ${k}`);
+  const long = await page.evaluate(() => (window as any).__long as number[]);
+  const stats = await page.evaluate(() => { const c = (window as any).__OBS_CTX__; let meshes = 0, tris = 0; c.world.scene.three.traverse((o: any) => { if (o.isMesh) { meshes++; const g = o.geometry; tris += g?.index ? g.index.count / 3 : (g?.attributes?.position?.count ?? 0) / 3; } }); return { meshes, tris: Math.round(tris), models: c.fragments.list.size }; });
+  const report = `ORBIT PROFILE  wall time ${wall} ms for 240 mouse moves; models ${stats.models}, meshes ${stats.meshes}, triangles ${stats.tris}\nlong tasks (ms): ${long.length} total, longest ${Math.max(0, ...long)}, sum ${long.reduce((a, b) => a + b, 0)}\n--- top self time ---\n${top.join('\n')}`;
+  console.log(report);
+  test.info().annotations.push({ type: 'orbit-profile', description: report });
+  (await import('fs')).mkdirSync('test-results', { recursive: true });
+  (await import('fs')).writeFileSync('test-results/orbit-profile.txt', report);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('smooth navigation lowers the render resolution while dragging and restores it afterwards', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.world?.renderer?.three), { timeout: 30000 }).toBe(true);
+  const ratio = () => page.evaluate(() => (window as any).__OBS_CTX__.world.renderer.three.getPixelRatio() as number);
+  const before = await ratio();
+  const box = (await page.locator('canvas').first().boundingBox())!;
+  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  await page.mouse.move(cx, cy);
+  await page.mouse.down({ button: 'middle' });
+  await page.mouse.move(cx + 60, cy + 20, { steps: 6 });
+  const during = await ratio();
+  await page.mouse.up({ button: 'middle' });
+  await page.waitForTimeout(600);
+  const after = await ratio();
+  expect(during, `during drag (before ${before})`).toBeLessThan(before);
+  expect(after, 'restored after the drag').toBe(before);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('Family sketch window: a parametric rectangle and a polygon with a hole create real families', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.features?.family), { timeout: 30000 }).toBe(true);
+  const open = async () => {
+    await openPaletteWith(page, 'Family sketch: new family');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('[data-sketch-editor]')).toBeVisible({ timeout: 10000 });
+  };
+  const click = async (fx: number, fy: number) => {
+    const b = (await page.locator('[data-sketch-editor] [data-svg]').boundingBox())!;
+    await page.mouse.click(b.x + b.width * fx, b.y + b.height * fy);
+  };
+  const familyByName = (name: string) => page.evaluate((n) => {
+    const svc = (window as any).__OBS_CTX__.features.family;
+    const f = svc.list().find((x: any) => x.name === n);
+    return f ? JSON.parse(JSON.stringify(f)) : null;
+  }, name);
+
+  // 1) Parametric rectangle.
+  await open();
+  const ed = page.locator('[data-sketch-editor]');
+  await ed.locator('[data-name]').fill('E2E Pad');
+  await ed.locator('[data-tool="rect"]').click();
+  await click(0.4, 0.4); await click(0.6, 0.55);
+  await ed.locator('[data-apply]').click();
+  await expect(ed).toHaveCount(0, { timeout: 10000 });
+  const pad = await familyByName('E2E Pad');
+  expect(pad, 'family created').not.toBeNull();
+  const names = pad.parameters.map((p: any) => p.name);
+  expect(names, JSON.stringify(names)).toEqual(expect.arrayContaining(['sketchWidth', 'sketchLength', 'sketchDepth']));
+  expect(pad.geometry.profile?.kind ?? pad.geometry.parts?.[0]?.profile?.kind, 'rect profile kept parametric').toBe('rect');
+
+  // 2) Square outline with a square hole.
+  await open();
+  await ed.locator('[data-name]').fill('E2E Holed');
+  await ed.locator('[data-tool="polygon"]').click();
+  for (const [x, y] of [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7]]) await click(x, y);
+  await ed.locator('[data-close]').click();
+  await ed.locator('[data-hole]').click();
+  await ed.locator('[data-tool="rect"]').click();
+  await click(0.45, 0.45); await click(0.55, 0.55);
+  await ed.locator('[data-apply]').click();
+  await expect(ed).toHaveCount(0, { timeout: 10000 });
+  const holed = await familyByName('E2E Holed');
+  expect(holed, 'holed family created').not.toBeNull();
+  const g = holed.geometry.holes ? holed.geometry : holed.geometry.parts?.find((p: any) => p.holes);
+  expect(g?.holes?.length, JSON.stringify(holed.geometry).slice(0, 300)).toBe(1);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+// ---- 3D sectioning: does the Section Box really clip the model on screen?
+async function loadWallIfc(page: import('@playwright/test').Page): Promise<void> {
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.fragments), { timeout: 30000 }).toBe(true);
+  await page.evaluate(async (text) => {
+    const host = (window as any).__OBS_CTX__.rightHost as HTMLElement;
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], 'wall.ifc', { type: 'application/octet-stream' }));
+    host.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, WALL_IFC);
+  await expect.poll(() => page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size), { timeout: 90000, message: 'IFC model loaded' }).toBeGreaterThanOrEqual(1);
+  await page.waitForTimeout(1500);
+}
+
+/** Minimal 8-bit non-interlaced PNG decoder (the page CSP blocks decoding inside the browser). Returns RGB(A) bytes. */
+function decodePng(buf: Buffer): { w: number; h: number; bpp: number; data: Buffer } {
+  let o = 8, w = 0, h = 0, ct = 0; const idat: Buffer[] = [];
+  while (o < buf.length) {
+    const len = buf.readUInt32BE(o), type = buf.toString('ascii', o + 4, o + 8), d = buf.subarray(o + 8, o + 8 + len);
+    if (type === 'IHDR') { w = d.readUInt32BE(0); h = d.readUInt32BE(4); ct = d[9]; }
+    if (type === 'IDAT') idat.push(d);
+    o += 12 + len;
+  }
+  const bpp = ct === 6 ? 4 : 3; const raw = zlib.inflateSync(Buffer.concat(idat)); const stride = w * bpp;
+  const out = Buffer.alloc(h * stride);
+  for (let y = 0; y < h; y++) {
+    const f = raw[y * (stride + 1)], src = y * (stride + 1) + 1, dst = y * stride;
+    for (let x = 0; x < stride; x++) {
+      const v = raw[src + x], a = x >= bpp ? out[dst + x - bpp] : 0, b = y > 0 ? out[dst - stride + x] : 0, c = x >= bpp && y > 0 ? out[dst - stride + x - bpp] : 0;
+      let r = v;
+      if (f === 1) r = v + a; else if (f === 2) r = v + b; else if (f === 3) r = v + ((a + b) >> 1);
+      else if (f === 4) { const pp = a + b - c, pa = Math.abs(pp - a), pb = Math.abs(pp - b), pc = Math.abs(pp - c); r = v + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c); }
+      out[dst + x] = r & 255;
+    }
+  }
+  return { w, h, bpp, data: out };
+}
+
+/** Number of canvas pixels that differ clearly from the canvas corner colour (a crude "something is drawn" measure). */
+async function drawnPixels(page: import('@playwright/test').Page): Promise<number> {
+  const box = (await page.locator('canvas').first().boundingBox())!;
+  const shot = await page.screenshot({ clip: { x: box.x, y: box.y, width: box.width, height: box.height } });
+  const { data, bpp } = decodePng(shot);
+  const bg = [data[0], data[1], data[2]];
+  let n = 0;
+  for (let i = 0; i < data.length; i += bpp) if (Math.abs(data[i] - bg[0]) + Math.abs(data[i + 1] - bg[1]) + Math.abs(data[i + 2] - bg[2]) > 60) n++;
+  return n;
+}
+
+test('SECTION BOX: clips the model on screen and restores it when switched off', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  // Look straight down at the wall (5 m x 0.2 m x 3 m) from above.
+  await page.evaluate(async () => {
+    const c = (window as any).__OBS_CTX__.world.camera.controls;
+    await c.setLookAt(2.5, 14, 0.1, 2.5, 0, 0.1, false);
+  });
+  await page.waitForTimeout(500);
+  const before = await drawnPixels(page);
+  await page.screenshot({ path: 'test-results/section-0-before.png' });
+
+  const info = await page.evaluate(() => {
+    const sb = (window as any).__OBS_CTX__.features.sectionBox;
+    sb.enable(0.5);
+    const b = sb.getBox();
+    return { active: sb.isActive(), min: [b.min.x, b.min.y, b.min.z], max: [b.max.x, b.max.y, b.max.z], planes: ((window as any).__OBS_CTX__.world.renderer.three.clippingPlanes ?? []).length };
+  });
+  await page.waitForTimeout(500);
+  const full = await drawnPixels(page);
+  await page.screenshot({ path: 'test-results/section-1-box-on.png' });
+
+  // Cut the box in half along X (keep x <= 2.5).
+  const half = await page.evaluate(() => {
+    const sb = (window as any).__OBS_CTX__.features.sectionBox; const b = sb.getBox(); b.max.x = (b.min.x + b.max.x) / 2; sb.setBox(b);
+    return ((window as any).__OBS_CTX__.world.renderer.three.clippingPlanes ?? []).length;
+  });
+  let halved = await drawnPixels(page);
+  for (let i = 0; i < 12 && full - halved <= 400; i++) { await page.waitForTimeout(500); halved = await drawnPixels(page); } // the clipper registers planes asynchronously
+  await page.screenshot({ path: 'test-results/section-2-halved.png' });
+
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.sectionBox.disable());
+  await page.waitForTimeout(500);
+  const after = await drawnPixels(page);
+  const dbg = await page.evaluate(() => (window as any).__OBS_CTX__.features.sectionBox.debugPlanes());
+  console.log('SECTION-DBG ' + JSON.stringify(dbg));
+  const planesAfter = await page.evaluate(() => ((window as any).__OBS_CTX__.world.renderer.three.clippingPlanes ?? []).length);
+
+  const diag = `before ${before}, box-on ${full}, halved ${halved}, after-off ${after}; box ${JSON.stringify(info)}; planes after off ${planesAfter}; planes after edit ${half}`;
+  console.log('SECTION-DIAG ' + diag);
+  expect(info.active, diag).toBe(true);
+  expect(full - halved, 'half the wall (~1000 px at this zoom) is clipped away. ' + diag).toBeGreaterThan(400);
+  expect(halved, 'something remains. ' + diag).toBeGreaterThan(0);
+  expect(Math.abs(after - before), 'switching off restores the view. ' + diag).toBeLessThan(before * 0.1 + 50);
+  expect(half, 'editing the box replaces its planes instead of stacking them. ' + diag).toBe(6);
+  expect(planesAfter, diag).toBe(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('SECTION BOX: dragging a face arrow with a real mouse moves that face and keeps exactly 6 planes', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  const setup = await page.evaluate(async () => {
+    const ctx = (window as any).__OBS_CTX__;
+    const sb = ctx.features.sectionBox; sb.enable(0.5);
+    const b = sb.getBox(); const cx = (b.min.x + b.max.x) / 2, cy = (b.min.y + b.max.y) / 2;
+    await ctx.world.camera.controls.setLookAt(cx, cy + 3, 14, cx, cy, 0, false);
+    await new Promise((r) => setTimeout(r, 600));
+    const cam = ctx.world.camera.three; cam.updateMatrixWorld(true);
+    let h: any = null;
+    ctx.world.scene.three.traverse((o: any) => { if (o.name === 'obs-section-box-handles') h = o; });
+    let target: any = null;
+    h?.traverse((o: any) => { const u = o.userData; if (!target && u?.kind === 'section-box-face' && u.axis === 'x' && u.sign === 1 && u.part === 'arrow') target = o; });
+    if (!target) return { err: 'no +X arrow handle found' };
+    const p = target.getWorldPosition(new (cam.position.constructor)());
+    p.project(cam);
+    const rect = ctx.world.renderer.three.domElement.getBoundingClientRect();
+    return { x: rect.left + (p.x * 0.5 + 0.5) * rect.width, y: rect.top + (-p.y * 0.5 + 0.5) * rect.height, maxX: b.max.x, w: rect.width };
+  });
+  expect((setup as any).err, JSON.stringify(setup)).toBeUndefined();
+  const s = setup as { x: number; y: number; maxX: number };
+  await page.mouse.move(s.x, s.y); await page.waitForTimeout(150);
+  const cursor = await page.evaluate(() => (window as any).__OBS_CTX__.world.renderer.three.domElement.style.cursor);
+  await page.mouse.down();
+  const midDown = await page.evaluate(() => ({ dragging: (window as any).__OBS_CTX__.features.sectionBox.debugPlanes().dragging, controls: (window as any).__OBS_CTX__.world.camera.controls.enabled }));
+  await page.mouse.move(s.x - 60, s.y, { steps: 8 });
+  const midMove = await page.evaluate(() => ({ dragging: (window as any).__OBS_CTX__.features.sectionBox.debugPlanes().dragging, maxX: (window as any).__OBS_CTX__.features.sectionBox.getBox().max.x }));
+  console.log('SECTION-MID ' + JSON.stringify({ midDown, midMove }));
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+  const after = await page.evaluate(() => { const sb = (window as any).__OBS_CTX__.features.sectionBox; return { maxX: sb.getBox().max.x, planes: sb.debugPlanes() }; });
+  const diag = `start ${JSON.stringify(s)} cursorOnHover=${cursor} after ${JSON.stringify(after)}`;
+  console.log('SECTION-DRAG ' + diag);
+  expect(cursor, 'hovering the arrow shows a grab hand. ' + diag).toBe('grab');
+  expect(after.maxX, 'dragging left shrinks the +X face. ' + diag).toBeLessThan(s.maxX - 0.2);
+  expect(after.planes.renderer, 'still exactly 6 planes. ' + diag).toBe(6);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('3D DIMENSION (Measure): one Esc cancels the active dimension command and its unfinished dimension; finished ones stay until deleted; Clear deletes all', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  await page.evaluate(async () => {
+    const c = (window as any).__OBS_CTX__.world.camera.controls;
+    await c.setLookAt(2.5, 14, 0.1, 2.5, 0, 0.1, false);
+  });
+  await page.waitForTimeout(500);
+  const box = (await page.locator('canvas').first().boundingBox())!;
+  const at = (fx: number, fy: number) => ({ x: box.x + box.width * fx, y: box.y + box.height * fy });
+  const st = () => page.evaluate(() => (window as any).__obsMeasure.state());
+  const click = async (fx: number, fy: number) => { const p = at(fx, fy); await page.mouse.click(p.x, p.y); await page.waitForTimeout(500); };
+  await page.evaluate(() => { (window as any).__obsMeasure.setMode('distance'); (window as any).__obsMeasure.enable(); });
+  await page.waitForTimeout(400);
+
+  await click(0.35, 0.4); await click(0.65, 0.4);          // dimension 1
+  const one = await st();
+  await click(0.35, 0.6); await click(0.65, 0.6);          // dimension 2
+  const two = await st();
+  await click(0.5, 0.3);                                    // first point of dimension 3
+  const pend = await st();
+  await page.keyboard.press('Escape');
+  const afterEsc1 = await st();
+  await page.keyboard.press('Escape'); // pressing Esc again with nothing active must be harmless
+  const afterEsc2 = await st();
+  const diag = JSON.stringify({ one, two, pend, afterEsc1, afterEsc2 });
+  console.log('MEASURE-DIAG ' + diag);
+  expect(one.labels, 'dimension 1 is drawn. ' + diag).toBeGreaterThan(0);
+  expect(two.labels, 'dimension 2 is added, not replacing 1. ' + diag).toBeGreaterThan(one.labels);
+  expect(pend.pending, 'first point of dimension 3 is pending. ' + diag).toBe(1);
+  expect(afterEsc1.pending + afterEsc1.pendingBalls, 'Esc cancels the unfinished dimension and its marker. ' + diag).toBe(0);
+  expect(afterEsc1.enabled, 'one Esc cancels the dimension command completely. ' + diag).toBe(false);
+  expect(afterEsc1.labels, 'Esc does not delete finished dimensions. ' + diag).toBe(two.labels);
+  expect(afterEsc2.labels, 'finished dimensions remain. ' + diag).toBe(two.labels);
+
+  await page.evaluate(() => (window as any).__obsMeasure.clear());
+  const cleared = await st();
+  console.log('MEASURE-CLEARED ' + JSON.stringify(cleared));
+  expect(cleared.labels + cleared.graphics + cleared.obcDims + cleared.pending, 'Clear deletes every dimension. ' + JSON.stringify(cleared)).toBe(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('3D DIMENSION (Measure): XYZ, angle and chain modes complete, Esc cancels each unfinished one, Clear deletes all', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  await page.evaluate(async () => {
+    await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(2.5, 14, 0.1, 2.5, 0, 0.1, false);
+  });
+  await page.waitForTimeout(500);
+  const box = (await page.locator('canvas').first().boundingBox())!;
+  const st = () => page.evaluate(() => (window as any).__obsMeasure.state());
+  const click = async (fx: number, fy: number) => { await page.mouse.click(box.x + box.width * fx, box.y + box.height * fy); await page.waitForTimeout(450); };
+  const start = (m: string) => page.evaluate((mode) => { const o = (window as any).__obsMeasure; o.setMode(mode); o.enable(); }, m);
+  const log: Record<string, unknown> = {};
+
+  await start('xyz'); await page.waitForTimeout(300);
+  await click(0.3, 0.35); await click(0.6, 0.5);
+  log.xyzDone = await st();
+  await click(0.4, 0.7);
+  log.xyzPending = await st();
+  await page.keyboard.press('Escape');
+  log.xyzEsc = await st();
+
+  await start('angle'); await page.waitForTimeout(300);
+  await click(0.3, 0.3); await click(0.5, 0.5); await click(0.7, 0.3);
+  log.angleDone = await st();
+  await click(0.4, 0.7); await click(0.5, 0.8);
+  log.anglePending = await st();
+  await page.keyboard.press('Escape');
+  log.angleEsc = await st();
+
+  await start('chain'); await page.waitForTimeout(300);
+  await click(0.3, 0.7); await click(0.4, 0.75); await click(0.5, 0.7);
+  log.chainDone = await st();
+  await page.keyboard.press('Escape');
+  log.chainEsc = await st();
+
+  // Delete removes only the last finished dimension.
+  await start('distance'); await page.waitForTimeout(300);
+  await click(0.2, 0.2); await click(0.4, 0.2);
+  log.beforeDel = await st();
+  await page.keyboard.press('Delete');
+  log.afterDel = await st();
+  await page.keyboard.press('Backspace');
+  log.afterBack = await st();
+  await page.evaluate(() => (window as any).__obsMeasure.clear());
+  log.cleared = await st();
+  const d = JSON.stringify(log);
+  console.log('MEASURE-MODES ' + d);
+  {
+    const Lx = log as any;
+    expect(Lx.afterDel.labels, 'Delete removes the last dimension only. ' + d).toBeLessThan(Lx.beforeDel.labels);
+    expect(Lx.afterDel.labels, 'earlier dimensions stay. ' + d).toBeGreaterThan(0);
+    expect(Lx.afterBack.labels, 'Backspace removes the next one. ' + d).toBeLessThanOrEqual(Lx.afterDel.labels);
+  }
+  const L = log as any;
+  expect(L.xyzDone.labels, 'xyz draws X/Y/Z + total labels. ' + d).toBeGreaterThanOrEqual(2);
+  expect(L.xyzPending.pending, d).toBe(1);
+  expect(L.xyzEsc.pending + L.xyzEsc.pendingBalls, 'xyz Esc cancels pending. ' + d).toBe(0);
+  expect(L.xyzEsc.enabled, d).toBe(false);
+  expect(L.xyzEsc.labels, 'xyz Esc keeps finished. ' + d).toBe(L.xyzDone.labels);
+  expect(L.angleDone.labels, 'angle adds a label. ' + d).toBeGreaterThan(L.xyzEsc.labels);
+  expect(L.anglePending.pending, d).toBe(2);
+  expect(L.angleEsc.pending + L.angleEsc.pendingBalls, 'angle Esc cancels pending. ' + d).toBe(0);
+  expect(L.angleEsc.labels, 'angle Esc keeps finished. ' + d).toBe(L.angleDone.labels);
+  expect(L.chainDone.labels, 'chain adds segment labels. ' + d).toBeGreaterThan(L.angleEsc.labels);
+  expect(L.chainEsc.pending + L.chainEsc.pendingBalls, 'chain Esc leaves no marker. ' + d).toBe(0);
+  expect(L.chainEsc.enabled, d).toBe(false);
+  expect(L.cleared.labels + L.cleared.graphics + L.cleared.pending + L.cleared.pendingBalls, 'Clear deletes all. ' + d).toBe(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('WALK MODE: smooth constant-speed walking, stops at a wall without passing or jittering, Esc leaves cleanly', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  await page.waitForTimeout(2500); // let the automatic zoom-to-model after loading finish before taking the camera
+  // Stand 6 m in front of the wall (wall at z=0, spanning x -2.5..2.5) looking at it.
+  // The automatic zoom-to-model after loading can still move the camera; retry until Walk starts facing the wall.
+  for (let i = 0; i < 6; i++) {
+    await page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(0, 1.7, 6, 0, 1.7, 0, false); });
+    await page.waitForTimeout(700);
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.enable());
+    await page.waitForTimeout(500);
+    const pose = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+    if (pose && Math.abs(pose.yaw) + Math.abs(pose.pitch) < 0.05) break;
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable?.());
+    await page.waitForTimeout(300);
+  }
+  const enabled = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.isEnabled());
+  expect(enabled, 'walk mode starts').toBe(true);
+  const p0 = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+  expect(Math.abs(p0.yaw) + Math.abs(p0.pitch), 'walk starts facing where the camera looked. ' + JSON.stringify(p0)).toBeLessThan(0.05);
+  // Sample the walker pose on every animation frame while W is held.
+  const startPose = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+  console.log('WALK-START ' + JSON.stringify(startPose));
+  await page.evaluate(() => {
+    const w = window as any; w.__walkSamples = []; w.__walkRec = true;
+    const loop = (t: number) => { const p = w.__OBS_CTX__.features.walkMode.getPose(); if (p) w.__walkSamples.push([t, p.x, p.y, p.z]); if (w.__walkRec) requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  });
+  await page.keyboard.down('w');
+  // Hold W until the walker has reached the wall AND settled (bounded wait). The simulation step is capped per frame, so
+  // on a slow CI runner the walk takes several times longer in wall-clock time; a fixed 4.5 s hold measured the runner.
+  {
+    let prevZ = Infinity, still = 0;
+    for (let i = 0; i < 60 && still < 3; i++) {
+      await page.waitForTimeout(500);
+      const q = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+      if (q && q.z < 2 && Math.abs(prevZ - q.z) < 0.01) still++; else still = 0;
+      prevZ = q ? q.z : prevZ;
+    }
+    await page.waitForTimeout(1500); // keep pressing against the wall: the last second is what is measured
+  }
+  await page.keyboard.up('w');
+  await page.waitForTimeout(700);
+  const samples: number[][] = await page.evaluate(() => { const w = window as any; w.__walkRec = false; return w.__walkSamples; });
+  // Speeds per frame.
+  const v: number[] = [], t: number[] = [];
+  for (let i = 1; i < samples.length; i++) {
+    const dt = (samples[i][0] - samples[i - 1][0]) / 1000; if (dt <= 0) continue;
+    v.push(Math.hypot(samples[i][1] - samples[i - 1][1], samples[i][3] - samples[i - 1][3]) / Math.min(dt, 0.05)); t.push(samples[i][0]);
+  }
+  const cruise = v.filter((x) => x > 2.5 && x < 4);
+  const mean = cruise.reduce((a, b) => a + b, 0) / Math.max(1, cruise.length);
+  const sd = Math.sqrt(cruise.reduce((a, b) => a + (b - mean) ** 2, 0) / Math.max(1, cruise.length));
+  const minZ = Math.min(...samples.map((s) => s[3]));
+  const lastZ = samples[samples.length - 1][3];
+  const lastSecond = samples.filter((s) => s[0] > samples[samples.length - 1][0] - 1000);
+  const jitterAtWall = Math.max(...lastSecond.map((s) => s[3])) - Math.min(...lastSecond.map((s) => s[3]));
+  const ys = samples.map((s) => s[2]); const yRange = Math.max(...ys) - Math.min(...ys);
+  const frameMs = samples.length > 1 ? (samples[samples.length - 1][0] - samples[0][0]) / (samples.length - 1) : 0;
+  const diag = { frames: samples.length, frameMs: +frameMs.toFixed(1), cruiseFrames: cruise.length, meanSpeed: +mean.toFixed(2), sdSpeed: +sd.toFixed(2), minZ: +minZ.toFixed(3), lastZ: +lastZ.toFixed(3), jitterAtWall: +jitterAtWall.toFixed(4), eyeYRange: +yRange.toFixed(4) };
+  console.log('WALK-DIAG ' + JSON.stringify(diag));
+  console.log('WALK-TAIL ' + JSON.stringify(samples.slice(-22).map((q) => [Math.round(q[0]), +q[1].toFixed(3), +q[3].toFixed(3)])));
+  const d = JSON.stringify(diag);
+  expect(cruise.length, 'it actually walked at normal speed. ' + d).toBeGreaterThan(5);
+  expect(sd / mean, 'speed is steady while walking (low frame-to-frame variation). ' + d).toBeLessThan(0.15);
+  expect(minZ, 'the walker never passes through the wall (z=0, half thickness 0.1 + body 0.32). ' + d).toBeGreaterThan(0.1);
+  expect(jitterAtWall, 'no shaking while pressed against the wall. ' + d).toBeLessThan(0.02);
+  expect(yRange, 'eye height stays level on flat floor. ' + d).toBeLessThan(0.05);
+
+  // Esc leaves cleanly and hands the camera back.
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(400);
+  const after = await page.evaluate(() => { const c = (window as any).__OBS_CTX__; return { walking: c.features.walkMode.isEnabled(), controls: c.world.camera.controls.enabled, up: c.world.camera.three.up.y }; });
+  console.log('WALK-AFTER ' + JSON.stringify(after));
+  expect(after.walking, 'Esc exits walk mode').toBe(false);
+  expect(after.controls, 'orbit controls are back').toBe(true);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+
+test('PDF -> DWG: one step in the browser - real PDF in, real binary DWG downloaded', async ({ page }) => {
+  test.setTimeout(120000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__OBS_CTX__?.features?.pdfToDwg?.run), { timeout: 30000 }).toBe('function');
+  // A one-page vector PDF built in the page.
+  const content = ['0 0 0 RG 1 w', '100 100 m 300 100 l 300 200 l S', '0 0 1 RG', '100 300 m 400 300 l S', 'BT /F1 12 Tf 100 500 Td (HELLO) Tj ET'].join('\n');
+  const objs: string[] = [];
+  objs[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+  objs[2] = '<< /Type /Pages /Kids [3 0 R] /Count 1 >>';
+  objs[3] = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>';
+  objs[4] = `<< /Length ${content.length} >>\nstream\n${content}\nendstream`;
+  objs[5] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  let pdf = '%PDF-1.4\n'; const off = [0];
+  for (let i = 1; i < objs.length; i++) { off[i] = pdf.length; pdf += `${i} 0 obj\n${objs[i]}\nendobj\n`; }
+  const x = pdf.length;
+  pdf += `xref\n0 ${objs.length}\n0000000000 65535 f \n`;
+  for (let i = 1; i < objs.length; i++) pdf += `${String(off[i]).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objs.length} /Root 1 0 R >>\nstartxref\n${x}\n%%EOF\n`;
+  const logs: string[] = [];
+  page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') logs.push(m.type() + ': ' + m.text().slice(0, 300)); });
+  await page.evaluate(() => { (window as any).__toasts = []; window.addEventListener('obs-toast', (e: any) => (window as any).__toasts.push(e.detail?.kind + ': ' + e.detail?.message)); });
+  void page.evaluate((text) => (window as any).__OBS_CTX__.features.pdfToDwg.run(new File([text], 'site plan.pdf', { type: 'application/pdf' })), pdf);
+  const submit = page.getByRole('button', { name: /Convert and download/i });
+  await expect(submit, 'the PDF to DWG dialog opens').toBeVisible({ timeout: 30000 });
+  const dl = page.waitForEvent('download', { timeout: 40000 }).catch(() => null);
+  await submit.click();
+  const d = await dl;
+  const toasts = await page.evaluate(() => (window as any).__toasts);
+  console.log('PDF2DWG-TOASTS ' + JSON.stringify(toasts) + ' LOGS ' + JSON.stringify(logs.slice(0, 8)));
+  expect(d, 'a file was downloaded. toasts: ' + JSON.stringify(toasts) + ' logs: ' + JSON.stringify(logs.slice(0, 6))).not.toBeNull();
+  const name = d!.suggestedFilename();
+  const fs = await import('node:fs');
+  const bytes = fs.readFileSync((await d!.path())!);
+  console.log('PDF2DWG ' + JSON.stringify({ name, size: bytes.length, head: bytes.subarray(0, 6).toString() }));
+  expect(name, 'downloaded name').toBe('site plan.dwg');
+  expect(bytes.subarray(0, 6).toString(), 'binary DWG signature').toMatch(/^AC10/);
+  expect(bytes.length, 'a non-trivial DWG').toBeGreaterThan(500);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('LIVE IFC LINK: writes edits to the linked file, never overwrites an outside change, Keep-mine resolves it', async ({ page }) => {
+  test.setTimeout(120000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.features?.liveIfcLink), { timeout: 30000 }).toBe(true);
+  // An in-memory stand-in for the browser's file picker (the real one needs a human), driving the REAL link code.
+  await page.evaluate(() => {
+    const w = window as any, c = w.__OBS_CTX__;
+    w.__disk = { text: '', mod: 1000 };
+    w.showSaveFilePicker = async () => ({
+      name: 'live-test.ifc',
+      getFile: async () => new File([w.__disk.text], 'live-test.ifc', { lastModified: w.__disk.mod }),
+      createWritable: async () => { let buf = ''; return { write: async (t: string) => { buf += t; }, close: async () => { w.__disk.text = buf; w.__disk.mod += 1; } }; },
+    });
+    const box: number[] = []; const V = [[0,0,0],[2,0,0],[2,1,0],[0,1,0],[0,0,3],[2,0,3],[2,1,3],[0,1,3]];
+    for (const f of [[0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]]) for (const i of f) box.push(...V[i]);
+    const twin = (name: string) => ({ name, nativeEntity: 'IFCWALL', modelId: 'm', position: [0, 0, 0], quaternion: [0, 0, 0, 1], geometry: { positions: box } });
+    w.__twins = [twin('Twin A')]; w.__mk = twin;
+    c.features.fragEdit = c.features.fragEdit ?? {};
+    c.features.fragEdit.getTwinsForIfcExport = () => w.__twins;
+  });
+  const st = () => page.evaluate(() => { const w = window as any; return { status: w.__OBS_CTX__.features.liveIfcLink.status(), text: w.__disk.text as string, panel: !!document.getElementById('obs-live-ifc-link') }; });
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.liveIfcLink.start());
+  const s1 = await st();
+  expect(s1.status.active, JSON.stringify(s1.status)).toBe(true);
+  expect(s1.text, 'first write contains the element').toContain('Twin A');
+  expect(s1.panel, 'status panel is shown').toBe(true);
+
+  await page.evaluate(async () => { const w = window as any; w.__twins = [...w.__twins, w.__mk('Twin B')]; await w.__OBS_CTX__.features.liveIfcLink.tick(); });
+  const s2 = await st();
+  expect(s2.text, 'an edit is written without any export step').toContain('Twin B');
+  expect(s2.status.writes).toBe(2);
+
+  await page.evaluate(async () => { const w = window as any; w.__disk.text = 'EDITED BY ANOTHER PROGRAM'; w.__disk.mod += 5; w.__twins = [...w.__twins, w.__mk('Twin C')]; await w.__OBS_CTX__.features.liveIfcLink.tick(); });
+  const s3 = await st();
+  expect(s3.status.external, 'outside change detected').toBe(true);
+  expect(s3.text, 'the outside change is NOT overwritten').toBe('EDITED BY ANOTHER PROGRAM');
+
+  await page.locator('#obs-live-ifc-link button[data-a="keep"]').click();
+  await expect.poll(async () => (await st()).text, { timeout: 8000 }).toContain('Twin C');
+  const s4 = await st();
+  expect(s4.status.external).toBe(false);
+
+  // The file the link wrote must be a valid IFC that the app's own IFC loader accepts.
+  const before = await page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size);
+  const msgs: string[] = []; page.on('console', (m) => { if (['error', 'warning'].includes(m.type())) msgs.push(m.type() + ': ' + m.text().slice(0, 240)); });
+  await page.evaluate(() => { const w = window as any; w.__tt = []; window.addEventListener('obs-toast', (e: any) => w.__tt.push(e.detail?.kind + ': ' + e.detail?.message)); });
+  console.log('LIVE-IFC-TEXT ' + JSON.stringify((await st()).text.split('\n').slice(0, 60).join('\n')));
+  await page.evaluate(async () => {
+    const w = window as any, host = w.__OBS_CTX__.rightHost as HTMLElement;
+    const dt = new DataTransfer();
+    dt.items.add(new File([w.__disk.text], 'live-written.ifc', { type: 'application/octet-stream' }));
+    host.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  });
+  await page.waitForTimeout(8000);
+  console.log('LIVE-IFC-LOAD ' + JSON.stringify({ msgs: msgs.slice(0, 8), toasts: await page.evaluate(() => (window as any).__tt), models: await page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size), before }));
+  await expect.poll(() => page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size), { timeout: 60000, message: 'the written IFC opens in the app' }).toBeGreaterThan(before);
+
+  await page.locator('#obs-live-ifc-link button[data-a="stop"]').click();
+  const s5 = await st();
+  expect(s5.status.active).toBe(false);
+  expect(s5.panel, 'panel removed after stop').toBe(false);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('SECTION CAPS: a cut through a solid wall shows a solid hatched cut face; off restores the hollow look; no shader errors', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = []; const logs: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  page.on('console', (m) => { if (m.type() === 'error' && /shader|WebGL|program/i.test(m.text())) logs.push(m.text().slice(0, 300)); });
+  await loadWallIfc(page);
+  await page.evaluate(() => { const sb = (window as any).__OBS_CTX__.features.sectionBox; sb.enable(0.5); const b = sb.getBox(); b.max.y = 1.5; sb.setBox(b); });
+  // A horizontal cut at 1.5 m, looked at from straight above: the wall is a hollow strip unless it is capped.
+  await page.evaluate(async () => { const c = (window as any).__OBS_CTX__.world.camera.controls; await c.setLookAt(0, 9, 0.01, 0, 0, 0, false); });
+  await page.waitForTimeout(900);
+  const crop = async () => { const box = (await page.locator('canvas').first().boundingBox())!;
+    return decodePng(await page.screenshot({ clip: { x: box.x, y: box.y, width: box.width, height: box.height } })); };
+  const diffPx = (a: ReturnType<typeof decodePng>, b: ReturnType<typeof decodePng>) => { let n = 0; for (let i = 0; i < a.data.length && i < b.data.length; i += a.bpp) if (Math.abs(a.data[i] - b.data[i]) + Math.abs(a.data[i + 1] - b.data[i + 1]) + Math.abs(a.data[i + 2] - b.data[i + 2]) > 60) n++; return n; };
+  const capsOn = await crop();
+  const patchedOn = await page.evaluate(() => (window as any).__OBS_CTX__.features.sectionCaps.patched());
+  await page.screenshot({ path: 'test-results/caps-on.png' });
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.sectionCaps.set(false));
+  await page.waitForTimeout(900);
+  const capsOff = await crop();
+  const patchedOff = await page.evaluate(() => (window as any).__OBS_CTX__.features.sectionCaps.patched());
+  await page.screenshot({ path: 'test-results/caps-off.png' });
+  const changed = diffPx(capsOn, capsOff);
+  const diag = JSON.stringify({ patchedOn, patchedOff, changedPixels: changed, logs });
+  console.log('CAPS-DIAG ' + diag);
+  expect(patchedOn, 'materials patched while the box is on. ' + diag).toBeGreaterThan(0);
+  expect(patchedOff, 'restored when caps are turned off. ' + diag).toBe(0);
+  expect(changed, 'the cut face looks different with caps on (solid hatched face vs hollow). ' + diag).toBeGreaterThan(300);
+  expect(logs, 'no shader compile errors').toEqual([]);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('SECTION CAPS: authored (non-IFC) wall is capped too', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.waitForFunction(() => !!(window as any).__obsAuthoring, null, { timeout: 60000 }).catch(() => {});
+  await page.locator('#obs-hero-3d').click({ timeout: 15000 }).catch(() => {});
+  const id = await page.evaluate(async () => (window as any).__obsAuthoring.createElementByType('wall', { start: [-2, 0], end: [2, 0], height: 3, thickness: 0.4 }));
+  expect(id, 'authored wall created').toBeTruthy();
+  await expect.poll(() => page.evaluate(() => (window as any).__obsAuthoring.getGroup().children.length), { timeout: 15000 }).toBeGreaterThan(0);
+  await page.evaluate(() => { const sb = (window as any).__OBS_CTX__.features.sectionBox; sb.enable(0.5); const b = sb.getBox(); b.max.y = 1.5; sb.setBox(b); });
+  await page.evaluate(async () => { const c = (window as any).__OBS_CTX__.world.camera.controls; await c.setLookAt(0, 9, 0.01, 0, 0, 0, false); });
+  await page.waitForTimeout(900);
+  const crop = async () => { const box = (await page.locator('canvas').first().boundingBox())!;
+    return decodePng(await page.screenshot({ clip: { x: box.x, y: box.y, width: box.width, height: box.height } })); };
+  const diff = (a: ReturnType<typeof decodePng>, b: ReturnType<typeof decodePng>) => { let n = 0; for (let i = 0; i < a.data.length && i < b.data.length; i += a.bpp) if (Math.abs(a.data[i] - b.data[i]) + Math.abs(a.data[i + 1] - b.data[i + 1]) + Math.abs(a.data[i + 2] - b.data[i + 2]) > 60) n++; return n; };
+  // Rendering is asynchronous in software WebGL: poll until the two states differ.
+  let n = 0, patchedOn = 0;
+  for (let k = 0; k < 8 && n <= 300; k++) {
+    await page.evaluate(() => { const sb = (window as any).__OBS_CTX__.features.sectionBox; const bx = sb.getBox(); if (bx) { bx.max.y = 1.5; sb.setBox(bx); } });
+    // Automatic zoom-to-model can move the camera after the wall is created: look straight down at it every round.
+    await page.evaluate(async () => { const c = (window as any).__OBS_CTX__.world.camera.controls; await c.setLookAt(0, 9, 0.01, 0, 0, 0, false); });
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.sectionCaps.set(true));
+    await page.waitForTimeout(1200);
+    const on = await crop();
+    patchedOn = await page.evaluate(() => (window as any).__OBS_CTX__.features.sectionCaps.patched());
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.sectionCaps.set(false));
+    await page.waitForTimeout(1200);
+    const off = await crop();
+    n = diff(on, off);
+  }
+  console.log('CAPS-AUTHORED ' + JSON.stringify({ patchedOn, changed: n, box: await page.evaluate(() => { const sb = (window as any).__OBS_CTX__.features.sectionBox; const b = sb.getBox(); return b ? [b.min.y, b.max.y] : null; }), clip: await page.evaluate(() => (window as any).__OBS_CTX__.world.renderer.three.clippingPlanes?.length ?? 0) }));
+  if (n <= 300) {
+    const info = await page.evaluate(() => { const g = (window as any).__obsAuthoring.getGroup(); const THREE_: any = (window as any).__OBS_CTX__.world.scene.three.constructor; const out: any[] = []; g.traverse((o: any) => { if (o.isMesh) { const bb = { min: [0, 0, 0], max: [0, 0, 0] }; try { o.geometry.computeBoundingBox(); const b = o.geometry.boundingBox.clone().applyMatrix4(o.matrixWorld); bb.min = [b.min.x, b.min.y, b.min.z]; bb.max = [b.max.x, b.max.y, b.max.z]; } catch { /* */ } const m = Array.isArray(o.material) ? o.material[0] : o.material; out.push({ vis: o.visible, type: m?.type, mvis: m?.visible, side: m?.side, clip: m?.clippingPlanes?.length ?? null, bb }); } }); return { THREE_: !!THREE_, meshes: out, cam: (window as any).__OBS_CTX__.world.camera.three.position.toArray() }; });
+    console.log('CAPS-AUTHORED-INFO ' + JSON.stringify(info));
+    await page.screenshot({ path: 'test-results/caps-authored-fail.png' });
+  }
+  expect(patchedOn, 'authored materials patched').toBeGreaterThan(0);
+  expect(n, 'authored cut face differs with caps on/off').toBeGreaterThan(300);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+/** A ground slab (top at 0) plus five 0.17 m risers rising east to a landing at 0.85 m. IFC x = app x. */
+function stairsIfc(count = 5, rise = 0.17, tread = 0.3): string {
+  const end = tread * count + 4.5;
+  const head = WALL_IFC.slice(0, WALL_IFC.indexOf('#50='));
+  let n = 100; const L: string[] = ['#51=IFCLOCALPLACEMENT(#31,#21);', '#64=IFCDIRECTION((0.,0.,1.));'];
+  const solid = (cx: number, dx: number, h: number, zBase: number, name: string) => {
+    const a = n++, b = n++, c = n++, d = n++, e = n++, f = n++, g = n++, hh = n++, i = n++;
+    L.push(`#${a}=IFCSLAB('${'S' + a}VqzM6bXH7ugTO1ZoXR',$,'${name}',$,$,#51,#${b},$,.FLOOR.);`);
+    L.push(`#${b}=IFCPRODUCTDEFINITIONSHAPE($,$,(#${c}));`);
+    L.push(`#${c}=IFCSHAPEREPRESENTATION(#20,'Body','SweptSolid',(#${d}));`);
+    L.push(`#${d}=IFCEXTRUDEDAREASOLID(#${e},#${f},#64,${h.toFixed(3)});`);
+    L.push(`#${e}=IFCRECTANGLEPROFILEDEF(.AREA.,$,#${g},${dx.toFixed(3)},4.);`);
+    L.push(`#${f}=IFCAXIS2PLACEMENT3D(#${hh},$,$);`);
+    L.push(`#${g}=IFCAXIS2PLACEMENT2D(#${i},$);`);
+    L.push(`#${hh}=IFCCARTESIANPOINT((0.,0.,${zBase.toFixed(3)}));`);
+    L.push(`#${i}=IFCCARTESIANPOINT((${cx.toFixed(3)},0.));`);
+    return a;
+  };
+  const ids = [solid(0, 12, 0.2, -0.2, 'Ground')];
+  for (let k = 1; k <= count; k++) { const x0 = tread * k; ids.push(solid((x0 + end) / 2, end - x0, rise * k, 0, 'Step' + k)); }
+  L.push(`#70=IFCRELCONTAINEDINSPATIALSTRUCTURE('4VqzM6bXH7ugTO1ZoXRFzs',$,$,$,(${ids.map((x) => '#' + x).join(',')}),#30);`);
+  return head + L.join('\n') + '\nENDSEC;\nEND-ISO-10303-21;\n';
+}
+
+test('WALK MODE: walks up a staircase onto a raised landing without clipping through or dropping', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.fragments), { timeout: 30000 }).toBe(true);
+  await page.evaluate(async (text) => {
+    const host = (window as any).__OBS_CTX__.rightHost as HTMLElement;
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], 'stairs.ifc', { type: 'application/octet-stream' }));
+    host.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, stairsIfc());
+  await expect.poll(() => page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size), { timeout: 90000 }).toBeGreaterThanOrEqual(1);
+  await page.waitForTimeout(4000);
+  for (let i = 0; i < 6; i++) {
+    await page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(-4, 1.7, 0, 4, 1.7, 0, false); });
+    await page.waitForTimeout(700);
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.enable());
+    await page.waitForTimeout(600);
+    const p = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+    if (p && p.x < -3.5 && Math.abs(p.pitch) < 0.05) break;
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable?.());
+    await page.waitForTimeout(300);
+  }
+  const p0 = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+  await page.evaluate(() => {
+    const w = window as any; w.__ws = []; w.__wr = true;
+    const loop = (t: number) => { const p = w.__OBS_CTX__.features.walkMode.getPose(); if (p) w.__ws.push([t, p.x, p.y, p.z]); if (w.__wr) requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  });
+  await page.keyboard.down('w');
+  for (let k = 0; k < 36; k++) { await page.waitForTimeout(250); const q = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose()); if (q && q.x > 2.6) break; } // slower CI machines need longer
+  await page.keyboard.up('w');
+  await page.waitForTimeout(800);
+  const S: number[][] = await page.evaluate(() => { const w = window as any; w.__wr = false; return w.__ws; });
+  const last = S[S.length - 1];
+  let maxJump = 0; for (let i = 1; i < S.length; i++) maxJump = Math.max(maxJump, Math.abs(S[i][2] - S[i - 1][2]));
+  const diag = JSON.stringify({ start: p0, frames: S.length, lastX: +last[1].toFixed(2), lastEyeY: +last[2].toFixed(3), maxEyeJump: +maxJump.toFixed(3), minEyeY: +Math.min(...S.map((q) => q[2])).toFixed(3) });
+  console.log('STAIRS-DIAG ' + diag);
+  expect(last[1], 'walked past the staircase onto the landing. ' + diag).toBeGreaterThan(2);
+  expect(last[2], 'eye is about 1.7 m above the 0.85 m landing. ' + diag).toBeGreaterThan(2.35);
+  expect(last[2], diag).toBeLessThan(2.75);
+  // A slow CI frame (~100 ms) can legitimately cross two 0.3 m treads at once, so allow up to three risers (0.51 m); a missed floor would show as the full 0.85 m.
+  expect(maxJump, 'no single-frame eye jump bigger than three risers. ' + diag).toBeLessThan(0.45);
+  expect(Math.min(...S.map((q) => q[2])), 'never sank through the floor. ' + diag).toBeGreaterThan(1.55);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('WALK MODE: walks down the staircase from the landing, stepping down each riser without falling or floating', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.fragments), { timeout: 30000 }).toBe(true);
+  await page.evaluate(async (text) => {
+    const host = (window as any).__OBS_CTX__.rightHost as HTMLElement;
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], 'stairs.ifc', { type: 'application/octet-stream' }));
+    host.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, stairsIfc());
+  await expect.poll(() => page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size), { timeout: 90000 }).toBeGreaterThanOrEqual(1);
+  await page.waitForTimeout(4000);
+  for (let i = 0; i < 6; i++) {
+    await page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(4, 2.55, 0, -4, 2.55, 0, false); });
+    await page.waitForTimeout(700);
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.enable());
+    await page.waitForTimeout(600);
+    const p = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+    if (p && p.x > 3.5 && Math.abs(p.pitch) < 0.05) break;
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable?.());
+    await page.waitForTimeout(300);
+  }
+  const p0 = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+  await page.evaluate(() => {
+    const w = window as any; w.__ws = []; w.__wr = true;
+    const loop = (t: number) => { const p = w.__OBS_CTX__.features.walkMode.getPose(); if (p) w.__ws.push([t, p.x, p.y, p.z]); if (w.__wr) requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  });
+  await page.keyboard.down('w');
+  for (let k = 0; k < 36; k++) { await page.waitForTimeout(250); const q = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose()); if (q && q.x < -1) break; }
+  await page.keyboard.up('w');
+  await page.waitForTimeout(800);
+  const S: number[][] = await page.evaluate(() => { const w = window as any; w.__wr = false; return w.__ws; });
+  const last = S[S.length - 1];
+  let maxJump = 0; for (let i = 1; i < S.length; i++) maxJump = Math.max(maxJump, Math.abs(S[i][2] - S[i - 1][2]));
+  const diag = JSON.stringify({ start: p0, frames: S.length, lastX: +last[1].toFixed(2), lastEyeY: +last[2].toFixed(3), maxEyeJump: +maxJump.toFixed(3), minEyeY: +Math.min(...S.map((q) => q[2])).toFixed(3) });
+  console.log('STAIRS-DOWN-DIAG ' + diag);
+  expect(last[1], 'walked off the stairs towards the west. ' + diag).toBeLessThan(-0.5);
+  expect(last[2], 'eye is back at standing height on the ground. ' + diag).toBeGreaterThan(1.62);
+  expect(last[2], diag).toBeLessThan(1.78);
+  expect(maxJump, 'no drop bigger than three risers in one frame. ' + diag).toBeLessThan(0.45);
+  expect(Math.min(...S.map((q) => q[2])), 'never went below the ground. ' + diag).toBeGreaterThan(1.62);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('SECTION TOOL: a section plane cuts the IFC wall, switching it off restores it, deleting removes the plane', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  const crop = async () => { const box = (await page.locator('canvas').first().boundingBox())!;
+    return decodePng(await page.screenshot({ clip: { x: box.x, y: box.y, width: box.width, height: box.height } })); };
+  const diff = (a: ReturnType<typeof decodePng>, b: ReturnType<typeof decodePng>) => { let n = 0; for (let i = 0; i < a.data.length && i < b.data.length; i += a.bpp) if (Math.abs(a.data[i] - b.data[i]) + Math.abs(a.data[i + 1] - b.data[i + 1]) + Math.abs(a.data[i + 2] - b.data[i + 2]) > 60) n++; return n; };
+  const aim = () => page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(0, 9, 0.01, 0, 0, 0, false); });
+  await aim(); await page.waitForTimeout(900);
+  const before = await crop();
+  // Cut away everything above 1.5 m... the wall is 3 m tall, so keep only below: plane normal pointing down at y=1.5.
+  await page.evaluate(() => { const s = (window as any).__obsSection; s.setOn(true); (window as any).__OBS_CTX__.features.section.setPlanes([{ location: [0, 1.5, 0], direction: [0, -1, 0] }]); });
+  let planes: unknown[] = [], changed = 0, cutShot = before;
+  for (let k = 0; k < 8 && changed <= 300; k++) {
+    await aim(); await page.waitForTimeout(1200);
+    planes = await page.evaluate(() => (window as any).__obsSection.getPlanes());
+    cutShot = await crop();
+    changed = diff(before, cutShot);
+  }
+  const diag = JSON.stringify({ planes, changed });
+  console.log('SECTION-TOOL ' + diag);
+  expect(planes.length, 'one plane exists. ' + diag).toBe(1);
+  expect(changed, 'the cut changes the picture. ' + diag).toBeGreaterThan(300);
+  // Off lifts the clipping: the picture moves back towards the uncut one (the plane's own visual helper may remain drawn).
+  await page.evaluate(() => (window as any).__obsSection.setOn(false));
+  let offShot = cutShot, liftedFromCut = 0;
+  for (let k = 0; k < 8 && liftedFromCut <= 300; k++) { await aim(); await page.waitForTimeout(1200); offShot = await crop(); liftedFromCut = diff(cutShot, offShot); }
+  const restored = diff(before, offShot);
+  const diag2 = JSON.stringify({ changed, liftedFromCut, restoredDiff: restored });
+  console.log('SECTION-TOOL-OFF ' + diag2);
+  expect(liftedFromCut, 'switching off changes the picture again. ' + diag2).toBeGreaterThan(300);
+  expect(restored, 'off is much closer to the uncut picture than the cut was. ' + diag2).toBeLessThan(changed * 0.6);
+  // Delete removes the plane.
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.section.deleteAllPlanes());
+  await page.waitForTimeout(500);
+  const left = await page.evaluate(() => (window as any).__obsSection.getPlanes().length);
+  expect(left, 'delete removes planes').toBe(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('Export 3D model to DWG: a real DWG is written and re-read with its 3D faces', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  await openPaletteWith(page, 'Views to CAD');
+  await page.keyboard.press('Enter');
+  const dlg = page.locator('#obs-export-cad');
+  await expect(dlg).toBeVisible({ timeout: 10000 });
+  await dlg.locator('[data-3d-fmt]').selectOption('dwg');
+  const dl = page.waitForEvent('download', { timeout: 90000 });
+  await dlg.locator('[data-go3d]').click();
+  const d = await dl;
+  const bytes = (await import('fs')).readFileSync((await d.path())!);
+  const msg = await dlg.locator('[data-msg]').innerText();
+  console.log('DWG3D ' + JSON.stringify({ name: d.suggestedFilename(), size: bytes.length, magic: bytes.subarray(0, 6).toString('latin1'), msg }));
+  expect(d.suggestedFilename()).toBe('openbimstudio-model-3d.dwg');
+  expect(bytes.subarray(0, 4).toString('latin1'), 'DWG magic. ' + msg).toBe('AC10');
+  expect(bytes.length, 'non-trivial DWG. ' + msg).toBeGreaterThan(2000);
+  const m = /DWG re-read: ([\d,.]+) entities/.exec(msg);
+  expect(m, 'DWG re-read reported. ' + msg).toBeTruthy();
+  expect(parseInt(m![1].replace(/[^\d]/g, ''), 10), '3D faces survive the DWG conversion. ' + msg).toBeGreaterThanOrEqual(12);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('WALK MODE: climbs a full storey (18 risers, 3 m) to an upper deck', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.fragments), { timeout: 30000 }).toBe(true);
+  await page.evaluate(async (text) => {
+    const host = (window as any).__OBS_CTX__.rightHost as HTMLElement;
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], 'stairs.ifc', { type: 'application/octet-stream' }));
+    host.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, stairsIfc(18, 3 / 18, 0.3));
+  await expect.poll(() => page.evaluate(() => (window as any).__OBS_CTX__.fragments.list.size), { timeout: 90000 }).toBeGreaterThanOrEqual(1);
+  await page.waitForTimeout(4000);
+  for (let i = 0; i < 6; i++) {
+    await page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(-4, 1.7, 0, 4, 1.7, 0, false); });
+    await page.waitForTimeout(700);
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.enable());
+    await page.waitForTimeout(600);
+    const p = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+    if (p && p.x < -3.5 && Math.abs(p.pitch) < 0.05) break;
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable?.());
+    await page.waitForTimeout(300);
+  }
+  const p0 = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+  await page.evaluate(() => {
+    const w = window as any; w.__ws = []; w.__wr = true;
+    const loop = (t: number) => { const p = w.__OBS_CTX__.features.walkMode.getPose(); if (p) w.__ws.push([t, p.x, p.y, p.z]); if (w.__wr) requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  });
+  await page.keyboard.down('w');
+  for (let k = 0; k < 60; k++) { await page.waitForTimeout(250); const q = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose()); if (q && q.x > 6.6) break; } // slower CI machines need longer
+  await page.keyboard.up('w');
+  await page.waitForTimeout(800);
+  const S: number[][] = await page.evaluate(() => { const w = window as any; w.__wr = false; return w.__ws; });
+  const last = S[S.length - 1];
+  let maxJump = 0; for (let i = 1; i < S.length; i++) maxJump = Math.max(maxJump, Math.abs(S[i][2] - S[i - 1][2]));
+  const diag = JSON.stringify({ start: p0, frames: S.length, lastX: +last[1].toFixed(2), lastEyeY: +last[2].toFixed(3), maxEyeJump: +maxJump.toFixed(3), minEyeY: +Math.min(...S.map((q) => q[2])).toFixed(3) });
+  console.log('STOREY-DIAG ' + diag);
+  expect(last[1], 'reached the upper deck. ' + diag).toBeGreaterThan(6);
+  expect(last[2], 'eye is 1.7 m above the 3 m deck. ' + diag).toBeGreaterThan(4.55);
+  expect(last[2], diag).toBeLessThan(4.85);
+  expect(maxJump, 'no single-frame jump bigger than three risers. ' + diag).toBeLessThan(0.6);
+  expect(Math.min(...S.map((q) => q[2])), 'never sank below the ground. ' + diag).toBeGreaterThan(1.55);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('Export current 3D view as hidden-line 2D lines: an IFC wall seen from the front gives a 5 m x 3 m outline', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  await page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(0, 1.5, 12, 0, 1.5, 0, false); });
+  await page.waitForTimeout(900);
+  await openPaletteWith(page, 'Views to CAD');
+  await page.keyboard.press('Enter');
+  const dlg = page.locator('#obs-export-cad');
+  await expect(dlg).toBeVisible({ timeout: 10000 });
+  const dl = page.waitForEvent('download', { timeout: 90000 });
+  await dlg.locator('[data-gohl]').click();
+  const d = await dl;
+  const text = (await import('fs')).readFileSync((await d.path())!, 'utf8');
+  const msg = await dlg.locator('[data-msg]').innerText();
+  const xs = Array.from(text.matchAll(/\n1[01]\n(-?[\d.]+)\n/g)).map((m) => parseFloat(m[1]));
+  const ys = Array.from(text.matchAll(/\n2[01]\n(-?[\d.]+)\n/g)).map((m) => parseFloat(m[1]));
+  const w = Math.max(...xs) - Math.min(...xs), h = Math.max(...ys) - Math.min(...ys);
+  console.log('HLR ' + JSON.stringify({ lines: (text.match(/\nLINE\n/g) || []).length, w, h, msg }));
+  expect(d.suggestedFilename()).toBe('openbimstudio-view-lines.dxf');
+  expect(text, msg).toContain('A-WALL');
+  expect(w, 'front elevation width in mm (5 m wall, perspective sized at the model centre). ' + msg).toBeGreaterThan(4300);
+  expect(w, msg).toBeLessThan(5800);
+  expect(h, 'front elevation height in mm (3 m wall). ' + msg).toBeGreaterThan(2500);
+  expect(h, msg).toBeLessThan(3500);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('WALK MODE options: holds the starting height, walks through walls on request, shows a 1.7 m human', async ({ page }) => {
+  test.setTimeout(240000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  const W = () => (window as any).__OBS_CTX__.features.walkMode;
+  const stand = async (x: number, y: number, z: number, tx: number, ty: number, tz: number) => {
+    for (let i = 0; i < 6; i++) {
+      await page.evaluate(async (a) => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(a[0], a[1], a[2], a[3], a[4], a[5], false); }, [x, y, z, tx, ty, tz]);
+      await page.waitForTimeout(700);
+      await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.enable());
+      await page.waitForTimeout(500);
+      const p = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+      if (p && Math.abs(p.z - z) < 0.3 && Math.abs(p.pitch) < 0.1) return p;
+      await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+      await page.waitForTimeout(300);
+    }
+    return await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+  };
+  const pose = () => page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+  const setOpt = (k: string, v: boolean) => page.evaluate(([kk, vv]) => (window as any).__OBS_CTX__.features.walkMode.setOption(kk, vv), [k, v] as [string, boolean]);
+
+  // 1) Hold my height: start 6.5 m above the ground; the walker stays at that eye height instead of falling to the lowest level.
+  await setOpt('holdLevel', true);
+  const p0 = await stand(0, 6.5, 6, 0, 6.5, 0);
+  await page.waitForTimeout(2500);
+  const held = await pose();
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+  console.log('WALK-HOLD ' + JSON.stringify({ start: p0?.y, after: held?.y }));
+  expect(Math.abs(p0.y - 6.5), 'starts at the camera height').toBeLessThan(0.05);
+  expect(Math.abs(held.y - 6.5), 'stays at the starting height (no fall to the lowest level)').toBeLessThan(0.15);
+  // With the option off the old behaviour returns: the walker falls to the ground.
+  await setOpt('holdLevel', false);
+  await stand(0, 6.5, 6, 0, 6.5, 0);
+  let fell = 99;
+  for (let k = 0; k < 24 && fell > 1.9; k++) { await page.waitForTimeout(500); fell = (await pose()).y; }
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+  console.log('WALK-FALL ' + fell);
+  expect(fell, 'without the option it falls to standing height').toBeLessThan(2.1);
+  await setOpt('holdLevel', true);
+
+  // 2) Through walls: the 5 m wall at z = 0 blocks the walker unless the option is on.
+  await setOpt('noClip', true);
+  await stand(0, 1.7, 3, 0, 1.7, -5);
+  await page.keyboard.down('w');
+  let z = 99;
+  for (let k = 0; k < 40 && z > -1.5; k++) { await page.waitForTimeout(250); z = (await pose()).z; }
+  await page.keyboard.up('w');
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+  console.log('WALK-NOCLIP z=' + z);
+  expect(z, 'walked through the wall').toBeLessThan(-1);
+  await setOpt('noClip', false);
+
+  // 3) Human figure: 1.7 m tall, standing at the feet, with the camera behind it.
+  await setOpt('human', true);
+  await stand(0, 1.7, 3, 0, 1.7, -5);
+  await page.waitForTimeout(800);
+  const h = await page.evaluate(() => {
+    const ctx = (window as any).__OBS_CTX__;
+    const g = ctx.world.scene.three.getObjectByName('obs-walk-human');
+    if (!g) return null;
+    const THREE_Box = (ctx.world.camera.three.position.constructor as any);
+    let minY = Infinity, maxY = -Infinity;
+    g.updateWorldMatrix(true, true);
+    g.traverse((o: any) => { if (o.isMesh) { o.geometry.computeBoundingBox(); const b = o.geometry.boundingBox.clone().applyMatrix4(o.matrixWorld); minY = Math.min(minY, b.min.y); maxY = Math.max(maxY, b.max.y); } });
+    const cam = ctx.world.camera.three.position, pose = ctx.features.walkMode.getPose();
+    return { height: maxY - minY, feetY: minY, camDist: Math.hypot(cam.x - g.position.x, cam.z - g.position.z), eyeY: pose.y, ok: !!THREE_Box };
+  });
+  console.log('WALK-HUMAN ' + JSON.stringify(h));
+  expect(h, 'figure exists while walking').toBeTruthy();
+  expect(Math.abs(h!.height - 1.7), 'figure is 1.7 m tall').toBeLessThan(0.03);
+  expect(Math.abs(h!.feetY - (h!.eyeY - 1.7)), 'figure stands on the walker\'s floor').toBeLessThan(0.1);
+  expect(h!.camDist, 'camera follows behind the figure').toBeGreaterThan(1.8);
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+  const gone = await page.evaluate(() => !(window as any).__OBS_CTX__.world.scene.three.getObjectByName('obs-walk-human'));
+  expect(gone, 'figure is removed when walk mode ends').toBe(true);
+  await setOpt('human', false);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('WALK MODE: Space raises and the height stays fixed after release; C lowers straight down', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  const pose = () => page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.setOption('keepRaise', true));
+  let p0: any = null;
+  for (let i = 0; i < 6; i++) {
+    await page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(0, 1.7, 6, 0, 1.7, 0, false); });
+    await page.waitForTimeout(700);
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.enable());
+    await page.waitForTimeout(600);
+    p0 = await pose();
+    if (p0 && Math.abs(p0.y - 1.7) < 0.1 && Math.abs(p0.z - 6) < 0.3) break;
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+    await page.waitForTimeout(300);
+  }
+  // Hold Space until the eye has risen (bounded wait): the rise per second is frame-rate dependent on a slow CI
+  // runner, so a fixed 1.5 s hold measures the runner, not the feature.
+  await page.keyboard.down(' ');
+  for (let i = 0; i < 40; i++) { await page.waitForTimeout(250); const q = await pose(); if (q && q.y - p0.y > 1.8) break; }
+  await page.keyboard.up(' ');
+  await page.waitForTimeout(400);
+  const up1 = await pose();
+  await page.waitForTimeout(2500);
+  const up2 = await pose();
+  console.log('WALK-RAISE ' + JSON.stringify({ start: p0.y, afterRelease: up1.y, 2.5: up2.y }));
+  expect(up1.y - p0.y, 'Space raised the eye').toBeGreaterThan(1.5);
+  expect(Math.abs(up2.y - up1.y), 'the raised height stays fixed after releasing Space (no fall back)').toBeLessThan(0.05);
+  // Walking keeps the raised height too.
+  await page.keyboard.down('w'); await page.waitForTimeout(800); await page.keyboard.up('w');
+  const mv = await pose();
+  expect(Math.abs(mv.y - up2.y), 'raised height survives walking').toBeLessThan(0.1);
+  // C lowers vertically and the lower height stays too, never below standing height.
+  await page.keyboard.down('c');
+  for (let i = 0; i < 40; i++) { await page.waitForTimeout(250); const q = await pose(); if (q && mv.y - q.y > 1.3) break; }
+  await page.keyboard.up('c');
+  await page.waitForTimeout(400);
+  const dn1 = await pose();
+  await page.waitForTimeout(1500);
+  const dn2 = await pose();
+  expect(mv.y - dn1.y, 'C lowers').toBeGreaterThan(1.2);
+  expect(Math.abs(dn2.y - dn1.y), 'the lowered height stays fixed').toBeLessThan(0.05);
+  await page.keyboard.down('c');
+  for (let i = 0; i < 60; i++) { await page.waitForTimeout(250); const q = await pose(); if (q && q.y < 1.75) break; }
+  await page.waitForTimeout(1200); // keep holding C: it must STOP at standing height, not pass below it
+  await page.keyboard.up('c');
+  await page.waitForTimeout(400);
+  const floor = await pose();
+  expect(floor.y, 'C stops at standing height').toBeGreaterThan(1.6);
+  expect(floor.y, 'C stops at standing height').toBeLessThan(1.8);
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('REFERENCE PERSON (M): a 1.7 m figure can be placed in the view and in Walk mode, and removed again', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await loadWallIfc(page);
+  const info = () => page.evaluate(() => {
+    const ctx = (window as any).__OBS_CTX__;
+    const g = ctx.world.scene.three.getObjectByName('obs-reference-person');
+    if (!g) return null;
+    let minY = Infinity, maxY = -Infinity; g.updateWorldMatrix(true, true);
+    g.traverse((o: any) => { if (o.isMesh) { o.geometry.computeBoundingBox(); const b = o.geometry.boundingBox.clone().applyMatrix4(o.matrixWorld); minY = Math.min(minY, b.min.y); maxY = Math.max(maxY, b.max.y); } });
+    return { x: g.position.x, y: g.position.y, z: g.position.z, height: maxY - minY, feetY: minY };
+  });
+  // Orbit view: stands at the view centre on the ground, 1.7 m tall; the same call hides it.
+  await page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(0, 4, 9, 0, 0, 3, false); });
+  await page.waitForTimeout(700);
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.toggleReference());
+  const a = await info();
+  console.log('REFPERSON-ORBIT ' + JSON.stringify(a));
+  expect(a, 'figure placed').toBeTruthy();
+  expect(Math.abs(a!.height - 1.7), 'figure is 1.7 m tall').toBeLessThan(0.03);
+  expect(Math.abs(a!.feetY), 'stands on the ground').toBeLessThan(0.1);
+  expect(Math.abs(a!.z - 3), 'at the middle of the view').toBeLessThan(0.6);
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.toggleReference());
+  expect(await info(), 'second toggle hides it').toBeNull();
+  // Walk mode: key M drops it 2 m ahead, facing you; it stays put when you walk on.
+  let p0: any = null;
+  for (let i = 0; i < 6; i++) {
+    await page.evaluate(async () => { await (window as any).__OBS_CTX__.world.camera.controls.setLookAt(0, 1.7, 8, 0, 1.7, 0, false); });
+    await page.waitForTimeout(700);
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.enable());
+    await page.waitForTimeout(600);
+    p0 = await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.getPose());
+    if (p0 && Math.abs(p0.z - 8) < 0.3 && Math.abs(p0.pitch) < 0.1) break;
+    await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+    await page.waitForTimeout(300);
+  }
+  await page.keyboard.press('m');
+  await page.waitForTimeout(500);
+  const b = await info();
+  console.log('REFPERSON-WALK ' + JSON.stringify({ walker: p0, fig: b }));
+  expect(b, 'M places the figure in Walk mode').toBeTruthy();
+  expect(Math.abs(b!.z - (p0.z - 2)), '2 m in front of the walker').toBeLessThan(0.4);
+  expect(Math.abs(b!.feetY - (p0.y - 1.7)), 'on the same floor').toBeLessThan(0.15);
+  await page.keyboard.down('w'); await page.waitForTimeout(1000); await page.keyboard.up('w');
+  const c = await info();
+  expect(Math.abs(c!.z - b!.z), 'the figure stays where it was placed').toBeLessThan(0.01);
+  await page.keyboard.press('m');
+  await page.waitForTimeout(300);
+  expect(await info(), 'M again removes it').toBeNull();
+  await page.evaluate(() => (window as any).__OBS_CTX__.features.walkMode.disable());
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('reference lines: the 3rd wall of a room closes square to the 1st, guides show, and the switch turns it off', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await page.waitForFunction(() => !!(window as any).__obsAuthoring && !!(window as any).__OBS_CTX__?.world?.camera?.three, null, { timeout: 30000 });
+  // Look straight down so screen offsets map cleanly onto the ground.
+  await page.evaluate(() => {
+    const c = (window as any).__OBS_CTX__.world; const cam = c.camera.three;
+    cam.position.set(3, 22, 2.001); cam.lookAt(3, 0, 2); cam.updateProjectionMatrix(); cam.updateMatrixWorld(true);
+    try { c.camera.controls.setLookAt(3, 22, 2.001, 3, 0, 2, false); } catch { /* */ }
+  });
+  const scr = (x: number, z: number) => page.evaluate(([x, z]) => {
+    const cam = (window as any).__OBS_CTX__.world.camera.three; const v = new cam.position.constructor(x, 0, z).project(cam);
+    const r = document.querySelector('canvas')!.getBoundingClientRect();
+    return { x: r.left + (v.x + 1) / 2 * r.width, y: r.top + (1 - v.y) / 2 * r.height };
+  }, [x, z]);
+  await page.evaluate(() => (window as any).__obsAuthoring.setAuthoringTool('wall'));
+  // A(0,0) -> B(6,0) -> C(6,4): the room's first two walls.
+  for (const [x, z] of [[0, 0], [6, 0], [6, 4]]) { const p = await scr(x, z); await page.mouse.move(p.x, p.y); await page.mouse.click(p.x, p.y); }
+  // Cursor a few pixels off "above A" while level with C: should be pulled to (0, 4) with two guide lines.
+  const near = await scr(0, 4);
+  await page.mouse.move(near.x + 40, near.y + 2); await page.mouse.move(near.x + 6, near.y + 4);
+  await page.waitForTimeout(400);
+  const hit = await page.evaluate(() => (window as any).__obsAuthoring.getRefSnap());
+  expect(hit, 'tracking should engage').not.toBeNull();
+  expect(Math.abs(hit[0]), 'x lined up with the 1st wall start').toBeLessThan(1e-6);
+  expect(Math.abs(hit[1] - 4), 'z level with the 3rd corner').toBeLessThan(1e-6);
+  const guides = await page.evaluate(() => (window as any).__OBS_CTX__.world.scene.three.getObjectByName('obs-alignment-guides')?.children.length ?? 0);
+  expect(guides, 'dashed guide lines are drawn').toBeGreaterThan(3);
+  await page.mouse.click(near.x + 6, near.y + 4);
+  const end = await page.evaluate(() => { const w = (window as any).__obsAuthoring.getElements().filter((e: any) => e.type === 'wall'); return w[w.length - 1].params.end; });
+  expect(Math.abs(end[0]), '3rd wall ends exactly above the 1st wall start').toBeLessThan(1e-6);
+  // Toggle off: no pull, no hit.
+  await page.evaluate(() => (window as any).__obsAuthoring.setReferenceTracking(false));
+  await page.mouse.move(near.x + 40, near.y + 2); await page.mouse.move(near.x + 6, near.y + 4);
+  await page.waitForTimeout(300);
+  expect(await page.evaluate(() => (window as any).__obsAuthoring.getRefSnap())).toBeNull();
+  await page.evaluate(() => (window as any).__obsAuthoring.setReferenceTracking(true));
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+const SHX_DXF = [
+  '0','SECTION','2','TABLES',
+  '0','TABLE','2','STYLE','70','2',
+  '0','STYLE','2','SHXSTYLE','70','0','40','0.0','41','1.0','50','0.0','71','0','42','2.5','3','romans.shx','4','',
+  '0','STYLE','2','TTSTYLE','70','0','40','0.0','41','1.0','50','0.0','71','0','42','2.5','3','arial.ttf','4','',
+  '0','ENDTAB','0','ENDSEC',
+  '0','SECTION','2','ENTITIES',
+  '0','TEXT','8','0','7','SHXSTYLE','10','0.0','20','0.0','30','0.0','40','10.0','1','HELLO WORLD 123',
+  '0','TEXT','8','0','7','TTSTYLE','10','200.0','20','0.0','30','0.0','40','10.0','1','HELLO WORLD 123',
+  '0','ENDSEC','0','EOF',
+].join('\n');
+
+test('CAD viewer: SHX-styled text is drawn as thin strokes (lighter than the same TrueType text)', async ({ page }) => {
+  const consoleMsgs: string[] = [];
+  page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') consoleMsgs.push(`${m.type()}: ${m.text().slice(0, 240)}`); });
+  await page.addInitScript(() => window.addEventListener('unhandledrejection', (e) => console.error('UNHANDLED', String((e.reason && (e.reason.stack || e.reason.message)) || e.reason).slice(0, 400))));
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await expect.poll(() => page.evaluate(() => !!(window as any).__OBS_CTX__?.rightHost), { timeout: 30000 }).toBe(true);
+  await page.evaluate((text) => {
+    const host = (window as any).__OBS_CTX__.rightHost as HTMLElement;
+    const dt = new DataTransfer();
+    dt.items.add(new File([text], 'shx-text.dxf', { type: 'application/octet-stream' }));
+    host.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, SHX_DXF);
+  // Lit pixels (differing from the canvas background) in the left/right thirds of a central band.
+  const measure = () => page.evaluate(() => {
+    const vc = document.querySelector('.obs-cad-viewcube');
+    let n: Element | null = vc;
+    while (n && !n.querySelector('canvas')) n = n.parentElement;
+    // The drawing canvas is the largest non-empty one in this container (other 0-size canvases may precede it).
+    const cvs = Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[];
+    void n;
+    const cv = cvs.filter((c) => c.width >= 100 && c.height >= 100 && c.getContext('2d')).sort((a, b) => b.width * b.height - a.width * a.height)[0] ?? null;
+    if (!cv) return null;
+    const g = cv.getContext('2d')!;
+    const W = cv.width, H = cv.height;
+    const bg = g.getImageData(Math.floor(W * 0.05), Math.floor(H * 0.5), 1, 1).data;
+    const count = (x0: number, x1: number) => {
+      const d = g.getImageData(Math.floor(W * x0), Math.floor(H * 0.35), Math.floor(W * (x1 - x0)), Math.floor(H * 0.3)).data;
+      let k = 0;
+      for (let i = 0; i < d.length; i += 4) if (Math.abs(d[i] - bg[0]) + Math.abs(d[i + 1] - bg[1]) + Math.abs(d[i + 2] - bg[2]) > 60) k++;
+      return k;
+    };
+    return { left: count(0.08, 0.45), right: count(0.55, 0.92) };
+  });
+  const diag = () => page.evaluate(() => Array.from(document.querySelectorAll('canvas')).map((c) => {
+    const r = c.getBoundingClientRect();
+    return `${c.className || c.id || 'canvas'}:${c.width}x${c.height} css ${Math.round(r.width)}x${Math.round(r.height)}`;
+  }).join(' | '));
+  try {
+    await expect.poll(async () => { const m = await measure(); return m ? Math.min(m.left, m.right) : 0; }, { timeout: 40000, message: 'both texts drawn' }).toBeGreaterThan(150);
+  } catch (e) {
+    console.log('SHX DIAG console:', JSON.stringify(consoleMsgs.slice(0, 12)));
+    console.log('SHX DIAG canvases:', await diag(), '| measure:', JSON.stringify(await measure().catch((x) => String(x))));
+    throw e;
+  }
+  await page.waitForTimeout(500);
+  const m = (await measure())!;
+  console.log('shx vs truetype lit pixels', JSON.stringify(m));
+  expect(m.left, `SHX text (thin strokes) should light fewer pixels than the TrueType text: ${JSON.stringify(m)}`).toBeLessThan(m.right * 0.9);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('reference lines: a new chain lines up with the end of a wall drawn earlier', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await page.locator('#obs-hero-3d').click({ timeout: 30000 });
+  await page.waitForFunction(() => !!(window as any).__obsAuthoring && !!(window as any).__OBS_CTX__?.world?.camera?.three, null, { timeout: 30000 });
+  await page.evaluate(() => {
+    const c = (window as any).__OBS_CTX__.world; const cam = c.camera.three;
+    cam.position.set(5, 22, 2.001); cam.lookAt(5, 0, 2); cam.updateProjectionMatrix(); cam.updateMatrixWorld(true);
+    try { c.camera.controls.setLookAt(5, 22, 2.001, 5, 0, 2, false); } catch { /* */ }
+  });
+  const scr = (x: number, z: number) => page.evaluate(([x, z]) => {
+    const cam = (window as any).__OBS_CTX__.world.camera.three; const v = new cam.position.constructor(x, 0, z).project(cam);
+    const r = document.querySelector('canvas')!.getBoundingClientRect();
+    return { x: r.left + (v.x + 1) / 2 * r.width, y: r.top + (1 - v.y) / 2 * r.height };
+  }, [x, z]);
+  await page.evaluate(() => (window as any).__obsAuthoring.setAuthoringTool('wall'));
+  // First chain: one wall A(0,0) -> B(6,0), then Esc ends the chain.
+  for (const [x, z] of [[0, 0], [6, 0]]) { const p = await scr(x, z); await page.mouse.move(p.x, p.y); await page.mouse.click(p.x, p.y); }
+  await page.keyboard.press('Escape');
+  await page.evaluate(() => (window as any).__obsAuthoring.setAuthoringTool('wall'));
+  // Second chain starts far away; hovering level with B's X (6) should pull the cursor onto B's vertical line.
+  const s = await scr(10, 4); await page.mouse.move(s.x, s.y); await page.mouse.click(s.x, s.y);
+  const t = await scr(6, 2.5); await page.mouse.move(t.x + 40, t.y + 3); await page.mouse.move(t.x + 6, t.y + 3);
+  await page.waitForTimeout(400);
+  const hit = await page.evaluate(() => (window as any).__obsAuthoring.getRefSnap());
+  expect(hit, 'tracking should engage from the earlier wall').not.toBeNull();
+  expect(Math.abs(hit[0] - 6), 'x lined up with the earlier wall end').toBeLessThan(1e-6);
+  expect(errors, errors.join('\n')).toEqual([]);
+});

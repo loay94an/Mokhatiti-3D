@@ -1,0 +1,326 @@
+/**
+ * Save to file / Open from file for whole projects (.obsproj).
+ *
+ *  - Chrome / Edge: pick a file once; Ctrl+S then keeps re-writing that same file
+ *    (the file link is remembered between sessions, the browser may ask to allow access again).
+ *  - Other browsers: the project is downloaded as a .obsproj file instead.
+ *  - Opening a file imports it into this browser's project database and opens it, so
+ *    projects can move between the web version and a local copy.
+ */
+import { notify as toast } from "../../core/notify";
+import * as store from "./store";
+import type { ProjectDoc } from "./types";
+import { normalizeProjectDoc } from "./project-schema";
+import { buildProjectFile, parseProjectFile, ProjectFileError, PROJECT_FILE_EXT, PROJECT_FILE_MIME, suggestedFileName } from "./project-file";
+import { getCurrentProject, openProject, saveProject } from "./projects";
+import { decryptProjectBlob, encryptProjectBlob, isEncryptedProjectBlob, WrongPasswordError } from "./project-crypto";
+import { askPassword } from "./password-dialog";
+import { backupExistingFileHandle, backupProjectFile } from "./browser-recovery";
+import { scopedDbName } from "../../core/account-scope";
+
+// legacy module-local state (formerly on window)
+// eslint-disable-next-line no-unused-vars
+let obsProjectFile: any;
+
+type Handle = any; // FileSystemFileHandle (not in every TS lib)
+interface Link { projectId: string; handle: Handle; name: string }
+
+let link: Link | null = null;
+let lastFileWrite = 0;
+let writing = false;
+const AUTOSAVE_MIN_GAP_MS = 45_000;
+
+const hasPicker = () => typeof (window as any).showSaveFilePicker === "function";
+const pickerTypes = () => [{ description: "Open BIM Studio project", accept: { [PROJECT_FILE_MIME]: [PROJECT_FILE_EXT] } }];
+
+/* ── remember the file handle per project (IndexedDB can store handles) ── */
+const LINK_DB = "obs-file-links";
+function linkDb(): Promise<IDBDatabase> {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(scopedDbName(LINK_DB), 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("links");
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function saveLink(l: Link): Promise<void> {
+  try {
+    const db = await linkDb();
+    await new Promise<void>((res, rej) => {
+      const t = db.transaction("links", "readwrite");
+      t.objectStore("links").put({ handle: l.handle, name: l.name }, l.projectId);
+      t.oncomplete = () => res(); t.onerror = () => rej(t.error);
+    });
+  } catch { /* handle persistence is best-effort */ }
+}
+async function loadLink(projectId: string): Promise<Link | null> {
+  try {
+    const db = await linkDb();
+    const rec: any = await new Promise((res, rej) => {
+      const r = db.transaction("links", "readonly").objectStore("links").get(projectId);
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+    return rec?.handle ? { projectId, handle: rec.handle, name: rec.name ?? rec.handle.name } : null;
+  } catch { return null; }
+}
+async function linkFor(projectId: string): Promise<Link | null> {
+  if (link?.projectId === projectId) return link;
+  const l = await loadLink(projectId);
+  if (l) link = l;
+  return l;
+}
+
+async function ensurePermission(handle: Handle, prompt: boolean): Promise<boolean> {
+  try {
+    const opts = { mode: "readwrite" };
+    if ((await handle.queryPermission?.(opts)) === "granted") return true;
+    if (!prompt) return false;
+    return (await handle.requestPermission?.(opts)) === "granted";
+  } catch { return false; }
+}
+
+/** The exact snapshot `saveProjectToFile` writes — exported so review links and publish flows can reuse it. */
+export async function snapshotProjectFile(): Promise<{ blob: Blob; doc: ProjectDoc } | null> {
+  const cur = getCurrentProject();
+  if (!cur) { toast("warn", "Open or create a project first."); return null; }
+  await saveProject(true);                       // flush live state into the project database
+  const doc = (await store.getProject(cur.id)) ?? cur;
+  const blobs = await store.getModelBlobs(cur.id);
+  return { blob: buildProjectFile(doc, blobs), doc };
+}
+
+async function snapshotFile(): Promise<{ blob: Blob; doc: ProjectDoc } | null> {
+  return snapshotProjectFile();
+}
+
+async function writeHandle(handle: Handle, blob: Blob): Promise<void> {
+  const w = await handle.createWritable();
+  try { await w.write(blob); } finally { await w.close(); }
+}
+
+function download(blob: Blob, name: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/** Save the open project to a .obsproj file. `asNew` always asks for a new file (Save As / backup copy). */
+export async function saveProjectToFile(asNew = false): Promise<boolean> {
+  if (writing) return false;
+  writing = true;
+  try {
+    const snap = await snapshotProjectFile();
+    if (!snap) return false;
+    const { blob, doc } = snap;
+    const name = suggestedFileName(doc);
+    if (!hasPicker()) {
+      download(blob, name);
+      toast("success", `Downloaded ${name}. This browser cannot save to a chosen file, so use Open File to continue from it.`);
+      return true;
+    }
+    let l = !asNew ? await linkFor(doc.id) : null;
+    if (l && !(await ensurePermission(l.handle, true))) l = null;
+    if (!l) {
+      const handle = await (window as any).showSaveFilePicker({ suggestedName: name, types: pickerTypes() });
+      l = { projectId: doc.id, handle, name: handle.name };
+      link = l; void saveLink(l);               // Ctrl+S now keeps this file up to date (Save As re-points it)
+    }
+    await backupExistingFileHandle(l.handle, doc.id, doc.name);
+    await writeHandle(l.handle, blob);
+    lastFileWrite = Date.now();
+    toast("success", `Saved to file: ${l.name}`);
+    return true;
+  } catch (err: any) {
+    if (err?.name === "AbortError") return false;           // user closed the picker
+    console.error("[project-file] save failed", err);
+    toast("error", `Could not save the file: ${err?.message ?? err}`);
+    return false;
+  } finally {
+    writing = false;
+  }
+}
+
+async function readPickedFile(): Promise<{ file: File; handle: Handle | null } | null> {
+  if (typeof (window as any).showOpenFilePicker === "function") {
+    try {
+      const [h] = await (window as any).showOpenFilePicker({ types: pickerTypes(), multiple: false });
+      return { file: await h.getFile(), handle: h };
+    } catch (err: any) {
+      if (err?.name === "AbortError") return null;
+      throw err;
+    }
+  }
+  return new Promise((resolve) => {
+    const inp = document.createElement("input");
+    inp.type = "file"; inp.accept = PROJECT_FILE_EXT;
+    inp.onchange = () => resolve(inp.files?.[0] ? { file: inp.files[0], handle: null } : null);
+    inp.oncancel = () => resolve(null);
+    inp.click();
+  });
+}
+
+/** Save a password-protected copy. It is never linked for autosave: the password is not kept anywhere. */
+export async function saveEncryptedCopy(): Promise<boolean> {
+  if (writing) return false;
+  writing = true;
+  try {
+    const snap = await snapshotProjectFile();
+    if (!snap) return false;
+    const pw = await askPassword({
+      title: "Encrypt project file",
+      message: "The file is encrypted with AES-256. If you forget the password it cannot be recovered.",
+      confirm: true, okLabel: "Encrypt & save",
+    });
+    if (!pw) return false;
+    const enc = await encryptProjectBlob(snap.blob, pw);
+    const name = suggestedFileName(snap.doc).replace(/\.obsproj$/i, "") + " (encrypted)" + PROJECT_FILE_EXT;
+    if (hasPicker()) {
+      const handle = await (window as any).showSaveFilePicker({ suggestedName: name, types: pickerTypes() });
+      await writeHandle(handle, enc);
+      toast("success", `Saved encrypted copy: ${handle.name}`);
+    } else {
+      download(enc, name);
+      toast("success", `Downloaded ${name}`);
+    }
+    return true;
+  } catch (err: any) {
+    if (err?.name === "AbortError") return false;
+    console.error("[project-file] encrypted save failed", err);
+    toast("error", `Could not save the encrypted file: ${err?.message ?? err}`);
+    return false;
+  } finally {
+    writing = false;
+  }
+}
+
+/** Import a parsed project into this browser and open it.
+ * `replaceExisting` skips the "Project already exists" confirm and replaces
+ * the stored copy — used by review links and published pages, where the
+ * incoming file is the intended version by definition. The pre-replace
+ * backup still runs, so the replaced copy is recoverable. */
+export async function importProjectFile(
+  file: Blob,
+  handle: Handle | null = null,
+  opts: { replaceExisting?: boolean } = {},
+): Promise<boolean> {
+  if (await isEncryptedProjectBlob(file)) {
+    // Password-protected: ask, decrypt in memory, and never link the file for plain-text autosave.
+    handle = null;
+    for (let attempt = 0; ; attempt++) {
+      const pw = await askPassword({ title: "Password-protected project", message: attempt ? "Wrong password. Try again." : "Enter the password to open this file.", okLabel: "Open" });
+      if (!pw) return false;
+      try { file = await decryptProjectBlob(file, pw); break; }
+      catch (e) {
+        if (e instanceof WrongPasswordError && attempt < 4) continue;
+        toast("error", e instanceof Error ? e.message : "Could not decrypt the file.");
+        return false;
+      }
+    }
+  }
+  const { doc, blobs } = await parseProjectFile(file);
+  // Validate the document inside the file BEFORE anything touches storage.
+  // A malformed file is refused with the exact problems listed — the file on
+  // disk is left untouched, so nothing is discarded and nothing is half-imported.
+  const parsed = normalizeProjectDoc(doc);
+  if (!parsed.ok) {
+    console.error("[project-file] refusing invalid project file:", parsed.fatal, parsed.issues);
+    throw new ProjectFileError(
+      `The project file contains invalid project data and was not imported.\n${parsed.fatal}` +
+      (parsed.issues.length ? `\n· ${parsed.issues.join("\n· ")}` : ""));
+  }
+  const clean = parsed.doc;
+  if (parsed.issues.length || parsed.migrations.length) {
+    console.warn("[project-file] repaired project on import:", [...parsed.migrations, ...parsed.issues]);
+  }
+  const existing = await store.getProject(clean.id);
+  let id = clean.id;
+  let replace = false;
+  if (existing) {
+    if (opts.replaceExisting) {
+      // Caller already decided: the file IS the newer version of this same
+      // project (a published share snapshot), so replace without asking.
+      // The pre-replace backup below still runs — nothing is lost silently.
+      replace = true;
+    } else {
+      const when = new Date(existing.updatedAt).toLocaleString();
+      const { confirmDialog } = await import("../../features/form-modal");
+      replace = await confirmDialog(
+        "Project already exists",
+        `"${existing.name}" already exists in this browser (last saved ${when}).\n\n` +
+        `Confirm = replace it with the file's version.\nCancel = open the file as a separate copy.`);
+      if (!replace) {
+        id = (crypto as any).randomUUID?.() ?? `${clean.id}-copy-${Date.now()}`;
+        clean.id = id;
+        clean.name = `${clean.name} (copy)`;
+      }
+    }
+  }
+  clean.updatedAt = Date.now();
+  if (replace && existing) {
+    const existingBlobs = await store.getModelBlobs(existing.id);
+    await backupProjectFile({
+      projectId: existing.id,
+      projectName: existing.name,
+      fileName: suggestedFileName(existing),
+      reason: "before-import-replace",
+      blob: buildProjectFile(existing, existingBlobs),
+    });
+  }
+  // ONE transaction for the document and every model payload: an interrupted
+  // import can no longer leave metadata whose payloads were never written.
+  await store.importProjectWithBlobs(clean, blobs, replace);
+  if (handle) { link = { projectId: id, handle, name: handle.name }; void saveLink(link); }
+  await openProject(id);
+  toast("success", `Opened ${clean.name}${blobs.length ? ` with ${blobs.length} model(s)` : ""}`);
+  return true;
+}
+
+export async function openProjectFromFile(): Promise<boolean> {
+  try {
+    const picked = await readPickedFile();
+    if (!picked) return false;
+    return await importProjectFile(picked.file, picked.handle);
+  } catch (err: any) {
+    console.error("[project-file] open failed", err);
+    toast("error", err instanceof ProjectFileError ? err.message : `Could not open the file: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
+/** After every project save: keep the linked file up to date (silent saves never prompt). */
+async function onProjectSaved(ev: Event): Promise<void> {
+  if (writing) return;
+  const cur = getCurrentProject();
+  if (!cur || !hasPicker()) return;
+  const silent = !!(ev as CustomEvent).detail?.silent;
+  const l = await linkFor(cur.id);
+  if (!l) return;
+  if (silent && Date.now() - lastFileWrite < AUTOSAVE_MIN_GAP_MS) return;
+  if (!(await ensurePermission(l.handle, !silent))) return;
+  writing = true;
+  try {
+    const doc = (await store.getProject(cur.id)) ?? cur;
+    const blobs = await store.getModelBlobs(cur.id);
+    await backupExistingFileHandle(l.handle, doc.id, doc.name);
+    await writeHandle(l.handle, buildProjectFile(doc, blobs));
+    lastFileWrite = Date.now();
+    if (!silent) toast("success", `Saved to ${l.name}`);
+  } catch (err) {
+    console.warn("[project-file] linked write failed", err);
+  } finally {
+    writing = false;
+  }
+}
+
+export function setupProjectFileIO(): void {
+  window.addEventListener("obs:project-saved", (e) => { void onProjectSaved(e); });
+  window.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "s") {
+      e.preventDefault(); e.stopImmediatePropagation();
+      void saveProjectToFile(true);
+    }
+  }, true);
+  obsProjectFile = { save: () => saveProjectToFile(false), saveAs: () => saveProjectToFile(true), open: openProjectFromFile };
+}

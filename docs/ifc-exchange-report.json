@@ -1,0 +1,33 @@
+{
+  "generatedAt": "test",
+  "sourceModel": {
+    "elements": 7
+  },
+  "exchanges": {
+    "IFC4": {
+      "schema": "IFC4",
+      "entities": 215,
+      "globalIds": 58,
+      "invalidGlobalIds": 0,
+      "units": true
+    },
+    "IFC2X3": {
+      "schema": "IFC2X3",
+      "entities": 752,
+      "globalIds": 56,
+      "invalidGlobalIds": 0,
+      "units": true
+    }
+  },
+  "invariantChecks": [
+    "element-totals",
+    "writer-stats",
+    "guid-determinism",
+    "units",
+    "psets",
+    "quantities",
+    "relationships",
+    "spatial",
+    "geometry-presence"
+  ]
+}

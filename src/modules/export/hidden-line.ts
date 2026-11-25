@@ -1,0 +1,251 @@
+/**
+ * Hidden-line projection: the current 3D view as 2D lines.
+ *
+ * Triangles are rasterised into a depth buffer; feature edges (boundary, crease > creaseDeg, silhouette) are sampled
+ * along their projection and split into visible and hidden runs. Pure logic, no DOM or three.js.
+ *
+ * Geometry behind the camera is clipped at a 2 cm near plane (so zooming into a model keeps what is in front).
+ * Joint lines: an edge between two pieces of the same layer that lie in one plane (separate meshes whose vertices do not meet) is
+ * not drawn; a joint between different layers, or across a height step, is.
+ * Limits (reported by the caller): visibility is decided per pixel sample, so lines are accurate to about one pixel of the chosen resolution; curved
+ * surfaces show only their silhouette and creases, not tessellation edges below creaseDeg.
+ */
+import type { MeshInput } from "./model-to-dxf3d";
+
+export interface HlrCamera {
+  /** Column-major world→camera matrix (three.js matrixWorldInverse.elements). */
+  view: ArrayLike<number>;
+  /** Column-major projection matrix (three.js projectionMatrix.elements). */
+  proj: ArrayLike<number>;
+  /** Perspective cameras: distance from the eye to the model, in metres, to size the drawing. Ignored for orthographic. */
+  distance?: number;
+}
+export interface HlrOptions { width?: number; creaseDeg?: number; includeHidden?: boolean; unitsScale?: number }
+export interface HlrSegment { x1: number; y1: number; x2: number; y2: number; layer: string }
+export interface HlrResult { visible: HlrSegment[]; hidden: HlrSegment[]; stats: { triangles: number; edges: number; droppedNearPlane: number /* triangles clipped at the near plane (kept, not dropped) */; width: number; height: number; perspective: boolean } }
+
+const mul = (m: ArrayLike<number>, x: number, y: number, z: number) => [
+  m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14], m[3] * x + m[7] * y + m[11] * z + m[15],
+];
+
+export function hiddenLineProject(meshes: MeshInput[], cam: HlrCamera, opts: HlrOptions = {}): HlrResult {
+  const W = Math.max(200, Math.min(3000, Math.floor(opts.width ?? 1400)));
+  const aspect = cam.proj[5] / cam.proj[0];
+  const H = Math.max(1, Math.round(W / aspect));
+  const persp = Math.abs(cam.proj[11]) > 0.5; // three: perspective has proj[11] = -1
+  const unitsPerNdcY = (persp ? (cam.distance ?? 10) : 1) / cam.proj[5] * (opts.unitsScale ?? 1);
+  const crease = Math.cos(((opts.creaseDeg ?? 30) * Math.PI) / 180);
+
+  interface Tri { a: number; b: number; c: number; nx: number; ny: number; nz: number; layer: string }
+  const V: number[] = []; // world xyz
+  const tris: Tri[] = [];
+  const keyToV = new Map<string, number>();
+  const vertex = (x: number, y: number, z: number) => {
+    const k = Math.round(x * 1e4) + "," + Math.round(y * 1e4) + "," + Math.round(z * 1e4);
+    let i = keyToV.get(k);
+    if (i === undefined) { i = V.length / 3; V.push(x, y, z); keyToV.set(k, i); }
+    return i;
+  };
+  for (const m of meshes) {
+    const P = m.positions, I = m.index, mat = m.matrix && m.matrix.length >= 16 ? m.matrix : null;
+    const nV = Math.floor(P.length / 3), nT = I ? Math.floor(I.length / 3) : Math.floor(nV / 3);
+    const loc: number[] = new Array(nV);
+    for (let i = 0; i < nV; i++) {
+      const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
+      const w = mat ? [mat[0] * x + mat[4] * y + mat[8] * z + mat[12], mat[1] * x + mat[5] * y + mat[9] * z + mat[13], mat[2] * x + mat[6] * y + mat[10] * z + mat[14]] : [x, y, z];
+      loc[i] = vertex(w[0], w[1], w[2]);
+    }
+    for (let t = 0; t < nT; t++) {
+      const a = I ? I[t * 3] : t * 3, b = I ? I[t * 3 + 1] : t * 3 + 1, c = I ? I[t * 3 + 2] : t * 3 + 2;
+      if (!(a >= 0 && b >= 0 && c >= 0 && a < nV && b < nV && c < nV)) continue;
+      const ia = loc[a], ib = loc[b], ic = loc[c];
+      if (ia === ib || ib === ic || ia === ic) continue;
+      const ux = V[ib * 3] - V[ia * 3], uy = V[ib * 3 + 1] - V[ia * 3 + 1], uz = V[ib * 3 + 2] - V[ia * 3 + 2];
+      const vx = V[ic * 3] - V[ia * 3], vy = V[ic * 3 + 1] - V[ia * 3 + 1], vz = V[ic * 3 + 2] - V[ia * 3 + 2];
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const len = Math.hypot(nx, ny, nz);
+      if (len < 1e-12) continue;
+      tris.push({ a: ia, b: ib, c: ic, nx: nx / len, ny: ny / len, nz: nz / len, layer: m.layer });
+    }
+  }
+
+  // View-space vertices. Anything closer than NEAR is clipped, never dropped, so zooming into a model keeps its geometry.
+  const NEAR = 0.02;
+  const nVert = V.length / 3;
+  const VX = new Float64Array(nVert), VY = new Float64Array(nVert), VZ = new Float64Array(nVert);
+  for (let i = 0; i < nVert; i++) { const v = mul(cam.view, V[i * 3], V[i * 3 + 1], V[i * 3 + 2]); VX[i] = v[0]; VY[i] = v[1]; VZ[i] = v[2]; }
+  interface P2 { sx: number; sy: number; d: number; nx: number; ny: number }
+  const project = (vx: number, vy: number, vz: number): P2 => {
+    const c = mul(cam.proj, vx, vy, vz); const w = c[3];
+    const nx = c[0] / w, ny = c[1] / w;
+    return { sx: (nx * 0.5 + 0.5) * W, sy: (1 - (ny * 0.5 + 0.5)) * H, d: -vz, nx, ny };
+  };
+
+  // Depth buffer (nearest view distance), perspective-correct via 1/depth interpolation.
+  const buf = new Float32Array(W * H).fill(Infinity);
+  const idBuf = new Int32Array(W * H).fill(-1); // nearest triangle per pixel, for seam detection
+  let clippedTris = 0, drawn = 0;
+  const raster = (p0: P2, p1: P2, p2: P2, ti: number) => {
+    const x0 = p0.sx, y0 = p0.sy, x1 = p1.sx, y1 = p1.sy, x2 = p2.sx, y2 = p2.sy;
+    const minX = Math.max(0, Math.floor(Math.min(x0, x1, x2))), maxX = Math.min(W - 1, Math.ceil(Math.max(x0, x1, x2)));
+    const minY = Math.max(0, Math.floor(Math.min(y0, y1, y2))), maxY = Math.min(H - 1, Math.ceil(Math.max(y0, y1, y2)));
+    const den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+    if (Math.abs(den) < 1e-9) return;
+    const i0 = 1 / p0.d, i1 = 1 / p1.d, i2 = 1 / p2.d;
+    for (let py = minY; py <= maxY; py++) for (let px = minX; px <= maxX; px++) {
+      const sx = px + 0.5, sy = py + 0.5;
+      const l0 = ((y1 - y2) * (sx - x2) + (x2 - x1) * (sy - y2)) / den;
+      const l1 = ((y2 - y0) * (sx - x2) + (x0 - x2) * (sy - y2)) / den;
+      const l2 = 1 - l0 - l1;
+      if (l0 < -1e-6 || l1 < -1e-6 || l2 < -1e-6) continue;
+      const d = 1 / (l0 * i0 + l1 * i1 + l2 * i2);
+      const k = py * W + px;
+      if (d < buf[k]) { buf[k] = d; idBuf[k] = ti; }
+    }
+  };
+  for (let ti = 0; ti < tris.length; ti++) {
+    const t = tris[ti];
+    const ids = [t.a, t.b, t.c];
+    const front = ids.map((i) => -VZ[i] > NEAR);
+    if (front[0] && front[1] && front[2]) { drawn++; raster(project(VX[t.a], VY[t.a], VZ[t.a]), project(VX[t.b], VY[t.b], VZ[t.b]), project(VX[t.c], VY[t.c], VZ[t.c]), ti); continue; }
+    if (!front[0] && !front[1] && !front[2]) continue;
+    // Clip the polygon against depth = NEAR (Sutherland–Hodgman) and fan-triangulate the result.
+    const poly: number[][] = [];
+    for (let k = 0; k < 3; k++) {
+      const i = ids[k], j = ids[(k + 1) % 3], fi = front[k], fj = front[(k + 1) % 3];
+      if (fi) poly.push([VX[i], VY[i], VZ[i]]);
+      if (fi !== fj) { const u = (-NEAR - VZ[i]) / (VZ[j] - VZ[i]); poly.push([VX[i] + (VX[j] - VX[i]) * u, VY[i] + (VY[j] - VY[i]) * u, -NEAR]); }
+    }
+    if (poly.length < 3) continue;
+    clippedTris++; drawn++;
+    const pp = poly.map((q) => project(q[0], q[1], q[2]));
+    for (let k = 1; k + 1 < pp.length; k++) raster(pp[0], pp[k], pp[k + 1], ti);
+  }
+
+  // Feature edges.
+  interface EdgeInfo { a: number; b: number; t0: number; t1: number; layer: string; n: number }
+  const edges = new Map<string, EdgeInfo>();
+  const camPos = (() => { // world-space eye from the view matrix (inverse of rigid transform)
+    const m = cam.view; return [-(m[0] * m[12] + m[1] * m[13] + m[2] * m[14]), -(m[4] * m[12] + m[5] * m[13] + m[6] * m[14]), -(m[8] * m[12] + m[9] * m[13] + m[10] * m[14])];
+  })();
+  const viewDir = [-cam.view[2], -cam.view[6], -cam.view[10]]; // world direction the camera looks along
+  const frontFacing = (t: Tri): boolean => {
+    if (persp) { const cx = (V[t.a * 3] + V[t.b * 3] + V[t.c * 3]) / 3, cy = (V[t.a * 3 + 1] + V[t.b * 3 + 1] + V[t.c * 3 + 1]) / 3, cz = (V[t.a * 3 + 2] + V[t.b * 3 + 2] + V[t.c * 3 + 2]) / 3; return t.nx * (camPos[0] - cx) + t.ny * (camPos[1] - cy) + t.nz * (camPos[2] - cz) > 0; }
+    return t.nx * viewDir[0] + t.ny * viewDir[1] + t.nz * viewDir[2] < 0;
+  };
+  tris.forEach((t, ti) => {
+    const pairs: Array<[number, number]> = [[t.a, t.b], [t.b, t.c], [t.c, t.a]];
+    for (const [p, q] of pairs) {
+      const key = p < q ? p + ":" + q : q + ":" + p;
+      const e = edges.get(key);
+      if (!e) edges.set(key, { a: p, b: q, t0: ti, t1: -1, layer: t.layer, n: 1 });
+      else { e.t1 = ti; e.n++; }
+    }
+  });
+  const visible: HlrSegment[] = [], hidden: HlrSegment[] = [];
+  const toDraw = (nx: number, ny: number) => [nx * unitsPerNdcY * aspect, ny * unitsPerNdcY];
+  let edgeCount = 0;
+  const bufAt = (px: number, py: number) => {
+    let m = Infinity;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const x = px + dx, y = py + dy; if (x < 0 || y < 0 || x >= W || y >= H) continue;
+      const v = buf[y * W + x]; if (v < m) m = v;
+    }
+    return m;
+  };
+  for (const e of edges.values()) {
+    const t0 = tris[e.t0];
+    let feature = false;
+    if (e.n !== 2) feature = true;
+    else {
+      const t1 = tris[e.t1];
+      const dot = t0.nx * t1.nx + t0.ny * t1.ny + t0.nz * t1.nz;
+      feature = dot < crease || frontFacing(t0) !== frontFacing(t1);
+    }
+    if (!feature) continue;
+    // Clip the edge to the near plane in view space, then project both ends.
+    let ax3 = [VX[e.a], VY[e.a], VZ[e.a]], bx3 = [VX[e.b], VY[e.b], VZ[e.b]];
+    const fa = -ax3[2] > NEAR, fb = -bx3[2] > NEAR;
+    if (!fa && !fb) continue;
+    if (fa !== fb) {
+      const [pIn, pOut] = fa ? [ax3, bx3] : [bx3, ax3];
+      const u = (-NEAR - pIn[2]) / (pOut[2] - pIn[2]);
+      const cl = [pIn[0] + (pOut[0] - pIn[0]) * u, pIn[1] + (pOut[1] - pIn[1]) * u, -NEAR];
+      if (fa) bx3 = cl; else ax3 = cl;
+    }
+    edgeCount++;
+    const pa = project(ax3[0], ax3[1], ax3[2]), pb = project(bx3[0], bx3[1], bx3[2]);
+    const ax = pa.sx, ay = pa.sy, bx = pb.sx, by = pb.sy;
+    const px = bx - ax, py = by - ay, plen = Math.hypot(px, py);
+    const steps = Math.max(1, Math.min(4000, Math.ceil(plen / 1.5)));
+    const ia = 1 / pa.d, ib = 1 / pb.d;
+    // Seam suppression: an edge (open, non-manifold or a crease of either piece) between two pieces of the SAME layer that lie in one plane (T-junctions or
+    // different subdivision keep their vertices apart, so the shared boundary is not detected as an interior edge) is not a
+    // real line. Decided per sample from the triangles found one pixel to either side of the edge.
+    const seamCheck = plen > 1e-6;
+    const sdx = -py / (plen || 1), sdy = px / (plen || 1);
+    const planeDist = (t: Tri, i: number) => t.nx * (V[i * 3] - V[t.a * 3]) + t.ny * (V[i * 3 + 1] - V[t.a * 3 + 1]) + t.nz * (V[i * 3 + 2] - V[t.a * 3 + 2]);
+    const isSeam = (sx: number, sy: number): boolean => {
+      const l = idBuf[Math.max(0, Math.min(H - 1, Math.floor(sy + sdy * 1.6))) * W + Math.max(0, Math.min(W - 1, Math.floor(sx + sdx * 1.6)))];
+      const r = idBuf[Math.max(0, Math.min(H - 1, Math.floor(sy - sdy * 1.6))) * W + Math.max(0, Math.min(W - 1, Math.floor(sx - sdx * 1.6)))];
+      if (l < 0 || r < 0) return false;
+      const tl = tris[l], tr = tris[r];
+      if (tl.layer !== tr.layer || tl.layer !== e.layer) return false;
+      if (Math.abs(tl.nx * tr.nx + tl.ny * tr.ny + tl.nz * tr.nz) < 0.9995) return false;
+      return Math.abs(planeDist(tl, e.a)) < 2e-3 && Math.abs(planeDist(tl, e.b)) < 2e-3 && Math.abs(planeDist(tr, e.a)) < 2e-3 && Math.abs(planeDist(tr, e.b)) < 2e-3;
+    };
+    let runStart = 0, runVis = true;
+    const emit = (s0: number, s1: number, vis: boolean, seam = false) => {
+      if (s1 <= s0 || seam) return;
+      const n0x = pa.nx + (pb.nx - pa.nx) * s0, n0y = pa.ny + (pb.ny - pa.ny) * s0;
+      const n1x = pa.nx + (pb.nx - pa.nx) * s1, n1y = pa.ny + (pb.ny - pa.ny) * s1;
+      // NDC is affine in screen space, so s is the same parameter for both.
+      const [x1, y1] = toDraw(n0x, n0y), [x2, y2] = toDraw(n1x, n1y);
+      (vis ? visible : hidden).push({ x1, y1, x2, y2, layer: e.layer });
+    };
+    let runSeam = false;
+    for (let s = 0; s <= steps; s++) {
+      const u = s / steps;
+      const sx = ax + px * u, sy = ay + py * u;
+      const d = 1 / (ia + (ib - ia) * u);
+      const b = bufAt(Math.floor(sx), Math.floor(sy));
+      const vis = d <= b * 1.004 + 0.002;
+      const seam = seamCheck && vis && isSeam(sx, sy);
+      if (s === 0) { runVis = vis; runSeam = seam; runStart = 0; continue; }
+      if (vis !== runVis || seam !== runSeam) { emit(runStart / steps, (s - 0.5) / steps, runVis, runSeam); runStart = (s - 0.5) / steps; runVis = vis; runSeam = seam; }
+    }
+    emit(runStart, 1, runVis, runSeam);
+  }
+  const keepHidden = opts.includeHidden ? hidden : [];
+  return { visible, hidden: keepHidden, stats: { triangles: drawn, edges: edgeCount, droppedNearPlane: clippedTris, width: W, height: H, perspective: persp } };
+}
+
+/** DXF R12 with LINE entities: visible edges on `<layer>`, hidden edges on `<layer>-HIDDEN` (dashed, grey). X/Y are the view plane; units mm or m. */
+export function hlrToDxf(res: HlrResult): { dxf: string; lines: number; layers: string[] } {
+  const out: string[] = [];
+  const w = (c: number, v: string | number) => out.push(String(c), String(v));
+  const fmt = (v: number) => (Math.abs(v) < 1e-9 ? "0" : String(Math.round(v * 1e4) / 1e4));
+  const used = new Set<string>();
+  const ents: string[] = [];
+  const add = (s: HlrSegment, name: string) => {
+    if (Math.hypot(s.x2 - s.x1, s.y2 - s.y1) < 1e-6) return;
+    used.add(name);
+    ents.push(["0", "LINE", "8", name, "10", fmt(s.x1), "20", fmt(s.y1), "30", "0", "11", fmt(s.x2), "21", fmt(s.y2), "31", "0"].join("\n"));
+  };
+  for (const s of res.visible) add(s, s.layer);
+  for (const s of res.hidden) add(s, s.layer + "-HIDDEN");
+  w(0, "SECTION"); w(2, "HEADER"); w(9, "$ACADVER"); w(1, "AC1009"); w(0, "ENDSEC");
+  w(0, "SECTION"); w(2, "TABLES");
+  w(0, "TABLE"); w(2, "LTYPE"); w(70, 2);
+  w(0, "LTYPE"); w(2, "CONTINUOUS"); w(70, 0); w(3, "Solid line"); w(72, 65); w(73, 0); w(40, 0);
+  w(0, "LTYPE"); w(2, "DASHED"); w(70, 0); w(3, "Dashed"); w(72, 65); w(73, 2); w(40, 0.75); w(49, 0.5); w(49, -0.25);
+  w(0, "ENDTAB");
+  const layers = Array.from(used).sort();
+  w(0, "TABLE"); w(2, "LAYER"); w(70, layers.length + 1);
+  const row = (name: string, color: number, lt: string) => { w(0, "LAYER"); w(2, name); w(70, 0); w(62, color); w(6, lt); };
+  row("0", 7, "CONTINUOUS");
+  for (const l of layers) row(l, l.endsWith("-HIDDEN") ? 8 : 7, l.endsWith("-HIDDEN") ? "DASHED" : "CONTINUOUS");
+  w(0, "ENDTAB"); w(0, "ENDSEC");
+  w(0, "SECTION"); w(2, "ENTITIES");
+  return { dxf: out.join("\n") + "\n" + (ents.length ? ents.join("\n") + "\n" : "") + "0\nENDSEC\n0\nEOF\n", lines: ents.length, layers };
+}

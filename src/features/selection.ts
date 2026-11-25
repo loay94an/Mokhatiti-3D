@@ -1,0 +1,923 @@
+/**
+ * Central selection manager.
+ *
+ * Multi-select across models (Ctrl add, Shift toggle, Alt remove).
+ * Two-way bridge to the OBC highlighter (source of truth for rendering).
+ * Named selection sets, persisted in localStorage.
+ * Click-to-select for fragments wired via setupClickToSelect().
+ *
+ * Boundary (hardening item 20): this is the LIVE viewport selection for
+ * fragment (IFC) models — modelId -> Set<number> local ids, registered as
+ * the canonical services SelectionService and published on
+ * ctx.features.selection by main.ts. It is NOT the authored-element
+ * selection engine in src/modules/selection/index.ts (pure SelectionEngine:
+ * plan hit-testing over authored elements by string id, reachable only
+ * from the Selection Inspector dialog). The two share the word "selection"
+ * but serve disjoint element universes; neither subsumes the other, so
+ * neither may be deleted as "the duplicate". Which copy runs where is
+ * pinned by tests/selection-generations.test.cjs.
+ */
+import { authoredOwnsClick } from "./pick-arbiter";
+import { hoverPreselectCycle, emitTabCycleStatus } from "../modules/selection/selection-cycle";
+import * as THREE from "three";
+import * as OBC from "@thatopen/components";
+import { ctx } from "../core/context";
+import { register, tryUse, type SelectionService } from "../core/services";
+import { getSelectionPrefs } from "../core/selection-prefs";
+import { hoverGate } from "../core/hover-gate";
+import {
+  normalizeSelectionCategory,
+  PreviousSelectionStore,
+  resolveClickMode,
+  type SelectionItem,
+} from "./selection-semantics";
+
+export interface SelectionSnapshot {
+  [modelId: string]: Set<number>;
+}
+
+export interface SelectionSet {
+  id: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+  snapshot: Record<string, number[]>;
+}
+
+const SETS_KEY = "obs.selection-sets.v1";
+
+/** Encode a fragment snapshot as sorted `modelId:localId` keys (previous-selection store). */
+function encodeSelectionSnapshot(snap: SelectionSnapshot): string[] {
+  const out: string[] = [];
+  for (const [m, s] of Object.entries(snap)) for (const id of s) out.push(`${m}:${id}`);
+  return out.sort();
+}
+
+function decodeSelectionSnapshot(keys: readonly string[]): SelectionSnapshot {
+  const out: SelectionSnapshot = {};
+  for (const key of keys) {
+    const i = key.lastIndexOf(":");
+    if (i < 0) continue;
+    const m = key.slice(0, i);
+    const id = Number(key.slice(i + 1));
+    if (!Number.isFinite(id)) continue;
+    if (!out[m]) out[m] = new Set();
+    out[m].add(id);
+  }
+  return out;
+}
+
+function snapshotsEqual(a: SelectionSnapshot, b: SelectionSnapshot): boolean {
+  const ea = encodeSelectionSnapshot(a);
+  const eb = encodeSelectionSnapshot(b);
+  return ea.length === eb.length && ea.every((v, i) => v === eb[i]);
+}
+
+function categoryMatchesFilter(filter: Iterable<string> | null, category: string): boolean {
+  if (!filter) return true;
+  const target = normalizeSelectionCategory(category);
+  for (const value of filter) {
+    if (normalizeSelectionCategory(value) === target) return true;
+  }
+  return false;
+}
+
+class SelectionManager {
+  private map: SelectionSnapshot = {};
+  private listeners = new Set<() => void>();
+  private filter: Set<string> | null = null;
+  private filterRevision = 0;
+  private highlightStyle = "select";
+  /** Selection before the last change (Revit "Select Previous", Ctrl+Left). */
+  private previousStore = new PreviousSelectionStore<string>();
+
+  /**
+   * Remember the current selection as the previous one, ahead of a change.
+   * No-op when the selection is unchanged, so no-op commits (a Shift-click
+   * on an unselected element, clearing an empty selection) cannot overwrite
+   * a meaningful previous set.
+   */
+  private notePrevious(): void {
+    this.previousStore.note(encodeSelectionSnapshot(this.map));
+  }
+
+  hasPreviousSelection(): boolean {
+    return this.previousStore.hasPrevious();
+  }
+
+  /** Restore the previous selection (swap: a second press toggles back). */
+  async selectPrevious(): Promise<boolean> {
+    const prev = this.previousStore.restore(encodeSelectionSnapshot(this.map));
+    if (!prev) return false;
+    this.replaceInternal(decodeSelectionSnapshot(prev), false, false);
+    await this.applyToHighlighter();
+    return true;
+  }
+
+  onChange(cb: () => void): () => void {
+    this.listeners.add(cb);
+    return () => this.listeners.delete(cb);
+  }
+  private emit() {
+    for (const cb of this.listeners) {
+      try { cb(); } catch { /* */ }
+    }
+  }
+
+  // ── Read ──
+  snapshot(): SelectionSnapshot {
+    const out: SelectionSnapshot = {};
+    for (const [m, s] of Object.entries(this.map)) {
+      if (s.size) out[m] = new Set(s);
+    }
+    return out;
+  }
+  isEmpty(): boolean {
+    for (const s of Object.values(this.map)) if (s.size) return false;
+    return true;
+  }
+  size(): number {
+    let n = 0;
+    for (const s of Object.values(this.map)) n += s.size;
+    return n;
+  }
+  has(modelId: string, localId: number): boolean {
+    return !!this.map[modelId]?.has(localId);
+  }
+  modelCount(): number {
+    return Object.keys(this.map).filter((m) => (this.map[m]?.size ?? 0) > 0).length;
+  }
+
+  // ── Mutate ──
+  // The previous-selection note fires only when the selection really
+  // changes; the emit behaviour below is unchanged (a redundant emit is
+  // harmless, a lost "previous" is not).
+  add(modelId: string, localId: number): void {
+    if (!this.has(modelId, localId)) this.notePrevious();
+    if (!this.map[modelId]) this.map[modelId] = new Set();
+    this.map[modelId].add(localId);
+    this.emit();
+    if (this.filter) void this.reconcileFilter();
+  }
+  addMany(modelId: string, ids: Iterable<number>): void {
+    const list = [...ids];
+    if (list.some((id) => !this.has(modelId, id))) this.notePrevious();
+    if (!this.map[modelId]) this.map[modelId] = new Set();
+    for (const id of list) this.map[modelId].add(id);
+    this.emit();
+    if (this.filter) void this.reconcileFilter();
+  }
+  remove(modelId: string, localId: number): void {
+    if (this.has(modelId, localId)) this.notePrevious();
+    this.map[modelId]?.delete(localId);
+    if (this.map[modelId]?.size === 0) delete this.map[modelId];
+    this.emit();
+  }
+  removeMany(modelId: string, ids: Iterable<number>): void {
+    const s = this.map[modelId];
+    if (!s) return;
+    if ([...ids].some((id) => s.has(id))) this.notePrevious();
+    for (const id of ids) s.delete(id);
+    if (s.size === 0) delete this.map[modelId];
+    this.emit();
+  }
+  toggle(modelId: string, localId: number): void {
+    if (this.has(modelId, localId)) this.remove(modelId, localId);
+    else this.add(modelId, localId);
+  }
+  replace(snap: SelectionSnapshot, reconcile = true): void {
+    this.replaceInternal(snap, reconcile, true);
+  }
+  /** Inner replace: `note=false` for filter reconciliation / Select Previous restore. */
+  private replaceInternal(snap: SelectionSnapshot, reconcile = true, note = true): void {
+    if (note && !snapshotsEqual(this.map, snap)) this.notePrevious();
+    this.map = {};
+    for (const [m, s] of Object.entries(snap)) {
+      if (s.size) this.map[m] = new Set(s);
+    }
+    this.emit();
+    if (reconcile && this.filter) void this.reconcileFilter();
+  }
+  clear(): void {
+    if (!this.isEmpty()) this.notePrevious();
+    this.map = {};
+    this.emit();
+  }
+
+  applyClick(
+    modelId: string,
+    localId: number,
+    mods: { ctrl?: boolean; shift?: boolean; alt?: boolean },
+  ): void {
+    // Revit selection modifiers (shared rule in selection-semantics.ts):
+    //   plain click  = replace
+    //   Ctrl/Cmd     = add
+    //   Shift / Alt  = remove
+    // (Shift-remove was already the behaviour here; the rule is now shared
+    // with the plan view instead of living in two places.)
+    const mode = resolveClickMode(mods);
+    if (mode === "remove") this.remove(modelId, localId);
+    else if (mode === "add") this.add(modelId, localId);
+    else this.replace({ [modelId]: new Set([localId]) });
+  }
+
+  // ── Filter ──
+  setFilter(categories: string[] | null): void {
+    this.filter = categories && categories.length ? new Set(categories) : null;
+    this.filterRevision++;
+    this.emit();
+    if (this.filter) void this.reconcileFilter();
+  }
+
+  /**
+   * Remove stale selections that are outside the active category filter.
+   * The operation is atomic: if any model category index cannot be read, keep
+   * the current selection rather than partially deleting valid user work.
+   */
+  async reconcileFilter(): Promise<void> {
+    const revision = this.filterRevision;
+    const filter = this.filter;
+    if (!filter?.size) return;
+
+    const categoryByModel = new Map<string, Map<number, string>>();
+    try {
+      for (const modelId of Object.keys(this.map)) {
+        const model: any = ctx.fragments.list.get(modelId);
+        if (!model?.getItemsOfCategories) {
+          categoryByModel.set(modelId, new Map());
+          continue;
+        }
+        const categories = await model.getItemsOfCategories([/.+/]);
+        const byId = new Map<number, string>();
+        for (const [category, ids] of Object.entries(categories ?? {})) {
+          for (const id of (ids as number[]) ?? []) byId.set(id, category);
+        }
+        categoryByModel.set(modelId, byId);
+      }
+    } catch (err) {
+      console.warn("[selection] category reconciliation failed; preserving current selection", err);
+      return;
+    }
+
+    if (revision !== this.filterRevision || filter !== this.filter) return;
+    // A selection may be added on another model while category indexes are
+    // loading. Retry with the expanded model set instead of dropping that work.
+    if (Object.keys(this.map).some(modelId => !categoryByModel.has(modelId))) {
+      void this.reconcileFilter();
+      return;
+    }
+    const next: SelectionSnapshot = {};
+    for (const [modelId, ids] of Object.entries(this.map)) {
+      const byId = categoryByModel.get(modelId);
+      if (!byId) continue;
+      const keep = new Set<number>();
+      for (const id of ids) {
+        const category = byId.get(id);
+        if (category && categoryMatchesFilter(filter, category)) keep.add(id);
+      }
+      if (keep.size) next[modelId] = keep;
+    }
+    // Filter reconciliation is not a user selection change: it must not
+    // overwrite the previous-selection snapshot.
+    this.replaceInternal(next, false, false);
+    await this.applyToHighlighter();
+  }
+  getFilter(): string[] | null {
+    return this.filter ? [...this.filter] : null;
+  }
+  hasFilter(): boolean {
+    return this.filter != null && this.filter.size > 0;
+  }
+
+  /** Apply the active category filter consistently to native authored picks.
+   *  IFC aliases are accepted alongside native element type names.
+   */
+  matchesCategoryName(category: string): boolean {
+    return categoryMatchesFilter(this.filter, category);
+  }
+
+  matchesAuthoredCategoryFilter(type: string, properties?: Record<string, unknown> | null): boolean {
+    if (!this.filter?.size) return true;
+    const candidates = [
+      type,
+      properties?.ifcType,
+      properties?.ifcEntity,
+      properties?.ifcClass,
+      properties?.entity,
+      properties?.predefinedType,
+    ].filter((value): value is string => typeof value === "string" && value.length > 0);
+    return candidates.some(value => this.matchesCategoryName(value));
+  }
+
+  private async filteredGeometryIds(model: any, geometryIds: number[]): Promise<Set<number>> {
+    if (!this.filter?.size) return new Set(geometryIds);
+    const categories = await model.getItemsOfCategories([/.+/]);
+    const geometry = new Set(geometryIds);
+    const allowed = new Set<number>();
+    for (const [category, ids] of Object.entries(categories ?? {})) {
+      if (!this.matchesCategoryName(category)) continue;
+      for (const id of (ids as number[]) ?? []) if (geometry.has(id)) allowed.add(id);
+    }
+    return allowed;
+  }
+
+  // ── Bulk operations ──
+  async selectAll(): Promise<void> {
+    const next: SelectionSnapshot = {};
+    for (const [modelId, model] of ctx.fragments.list) {
+      try {
+        const ids = (await (model as any).getItemsIdsWithGeometry()) as number[];
+        if (!ids?.length) continue;
+        const keep = await this.filteredGeometryIds(model, ids);
+        if (keep.size) next[modelId] = keep;
+      } catch (err) {
+        console.warn("[selection] selectAll category lookup failed", err);
+      }
+    }
+    this.replace(next, false);
+    await this.applyToHighlighter();
+  }
+
+  async selectSimilar(modelId: string, localId: number): Promise<void> {
+    await this.reconcileFilter();
+    const model = ctx.fragments.list.get(modelId);
+    if (!model) return;
+    try {
+      const cats = await (model as any).getItemsOfCategories([/.+/]);
+      let category: string | null = null;
+      for (const [name, list] of Object.entries(cats ?? {})) {
+        if (((list as number[]) || []).includes(localId)) { category = name; break; }
+      }
+      if (!category || !this.matchesCategoryName(category)) return;
+      const geometryIds = (await (model as any).getItemsIdsWithGeometry()) as number[];
+      const geometry = new Set(geometryIds ?? []);
+      const ids = ((cats as any)[category] as number[] | undefined) ?? [];
+      const merged: SelectionSnapshot = this.snapshot();
+      const keep = new Set((ids ?? []).filter(id => geometry.has(id)));
+      if (!keep.size) return;
+      if (!merged[modelId]) merged[modelId] = new Set();
+      for (const id of keep) merged[modelId].add(id);
+      this.replace(merged, false);
+      await this.applyToHighlighter();
+    } catch (e) {
+      console.warn("[selection] selectSimilar failed", e);
+    }
+  }
+
+  /** Category index for one fragment model, cached per model instance. */
+  private async categoryIndex(modelId: string): Promise<Map<number, string> | null> {
+    const model: any = ctx.fragments.list.get(modelId);
+    if (!model?.getItemsOfCategories) return null;
+    let cached = categoryCache.get(modelId);
+    // Model IDs can be reused after unload/reload. Never apply a stale category
+    // index to a different model instance with the same ID.
+    if (!cached || cached.model !== model) {
+      const categories = await model.getItemsOfCategories([/.+/]);
+      const byId = new Map<number, string>();
+      for (const [category, ids] of Object.entries(categories ?? {})) {
+        for (const id of (ids as number[]) ?? []) byId.set(id, category);
+      }
+      cached = { model, byId };
+      categoryCache.set(modelId, cached);
+    }
+    return cached.byId;
+  }
+
+  /**
+   * Every element with geometry in every loaded fragment model, as
+   * SelectionItems (category = IFC class; a fragment has no family type
+   * of its own, so Select All Instances matches the same IFC class).
+   * Used by the Filter dialog and Select All Instances over a mixed
+   * authored + fragment selection.
+   */
+  async fragmentCatalog(): Promise<SelectionItem[]> {
+    const out: SelectionItem[] = [];
+    for (const [modelId, model] of ctx.fragments.list) {
+      try {
+        const ids = (await (model as any).getItemsIdsWithGeometry()) as number[];
+        if (!ids?.length) continue;
+        const byId = await this.categoryIndex(modelId);
+        for (const id of ids) {
+          const category = byId?.get(id) ?? "unknown";
+          out.push({ key: `${modelId}:${id}`, source: "fragment", category, type: category, modelId, localId: id });
+        }
+      } catch (err) {
+        console.warn("[selection] fragment catalog failed", err);
+      }
+    }
+    return out;
+  }
+
+  /** The current fragment selection, as SelectionItems with categories. */
+  async selectionItems(): Promise<SelectionItem[]> {
+    const catalog = await this.fragmentCatalog();
+    const selected = new Set(encodeSelectionSnapshot(this.snapshot()));
+    return catalog.filter((item) => selected.has(item.key));
+  }
+
+  async invert(): Promise<void> {
+    const next: SelectionSnapshot = {};
+    for (const [modelId, model] of ctx.fragments.list) {
+      try {
+        const all = (await (model as any).getItemsIdsWithGeometry()) as number[];
+        if (!all?.length) continue;
+        const universe = await this.filteredGeometryIds(model, all);
+        const current = this.map[modelId] ?? new Set<number>();
+        const inverse = new Set<number>();
+        for (const id of universe) if (!current.has(id)) inverse.add(id);
+        if (inverse.size) next[modelId] = inverse;
+      } catch (err) {
+        console.warn("[selection] invert category lookup failed", err);
+      }
+    }
+    this.replace(next, false);
+    await this.applyToHighlighter();
+  }
+
+  // ── Rendering bridge ──
+  async applyToHighlighter(style = this.highlightStyle): Promise<void> {
+    try { await (ctx.highlighter as any).clear(style); } catch { /* */ }
+    if (this.isEmpty()) return;
+    const map: OBC.ModelIdMap = {};
+    for (const [m, s] of Object.entries(this.map)) {
+      if (s.size) map[m] = new Set(s);
+    }
+    try {
+      await (ctx.highlighter as any).highlightByID(style, map, true);
+    } catch (e) {
+      console.warn("[selection] highlighter", e);
+    }
+  }
+
+  adoptFromHighlighter(): void {
+    const hl = ctx.highlighter as any;
+    const candidates: any[] = [hl?.selection, hl?.styles, hl];
+    const snap: SelectionSnapshot = {};
+    const isNumericSet = (v: any): v is Set<number> => {
+      if (!(v instanceof Set) || !v.size) return false;
+      for (const x of v) if (typeof x !== "number") return false;
+      return true;
+    };
+    const scan = (node: any, depth: number) => {
+      if (!node || depth > 4) return;
+      if (node instanceof Map) {
+        for (const [k, v] of node) {
+          if (isNumericSet(v)) {
+            if (!snap[String(k)]) snap[String(k)] = new Set();
+            for (const id of v) snap[String(k)]!.add(id);
+          } else scan(v, depth + 1);
+        }
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const v of node) scan(v, depth + 1);
+        return;
+      }
+      if (typeof node !== "object") return;
+      for (const [k, v] of Object.entries(node)) {
+        if (isNumericSet(v)) {
+          if (!snap[k]) snap[k] = new Set();
+          for (const id of v) snap[k]!.add(id);
+        } else if (v && typeof v === "object") {
+          scan(v, depth + 1);
+        }
+      }
+    };
+    for (const c of candidates) scan(c, 0);
+    if (Object.keys(snap).length) {
+      this.replace(snap, false);
+      void this.reconcileFilter();
+    }
+  }
+
+  // ── Selection sets ──
+  listSets(): SelectionSet[] {
+    try {
+      const raw = localStorage.getItem(SETS_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr : [];
+    } catch { return []; }
+  }
+  private persistSets(list: SelectionSet[]) {
+    try { localStorage.setItem(SETS_KEY, JSON.stringify(list)); } catch (e) {
+      console.warn("[selection] set save failed", e);
+    }
+  }
+  saveSet(name: string): SelectionSet {
+    const snap: Record<string, number[]> = {};
+    for (const [m, s] of Object.entries(this.map)) snap[m] = [...s];
+    const set: SelectionSet = {
+      id: (crypto as any).randomUUID?.() ?? `ss-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      name: name.trim() || "Set",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      snapshot: snap,
+    };
+    const list = this.listSets();
+    list.unshift(set);
+    this.persistSets(list);
+    this.emit();
+    return set;
+  }
+  async loadSet(id: string): Promise<void> {
+    const set = this.listSets().find((s) => s.id === id);
+    if (!set) return;
+    const snap: SelectionSnapshot = {};
+    for (const [m, arr] of Object.entries(set.snapshot)) snap[m] = new Set(arr);
+    this.replace(snap, false);
+    await this.reconcileFilter();
+    await this.applyToHighlighter();
+  }
+  deleteSet(id: string): void {
+    this.persistSets(this.listSets().filter((s) => s.id !== id));
+    this.emit();
+  }
+
+  async focus(): Promise<void> {
+    if (this.isEmpty()) return;
+    try {
+      const mod = await import("./camera-tools");
+      const map: any = {};
+      for (const [m, s] of Object.entries(this.map)) map[m] = s;
+      await mod.fitToMap(map);
+    } catch { /* */ }
+  }
+
+  async boundingBox(): Promise<THREE.Box3 | null> {
+    const box = new THREE.Box3();
+    let any = false;
+    for (const [modelId, ids] of Object.entries(this.map)) {
+      const model: any = ctx.fragments.list.get(modelId);
+      if (!model || !ids.size) continue;
+      try {
+        const boxes: THREE.Box3[] = await model.getBoxes([...ids]);
+        const mw = model.object.matrixWorld?.clone?.() ?? new THREE.Matrix4();
+        for (const b of boxes ?? []) {
+          if (!b || b.isEmpty()) continue;
+          const w = b.clone().applyMatrix4(mw);
+          box.union(w);
+          any = true;
+        }
+      } catch { /* */ }
+    }
+    return any ? box : null;
+  }
+}
+
+
+export const selection = new SelectionManager();
+
+/** Typed service registration (Week 3). */
+{
+  const svc: SelectionService = {
+    snapshot: () => selection.snapshot(),
+    size: () => selection.size(),
+    modelCount: () => selection.modelCount(),
+    isEmpty: () => selection.isEmpty(),
+    replace: (m) => selection.replace(m),
+    clear: () => selection.clear(),
+    addMany: (m, ids) => selection.addMany(m, ids),
+    removeMany: (m, ids) => selection.removeMany(m, ids),
+    selectAll: () => selection.selectAll(),
+    invert: () => selection.invert(),
+    selectSimilar: (m, id) => selection.selectSimilar(m, id),
+    selectPrevious: () => selection.selectPrevious(),
+    hasPreviousSelection: () => selection.hasPreviousSelection(),
+    fragmentCatalog: () => selection.fragmentCatalog(),
+    selectionItems: () => selection.selectionItems(),
+    applyClick: (m, id, mods) => selection.applyClick(m, id, mods),
+    adoptFromHighlighter: () => selection.adoptFromHighlighter(),
+    applyToHighlighter: () => selection.applyToHighlighter(),
+    focus: () => selection.focus(),
+    boundingBox: () => selection.boundingBox(),
+    saveSet: (n) => selection.saveSet(n),
+    listSets: () => selection.listSets(),
+    loadSet: (id) => selection.loadSet(id),
+    onChange: (cb) => selection.onChange(cb),
+  };
+  register("selection", svc);
+}
+
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Click-to-select wiring for fragments
+   ═════════════════════════════════════════════════════════════════════════ */
+let clickToSelectInstalled = false;
+let highlighterSyncInstalled = false;
+let hoverPending = false;
+let hoveredMap: Record<string, Set<number>> = {};
+const categoryCache = new Map<string, { model: object; byId: Map<number, string> }>();
+
+async function passesCategoryFilter(modelId: string, localId: number): Promise<boolean> {
+  const allowed = selection.getFilter();
+  if (!allowed?.length) return true;
+  try {
+    const model: any = ctx.fragments.list.get(modelId);
+    if (!model?.getItemsOfCategories) return false;
+    let cached = categoryCache.get(modelId);
+    // Model IDs can be reused after unload/reload. Never apply a stale category
+    // index to a different model instance with the same ID.
+    if (!cached || cached.model !== model) {
+      const categories = await model.getItemsOfCategories([/.+/]);
+      const byId = new Map<number, string>();
+      for (const [category, ids] of Object.entries(categories ?? {})) {
+        for (const id of (ids as number[]) ?? []) byId.set(id, category);
+      }
+      cached = { model, byId };
+      categoryCache.set(modelId, cached);
+    }
+    const category = cached.byId.get(localId);
+    return !!category && categoryMatchesFilter(allowed, category);
+  } catch (err) {
+    console.warn("[selection] category filter lookup failed; rejecting pick", err);
+    return false;
+  }
+}
+
+function anyBlockingToolActive(): boolean {
+  try {
+    // Only block while the section-cut ARROW is hovered/dragged — not for the whole
+    // Section mode session (that previously disabled every click/select action).
+    const w = window as any;
+    if (w.__OBS_SECTION_ARROW_HOVER || w.__OBS_SECTION_ARROW_LOCK) return true;
+    if ((tryUse("authoring") as any)?.isActive?.()) return true;
+    if ((ctx.features as any).drawing?.isActive?.()) return true;
+    if ((ctx.features as any).measure?.isEnabled?.()) return true;
+    if ((ctx.features as any).walkMode?.isEnabled?.()) return true;
+    return false;
+  } catch { return false; }
+}
+
+function normalizeRaycastResult(r: any): { modelId: string; localId: number; distance?: number } | null {
+  if (!r) return null;
+  const localCandidate = r.localId ?? r.localIds?.[0] ?? r.fragments?.localId ?? r.fragments?.localIds?.[0] ?? r.itemId;
+  const localId = typeof localCandidate === "number" ? localCandidate : Number(localCandidate);
+  const model = r.model ?? r.fragment?.model ?? r.fragments?.model ?? r.fragments?.[0]?.model;
+  let modelId: string | null =
+    typeof r.modelId === "string" ? r.modelId :
+    typeof r.fragments?.modelId === "string" ? r.fragments.modelId :
+    typeof r.fragments?.[0]?.modelId === "string" ? r.fragments[0].modelId :
+    typeof model?.modelId === "string" ? model.modelId :
+    typeof model?.id === "string" ? model.id : null;
+  if (modelId == null && model) {
+    for (const [id, m] of ctx.fragments.list as any) {
+      if (m === model || (m as any)?.object === model || (model as any)?.model === m) { modelId = id; break; }
+    }
+  }
+  if (!Number.isFinite(localId) || modelId == null || !ctx.fragments.list.has(modelId)) return null;
+  const d = Number(r.distance ?? r.dist);
+  return { modelId, localId, distance: Number.isFinite(d) ? d : undefined };
+}
+
+function clearAuthoredSelection(): void {
+  try {
+    const authoring: any = tryUse("authoring") as any;
+    authoring?.setSelectedAuthored?.([], "replace");
+  } catch { /* optional authoring bridge */ }
+}
+
+function clearFragmentSelection(): void {
+  try {
+    selection.replace({});
+    void selection.applyToHighlighter();
+  } catch { /* */ }
+}
+
+export async function pickFragmentAtPointer(): Promise<{ modelId: string; localId: number; distance?: number } | null> {
+  try {
+    const caster: any = ctx.components.get(OBC.Raycasters).get(ctx.world);
+    return normalizeRaycastResult(await caster.castRay());
+  } catch (err) {
+    console.warn("[selection] fragment raycast failed", err);
+    return null;
+  }
+}
+
+export async function clearHover(): Promise<void> {
+  if (!ctx.highlighter) return;
+  try { await (ctx.highlighter as any).clear("preselect"); } catch { /* */ }
+  hoveredMap = {};
+}
+
+async function updateHover(canvas: HTMLCanvasElement): Promise<void> {
+  if (hoverPending) return;
+  // Yield to transform gizmo — selection preselect/cursor must not block handle grab.
+  try {
+    const gz: any = (ctx.features as any)?.gizmo;
+    if (gz?.isDragging?.() || gz?.isHoveringHandle?.()) {
+      await clearHover();
+      return;
+    }
+  } catch { /* */ }
+  hoverPending = true;
+  try {
+    const caster: any = ctx.components.get(OBC.Raycasters).get(ctx.world);
+    const r: any = await caster.castRay();
+    const localId = r?.localId ?? r?.localIds?.[0] ?? r?.itemId ?? r?.id;
+    const modelId = r?.modelId ?? r?.fragments?.modelId ?? r?.fragments?.[0]?.modelId ?? r?.model?.modelId ?? r?.model?.id;
+    if (typeof localId !== "number" || typeof modelId !== "string" || !ctx.fragments.list.has(modelId)) {
+      await clearHover();
+      return;
+    }
+    // Hover feedback must obey the same category policy as committed picks.
+    if (!(await passesCategoryFilter(modelId, localId))) {
+      await clearHover();
+      return;
+    }
+    const next = { [modelId]: new Set([localId]) };
+    const same = Object.keys(hoveredMap).length === 1 && hoveredMap[modelId]?.size === 1 && hoveredMap[modelId].has(localId);
+    if (same) return;
+    await clearHover();
+    hoveredMap = next;
+    await (ctx.highlighter as any).highlightByID("preselect", next, true, false);
+    void canvas;
+  } catch {
+    await clearHover();
+  } finally {
+    hoverPending = false;
+  }
+}
+
+export function setupClickToSelect(): void {
+  if (clickToSelectInstalled) return;
+  clickToSelectInstalled = true;
+
+  if (!highlighterSyncInstalled) {
+    highlighterSyncInstalled = true;
+    try {
+      const selectEvents = (ctx.highlighter as any)?.events?.select;
+      selectEvents?.onHighlight?.add((map: any) => {
+        const snap: SelectionSnapshot = {};
+        for (const [modelId, ids] of Object.entries(map ?? {})) {
+          const set = ids instanceof Set ? ids : new Set<number>(Array.isArray(ids) ? ids : []);
+          if (set.size) snap[modelId] = new Set(set);
+        }
+        if (Object.keys(snap).length) (selection as any).replace(snap);
+      });
+      selectEvents?.onClear?.add((map: any) => {
+        if (map && Object.keys(map).length) {
+          const snap = selection.snapshot();
+          for (const [modelId, ids] of Object.entries(map)) {
+            const current = snap[modelId];
+            if (!current) continue;
+            for (const id of ids as Set<number>) current.delete(id);
+            if (!current.size) delete snap[modelId];
+          }
+          (selection as any).replace(snap);
+        }
+      });
+    } catch { /* event bridge is optional */ }
+  }
+
+  const canvasForHover = (ctx.world.renderer.three as THREE.WebGLRenderer)?.domElement as HTMLCanvasElement | null;
+  if (canvasForHover) {
+    canvasForHover.addEventListener(
+      "pointermove",
+      (e) => {
+        // Perf gate (core/hover-gate.ts): while any pointer button is held the
+        // camera is being orbited / panned / a box-select or gizmo drag is
+        // running — each hover cast is a full GPU ID-render pass and is pure
+        // waste here. Hover recomputes on the next free move; the stale
+        // preselect highlight is cleared once at drag start.
+        const gate = hoverGate(e.buttons, hoverPending, Object.keys(hoveredMap).length);
+        if (gate.clearStale) void clearHover();
+        if (!gate.pick) return;
+        void updateHover(canvasForHover);
+      },
+      { passive: true },
+    );
+    canvasForHover.addEventListener("pointerleave", () => { void clearHover(); }, { passive: true });
+  }
+
+  let downPos: { x: number; y: number; target: EventTarget | null } | null = null;
+
+  ctx.rightHost.addEventListener(
+    "mousedown",
+    (e) => {
+      if (e.button !== 0) return;
+      downPos = { x: e.clientX, y: e.clientY, target: e.target };
+    },
+    true,
+  );
+
+  ctx.rightHost.addEventListener(
+    "pointerup",
+    async (e) => {
+      const d = downPos;
+      downPos = null;
+      if (e.button !== 0 || !d) return;
+
+      // Ctrl+LeftClick is multi-selection in both 3D and Floor Plan.
+      // box-selection.ts only commits when the pointer actually drags, so a
+      // stationary Ctrl click reaches this handler and adds the element.
+
+      // The click must have started on the raw canvas, not on a floating panel.
+      const canvas = (ctx.world.renderer.three as THREE.WebGLRenderer)?.domElement;
+      if (!canvas || d.target !== canvas) return;
+
+      // Reject drags and gizmo drags.
+      const moved = Math.hypot(e.clientX - d.x, e.clientY - d.y);
+      if (moved > 4) return;
+      if ((ctx.features as any).gizmo?.isDragging?.()) return;
+      if (anyBlockingToolActive()) return;
+
+      // G3: a Tab-cycled candidate owns the click. An authored candidate is
+      // selected by the authoring gesture handler (registered before this
+      // listener, same host), so this handler must not also pick a fragment
+      // underneath it. A fragment candidate replaces the topmost pick below.
+      const cycled3d = hoverPreselectCycle.cycled ? hoverPreselectCycle.current() : null;
+      if (cycled3d?.kind === "authored") return;
+      const cycledFragment = cycled3d?.kind === "fragment" && cycled3d.modelId != null &&
+        cycled3d.localId != null && ctx.fragments.list.has(cycled3d.modelId)
+        ? { modelId: cycled3d.modelId, localId: cycled3d.localId, distance: cycled3d.distance }
+        : null;
+
+      let hit = cycledFragment ?? await pickFragmentAtPointer();
+
+      // Edit-tab "Select Links" OFF → linked federation models are not
+      // selectable (the authored document stays editable).
+      if (hit && !getSelectionPrefs().links) hit = null;
+      // Category filters are applied to the actual pointer pick, not only
+      // bulk Select All. The per-model category map is cached after first use.
+      if (hit && !(await passesCategoryFilter(hit.modelId, hit.localId))) hit = null;
+
+      // Depth arbitration: an authored element (e.g. a converted Native Twin) that is nearer than
+      // the linked-model hit owns the click. The fragment raycaster cannot see authored meshes, so
+      // without this the ray passed through the twin and selected whatever lay behind it.
+      // G3: a Tab-cycled fragment candidate is an explicit user override of
+      // this arbitration — the user already cycled past the nearer authored
+      // element on purpose.
+      if (!cycledFragment) {
+        try {
+          const authoring: any = tryUse("authoring") as any;
+          const ah = authoring?.pickAuthoredHitAt?.(e as MouseEvent) ?? null;
+          if (authoredOwnsClick(ah, hit?.distance ?? null)) return;
+        } catch { /* optional authoring bridge */ }
+      }
+
+      // G10 — the click may have opened the Properties palette between
+      // pointerup and the awaited raycast resolving, shifting the
+      // viewport: the re-picks below then use the stale pointer event
+      // against the moved canvas and miss, and this handler would clear
+      // (or steal for a fragment) the selection the input router has
+      // just made. The router's click handler has already run by now,
+      // so a non-empty authored selection means it owns this plain
+      // click — do not touch it. Modifier clicks keep the old
+      // behaviour: they explicitly multi-select / re-target.
+      const hasModifier = !!(e.ctrlKey || e.metaKey || e.shiftKey || e.altKey);
+      if (!hasModifier) {
+        try {
+          const authoring: any = tryUse("authoring") as any;
+          if ((authoring?.getSelectedIds?.() ?? []).length > 0) return;
+        } catch { /* optional authoring bridge */ }
+      }
+
+      // If the authored-element handler already owns this click, do not let
+      // the fragment selector clear that selection.
+      if (!hit) {
+        // G3: a cycled fragment that no longer passes the pick filters must
+        // not turn the click into a deselect-all.
+        if (cycledFragment) return;
+        try {
+          const authoring: any = tryUse("authoring") as any;
+          const authoredHit = authoring?.pickAuthoredElementAt?.(e as MouseEvent);
+          if (authoredHit) return;
+        } catch { /* optional authoring bridge */ }
+
+        // Empty click — clear unless a modifier is held.
+        await clearHover();
+        if (!e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
+          selection.replace({});
+          await selection.applyToHighlighter();
+          clearAuthoredSelection();
+        }
+        return;
+      }
+
+      await clearHover();
+      // A 3D viewport has one selection set: selecting a linked/fragment
+      // element clears any authored selection, just like BIM.
+      clearAuthoredSelection();
+      selection.applyClick(hit.modelId, hit.localId, {
+        ctrl: e.ctrlKey || e.metaKey,
+        shift: e.shiftKey,
+        alt: e.altKey,
+      });
+      await selection.applyToHighlighter();
+      // G3: the click consumed the Tab cycle — a later click re-picks the top hit.
+      if (cycledFragment) {
+        hoverPreselectCycle.reset();
+        emitTabCycleStatus(null);
+      }
+    },
+    true,
+  );
+
+  console.log("[selection] click-to-select installed");
+}
+
+/** Programmatic pick — returns the element under the last cursor position. */
+export async function pickUnderCursor(): Promise<{ modelId: string; localId: number } | null> {
+  return pickFragmentAtPointer();
+}

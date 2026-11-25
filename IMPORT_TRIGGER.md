@@ -1,1 +1,0 @@
-Trigger the OpenBIMStudio source import workflow. This file is removed from the final imported tree.

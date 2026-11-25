@@ -1,0 +1,429 @@
+/** Universal file opening: converts everything the browser can, guides for the rest. */
+import * as THREE from "three";
+import { ctx } from "../core/context";
+import { computeSceneBounds, fitAll } from "./camera-tools";
+import { loadIfcFiles, loadFragFiles } from "./importer";
+import { markDirty } from "../modules/projects/projects";
+import { uiAlert } from "../core/notify";
+import { safeLoad, LegacyProjectJsonSchema } from "../core/safeLoad";
+import { FILE_LIMITS, guardSize, guardZipDirectory } from "../core/file-guard";
+import { normalizeProjectDoc } from "../modules/projects/project-schema";
+
+export const ACCEPT_ALL =
+  ".ifc,.ifczip,.zip,.frag,.obs.json,.json,.glb,.gltf,.obj,.stl,.ply,.fbx,.dae,.3ds,.rvt,.rfa,.rte,.rft,.dwg,.dxf,.skp,.geojson,.shp,.dbf,.step,.stp,.iges,.igs,.brep,.3dm";
+
+const DESKTOP_ONLY: Record<string, string> = {
+  rvt: "BIM files cannot be converted in the browser.\n\nIn BIM: File → Export → IFC → export the model, then import the .ifc here.",
+  rte: "RVT templates cannot be converted in the browser here.\n\nOpen the template in a BIM authoring application and export a project as IFC.",
+  rft: "RFA family templates cannot be converted in the browser here.\n\nOpen the template in a BIM authoring application and export as IFC.",
+  rfa: "BIM families cannot be converted in the browser.\n\nLoad the family into a BIM project, then export the project as IFC and import it here.",
+  dwg: "DWG cannot be converted in the browser.\n\nIn a desktop drafting application: save as DXF, or export the model as IFC / OBJ, then import here.",
+  skp: "SketchUp files cannot be converted in the browser.\n\nIn SketchUp: File → Export → IFC / OBJ / DAE (3D model), then import here.",
+};
+
+const auxGroup = new THREE.Group();
+const auxIds: string[] = [];
+
+const uid = () => (crypto as any).randomUUID?.() ?? `aux-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+function pickFilesLocal(accept: string, cb: (files: File[]) => void) {
+  const input = document.createElement("input");
+  input.type = "file"; input.accept = accept; input.multiple = true;
+  input.onchange = () => { if (input.files?.length) cb(Array.from(input.files)); };
+  input.click();
+}
+
+function ext(name: string) { return (name.split(".").pop() ?? "").toLowerCase(); }
+
+function download(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 8000);
+}
+
+// ── Aux object lifecycle ──
+export function getAuxBox(): THREE.Box3 | null {
+  if (!auxGroup.children.length) return null;
+  return new THREE.Box3().setFromObject(auxGroup);
+}
+export function getAuxObjects(): THREE.Object3D[] { return auxGroup.children; }
+
+export function clearAux() {
+  while (auxGroup.children.length) {
+    const ch = auxGroup.children[0];
+    auxGroup.remove(ch);
+    ch.traverse((m: any) => {
+      m.geometry?.dispose?.();
+      if (Array.isArray(m.material)) m.material.forEach((x: any) => x.dispose?.());
+      else m.material?.dispose?.();
+    });
+  }
+  auxIds.length = 0;
+}
+
+// ─── BIM-style isometric view ─────────────────────────────────
+// Positions the camera at 45° azimuth, ~35° elevation looking at
+// the scene center. This mimics the default 3D View in BIM.
+function applyBIMIsoView() {
+  try {
+    const cam = (ctx.world.scene as any).camera as THREE.PerspectiveCamera | THREE.OrthographicCamera;
+    const controls = (ctx.world.scene as any).controls;
+    if (!cam) return;
+
+    // Compute bounding box of the scene (or aux group)
+    const target =
+      (typeof getAuxBox === "function" ? getAuxBox() : null) ||
+      (() => {
+        const box = new THREE.Box3();
+        ctx.world.scene.three.children.forEach((c: any) => {
+          if (c.visible) box.expandByObject(c);
+        });
+        return box;
+      })();
+
+    if (!target || target.isEmpty()) return;
+
+    const center = new THREE.Vector3();
+    const size = new THREE.Vector3();
+    target.getCenter(center);
+    target.getSize(size);
+
+    const radius = Math.max(size.x, size.y, size.z) * 0.5 || 10;
+    const dist = radius * 2.4; // pull back a bit for breathing room
+
+    // BIM default 3D view: SE isometric. In a Y-up system this is:
+    // +X to the right, +Z toward viewer, +Y up.
+    // Azimuth 45°, elevation ~35.264° (true isometric).
+    const az = Math.PI / 4;              // 45°
+    const el = Math.atan(1 / Math.SQRT2); // ≈ 35.26°
+
+    const dx = Math.cos(el) * Math.sin(az);
+    const dy = Math.sin(el);
+    const dz = Math.cos(el) * Math.cos(az);
+
+    const camPos = new THREE.Vector3(
+      center.x + dist * dx,
+      center.y + dist * dy,
+      center.z + dist * dz
+    );
+
+    cam.position.copy(camPos);
+    cam.up.set(0, 1, 0);
+    cam.lookAt(center);
+    cam.updateProjectionMatrix();
+
+    if (controls) {
+      (controls as any).target?.copy(center);
+      (controls as any).update?.();
+    }
+
+    // Notify the app that the camera changed (some features listen for this)
+    try { window.dispatchEvent(new CustomEvent("obs:camera-changed")); } catch { /* */ }
+  } catch (err) {
+    console.warn("[file-interop] applyBIMIsoView failed:", err);
+  }
+}
+function addAuxObject(obj: THREE.Object3D, label: string) {
+  obj.name = label;
+  auxGroup.add(obj);
+  // RVT view files carry per-element properties: enable click selection and Native Twin for them.
+  void import("./rvt-view").then((m) => { if (m.hasRVTElements(obj)) { m.installRVTView(); m.syncTwinVisibility(); } }).catch(() => { /* optional */ });
+  computeSceneBounds();
+  fitAll();
+  // Override the default fit view with a BIM-style isometric view
+  setTimeout(() => applyBIMIsoView(), 0);
+  markDirty();
+}
+
+function geometryToMesh(geo: THREE.BufferGeometry, label: string): THREE.Mesh {
+  geo.computeVertexNormals?.();
+  return new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: 0xb9c2cc }));
+}
+
+/** Size bound for a persisted aux blob, by extension (issue #90). These are
+ * the app's own stored blobs, but a corrupt or oversized entry must not DoS
+ * project reopen. DWG/DXF restore goes through readCadFile, which guards. */
+function assertAuxSize(name: string, size: number): void {
+  const kind = /\.geojson$/i.test(name) ? "geojson" : /\.(shp|dbf)$/i.test(name) ? "shapefile"
+    : /\.(step|stp|iges|igs|brep|brp|3dm)$/i.test(name) ? "solid" : "mesh";
+  const r = guardSize(kind, size);
+  if (!r.ok) throw new Error(`"${name}": ${r.reason} The stored file was not restored.`);
+}
+
+/** Re-load a persisted aux blob (called by projects.openProject). */
+export async function restoreAux(blob: Blob, name: string, modelId?: string) {
+  if (/\.(dwg|dxf)$/i.test(name)) {
+    const m = await import("../modules/cad-link");
+    m.setupCadLinks();
+    await m.restoreCadLinkFromBlob(blob, name, modelId);
+    return;
+  }
+  assertAuxSize(name, blob.size);
+  const buf = await blob.arrayBuffer();
+  if (/\.(geojson|shp)$/i.test(name)) {
+    const { openGis } = await import("./gis-import");
+    const r = openGis(buf, name);
+    if (r.object) addAuxObject(r.object, name);
+    return;
+  }
+  if (/\.(step|stp|iges|igs|brep|brp|3dm)$/i.test(name)) {
+    const { openSolid } = await import("./solid-import");
+    const r = await openSolid(buf, name);
+    if (r.object) addAuxObject(r.object, name);
+    return;
+  }
+  const obj = await parseModelBytes(buf, name);
+  if (obj) addAuxObject(obj, name);
+}
+
+async function parseModelBytes(buf: ArrayBuffer, name: string): Promise<THREE.Object3D | null> {
+  const e = ext(name);
+  try {
+    if (e === "glb" || e === "gltf") {
+      const { GLTFLoader } = await import("three/examples/jsm/loaders/GLTFLoader.js");
+      const gltf = await new GLTFLoader().parseAsync(buf, "");
+      return gltf.scene;
+    }
+    if (e === "obj") {
+      const { OBJLoader } = await import("three/examples/jsm/loaders/OBJLoader.js");
+      return new OBJLoader().parse(new TextDecoder().decode(buf));
+    }
+    if (e === "stl") {
+      const { STLLoader } = await import("three/examples/jsm/loaders/STLLoader.js");
+      return geometryToMesh(new STLLoader().parse(buf), name);
+    }
+    if (e === "ply") {
+      const { PLYLoader } = await import("three/examples/jsm/loaders/PLYLoader.js");
+      return geometryToMesh(new PLYLoader().parse(buf), name);
+    }
+    if (e === "fbx") {
+      const { FBXLoader } = await import("three/examples/jsm/loaders/FBXLoader.js");
+      return new FBXLoader().parse(buf, "");
+    }
+    if (e === "dae") {
+      const { ColladaLoader } = await import("three/examples/jsm/loaders/ColladaLoader.js");
+      const collada = new ColladaLoader().parse(new TextDecoder().decode(buf), "");
+      return collada.scene;
+    }
+    if (e === "3ds") {
+      const { TDSLoader } = await import("three/examples/jsm/loaders/TDSLoader.js");
+      return new TDSLoader().parse(buf, "");
+    }
+  } catch (err: any) {
+    uiAlert(`Could not parse "${name}":\n${err?.message ?? err}\n\nTip: .glb (binary, single file) is the most reliable mesh format.`);
+  }
+  return null;
+}
+
+// ── Router ──
+export async function importFiles(files: File[]) {
+  // Batch pass: several files of one linkable kind are handled together (one dialog / one summary), then skipped below.
+  const handled = new Set<File>();
+  const group = (re: RegExp) => files.filter((f) => re.test(f.name));
+  const cadBatch = group(/\.(dwg|dxf)$/i);
+  if (cadBatch.length > 1) {
+    cadBatch.forEach((f) => handled.add(f));
+    try { const m = await import("../modules/cad-link"); m.setupCadLinks(); await m.linkCadFilesBatch(cadBatch); }
+    catch (err: any) { console.error("[file-interop]", err); uiAlert(`Failed to link drawing files:\n${err?.message ?? err}`); }
+  }
+  const rvtBatch = group(/\.(rvt|rfa|rte|rft)$/i);
+  if (rvtBatch.length > 1) {
+    try {
+      const { openRVTFiles, rvtDecoderAvailable } = await import("./rvt-viewer");
+      if (await rvtDecoderAvailable()) { rvtBatch.forEach((f) => handled.add(f)); await openRVTFiles(rvtBatch); }
+    } catch (err: any) { console.error("[file-interop]", err); }
+  }
+  const ifcBatch = group(/\.ifc$/i);
+  if (ifcBatch.length > 1) { ifcBatch.forEach((f) => handled.add(f)); loadIfcFiles(ifcBatch); }
+
+  for (const file of files) {
+    if (handled.has(file)) continue;
+    const e = ext(file.name);
+    try {
+      if (e === "ifc") { loadIfcFiles([file]); continue; }
+      if (e === "frag") { loadFragFiles([file]); continue; }
+
+      if (e === "ifczip" || (e === "zip" && /\.ifczip$|\.zip$/i.test(file.name))) {
+        // Same ZIP discipline as expandIfcSources (issue #90): size bound
+        // before the read, central-directory audit (entry count, declared
+        // sizes, compression ratio, unsafe paths) before JSZip inflates
+        // anything. Previously this branch called JSZip.loadAsync(file)
+        // with no guard at all — a zip bomb or traversal archive went
+        // straight into the inflater.
+        const zipSize = guardSize("ifc", file.size);
+        if (!zipSize.ok) throw new Error(`"${file.name}": ${zipSize.reason} The file was not opened and your project is unchanged.`);
+        const zipBytes = new Uint8Array(await file.arrayBuffer());
+        const zipGuard = guardZipDirectory(zipBytes);
+        if (!zipGuard.ok) throw new Error(`"${file.name}": ${zipGuard.reason} The file was not opened and your project is unchanged.`);
+        const JSZip = (await import("jszip")).default;
+        const zip = await JSZip.loadAsync(zipBytes);
+        const ifcPaths: string[] = [];
+        zip.forEach((p) => { if (/\.ifc$/i.test(p)) ifcPaths.push(p); });
+        if (!ifcPaths.length) { uiAlert(`No .ifc entries inside "${file.name}".`); continue; }
+        const converted: File[] = [];
+        for (const p of ifcPaths) {
+          const bytes = await zip.file(p)!.async("uint8array");
+          if (bytes.byteLength > FILE_LIMITS.ifc) throw new Error(`"${p}" inside "${file.name}" exceeds the ${FILE_LIMITS.ifc / 1024 / 1024} MB IFC limit.`);
+          converted.push(new File([bytes as any], p.split("/").pop() || `from-${file.name}.ifc`));
+        }
+        loadIfcFiles(converted);
+        continue;
+      }
+
+      if (file.name.endsWith(".obs.json") || e === "json") {
+        if (file.size > 20 * 1024 * 1024) throw new Error("Project JSON exceeds the 20 MB import limit.");
+        const text = await file.text();
+        if (file.name.endsWith(".obs.json") || (text.includes("\"elements\"") && text.includes("\"models\""))) {
+          const { putProject } = await import("../modules/projects/store");
+          const { openProject } = await import("../modules/projects/projects");
+          const loaded = safeLoad("legacy project JSON", text, LegacyProjectJsonSchema, 20 * 1024 * 1024,
+            { maxDepth: 64, maxNodes: 2_000_000 });
+          if (loaded.ok) {
+            // The permissive JSON boundary only proves that the root is an
+            // object. Normalize the complete legacy document before it can
+            // touch IndexedDB or replace the active project. This preserves
+            // backward-compatible migrations while making malformed imports
+            // fail closed and state-preserving.
+            const normalized = normalizeProjectDoc(loaded.value);
+            if (!normalized.ok) {
+              throw new Error(`Not a valid Open BIM Studio project file: ${normalized.fatal}`);
+            }
+            const doc = normalized.doc;
+            await putProject(doc);
+            await openProject(doc.id);
+            continue;
+          }
+          const failure = loaded as { ok: false; error: { stage: string; issues: string[] } };
+          throw new Error(`Invalid project JSON (${failure.error.stage}): ${failure.error.issues.join("; ")}`);
+        }
+      }
+
+      if (e === "dwg" || e === "dxf") {
+        const m = await import("../modules/cad-link");
+        m.setupCadLinks();
+        await m.linkCadFileInteractive(file);
+        continue;
+      }
+
+      if (e === "rvt" || e === "rfa" || e === "rte" || e === "rft") {
+        // View-only, decoded in the browser by the rvt-rs WebAssembly reader (docs/RVT-VIEWER.md).
+        const { openRVTFile, rvtDecoderAvailable } = await import("./rvt-viewer");
+        if (await rvtDecoderAvailable()) { await openRVTFile(file); continue; }
+      }
+
+      if (e === "geojson" || e === "shp") {
+        // Site context (GeoJSON / Shapefile): flat overlay, see docs/COMPATIBILITY.md. A .dbf with the same base name is picked up for attributes.
+        // Size bound before the read (issue #90): GeoJSON is JSON.parsed via
+        // safeLoad in gis-core (20 MB / depth 32 / 2M nodes); shapefiles are
+        // binary record streams with their own 5M-vertex cap.
+        const gisSize = guardSize(e === "geojson" ? "geojson" : "shapefile", file.size);
+        if (!gisSize.ok) throw new Error(`"${file.name}": ${gisSize.reason} The file was not opened and your project is unchanged.`);
+        const { openGis } = await import("./gis-import");
+        const base = file.name.replace(/\.[^.]+$/, "").toLowerCase();
+        const sib = e === "shp" ? files.find((f) => ext(f.name) === "dbf" && f.name.replace(/\.[^.]+$/, "").toLowerCase() === base) : undefined;
+        if (sib) {
+          const dbfSize = guardSize("shapefile", sib.size);
+          if (!dbfSize.ok) throw new Error(`"${sib.name}": ${dbfSize.reason} The file was not opened and your project is unchanged.`);
+        }
+        const buf = await file.arrayBuffer();
+        const r = openGis(buf, file.name, sib ? await sib.arrayBuffer() : undefined);
+        if (r.object) {
+          addAuxObject(r.object, file.name);
+          (ctx.features.projects as any)?.onModelImported?.(`aux-${uid()}`, file.name, new Uint8Array(buf));
+        }
+        uiAlert(r.message);
+        continue;
+      }
+      if (e === "step" || e === "stp" || e === "iges" || e === "igs" || e === "brep" || e === "brp" || e === "3dm") {
+        // Tessellated view of solid models via vendored WebAssembly readers (docs/COMPATIBILITY.md).
+        // Size bound before the read (issue #90); openSolid re-checks the
+        // buffer length (200 MB) and the reader worker runs isolated with a
+        // 180 s timeout.
+        const solidSize = guardSize("solid", file.size);
+        if (!solidSize.ok) throw new Error(`"${file.name}": ${solidSize.reason} The file was not opened and your project is unchanged.`);
+        const { openSolid } = await import("./solid-import");
+        const buf = await file.arrayBuffer();
+        const r = await openSolid(buf, file.name);
+        if (r.object) {
+          addAuxObject(r.object, file.name);
+          (ctx.features.projects as any)?.onModelImported?.(`aux-${uid()}`, file.name, new Uint8Array(buf));
+        }
+        uiAlert(r.message);
+        continue;
+      }
+      if (e === "dbf" || e === "shx" || e === "prj" || e === "cpg") {
+        if (files.some((f) => ext(f.name) === "shp")) continue; // companion of a shapefile opened in the same batch
+        uiAlert(`".${e}" is a shapefile companion file. Open the .shp (optionally together with its .dbf) instead.`);
+        continue;
+      }
+
+      if (DESKTOP_ONLY[e]) { uiAlert(DESKTOP_ONLY[e]); continue; }
+
+      // Everything else → try as a 3D model (glb/gltf/obj/stl/ply/fbx/dae/3ds).
+      // Size bound before the read (issue #90): the three.js loaders parse
+      // the whole file on the main thread with no limit of their own.
+      const meshSize = guardSize("mesh", file.size);
+      if (!meshSize.ok) throw new Error(`"${file.name}": ${meshSize.reason} The file was not opened and your project is unchanged.`);
+      const buf = await file.arrayBuffer();
+      const obj = await parseModelBytes(buf, file.name);
+      if (obj) {
+        addAuxObject(obj, file.name);
+        const bytes = new Uint8Array(buf);
+        (ctx.features.projects as any)?.onModelImported?.(`aux-${uid()}`, file.name, bytes);
+      } else {
+        uiAlert(`Unsupported file type: "${file.name}"\n\nSupported: ${ACCEPT_ALL}\n\n${Object.entries(DESKTOP_ONLY).map(([k, v]) => `.${k}: ${v.split("\n")[0]}`).join("\n")}`);
+      }
+    } catch (err: any) {
+      console.error("[file-interop]", err);
+      uiAlert(`Failed to open "${file.name}":\n${err?.message ?? err}`);
+    }
+  }
+}
+
+export function pickAndImport() { pickFilesLocal(ACCEPT_ALL, importFiles); }
+
+// ── Setup ──
+export function setupFileInterop() {
+  ctx.world.scene.three.add(auxGroup);
+  ctx.features.fileInterop = {
+    importFiles, pickAndImport, ACCEPT_ALL,
+    getAuxBox, getAuxObjects, clearAux, restoreAux,
+  };
+
+  // --- Autodesk dialog event bridge --------------------------------
+  // The "Import from Autodesk Viewer" dialog dispatches a CustomEvent
+  // after a file drop. We catch it here and route it into importFiles().
+  const dialogDropHandler = (evt: Event) => {
+    const detail = (evt as CustomEvent<{ file?: File; blob?: Blob; name?: string }>).detail || {};
+    const candidates: File[] = [];
+    if (detail.file instanceof File) candidates.push(detail.file);
+    if (detail.blob instanceof Blob) {
+      const n = detail.name || "imported.glb";
+      candidates.push(new File([detail.blob], n));
+    }
+    const evtAny = evt as any;
+    if (evtAny.file instanceof File) candidates.push(evtAny.file);
+
+    if (candidates.length) {
+      void importFiles(candidates);
+    } else {
+      console.warn("[file-interop] dialog event had no usable file:", evt);
+    }
+  };
+
+  const EVENT_NAMES = [
+    "openbimstudio:load-geometry",
+    "openbimstudio:load-glb",
+    "openbimstudio:load-file",
+    "obs:load-geometry",
+    "obs:load-glb",
+    "obs:load-file",
+    "obs:import-file",
+  ];
+  for (const n of EVENT_NAMES) {
+    window.addEventListener(n, dialogDropHandler as EventListener);
+  }
+  console.log("[file-interop] Autodesk dialog bridge installed.");
+}

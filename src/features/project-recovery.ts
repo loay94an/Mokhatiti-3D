@@ -1,0 +1,325 @@
+/**
+ * Recovery checkpoints UI — makes the project journal (10 retained
+ * pre-save snapshots with archived model payloads) reachable from the app.
+ *
+ * Entry points:
+ *   - File → Recovery checkpoints…
+ *   - command palette: "project.recovery"
+ *   - the boot banner shown when the previous session ended without a
+ *     clean save (obs:recovery-available, dispatched by persistence.ts).
+ *
+ * Restore semantics live in the store: the current document + payloads are
+ * snapshotted first ("before-restore"), so a restore is itself reversible.
+ */
+import {
+  listProjectRecoverySnapshots, restoreProjectRecoverySnapshot,
+  getCurrentProject, openProject,
+} from "../modules/projects/projects";
+import type { ProjectRecoverySnapshot, QuarantinedCheckpointSummary } from "../modules/projects/project-journal";
+import { listBrowserRecoveryCopies, BROWSER_RECOVERY_KEEP } from "../modules/projects/browser-recovery";
+import { readCrashMarker } from "../modules/projects/persistence";
+import type { CrashRecoverySummary } from "../modules/projects/journal-recovery";
+import { confirmDialog } from "./form-modal";
+import { notify as toast } from "../core/notify";
+import { fmtDateTime } from "../core/region";
+import { escapeHtml as esc } from "../core/html-escape";
+
+const REASON_LABEL: Record<string, string> = {
+  "project-save": "before an overwrite",
+  "model-import": "before a model import",
+  "before-restore": "before a restore",
+  "manual-version": "manual version",
+};
+
+let bannerShown = false;
+/** Set when the user deliberately dismisses the banner — the outcome must not resurrect it. */
+let bannerDismissedByUser = false;
+/** The auto-dismiss timer, so the outcome can restart the 30 s clock. */
+let bannerDismissTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Restart the 30 s auto-dismiss clock for the given banner. */
+function scheduleBannerDismiss(banner: HTMLElement): void {
+  if (bannerDismissTimer !== undefined) clearTimeout(bannerDismissTimer);
+  bannerDismissTimer = setTimeout(() => { if (banner.isConnected) banner.remove(); }, 30_000);
+}
+
+/** Build the banner element (no latch, no timer — the callers own those). */
+function createRecoveryBanner(): HTMLDivElement {
+  const id = "obs-recovery-banner";
+  document.getElementById(id)?.remove();
+  const banner = document.createElement("div");
+  banner.id = id;
+  banner.style.cssText =
+    "position:fixed;right:16px;bottom:52px;z-index:9000;max-width:420px;" +
+    "background:var(--bg-floating,#1c1e28);color:var(--text-primary,#e8eaf0);" +
+    "border:1px solid var(--warning,#f59e0b);border-inline-start:3px solid var(--warning,#f59e0b);" +
+    "border-radius:6px;padding:12px 14px;font:12px/1.5 system-ui,sans-serif;" +
+    "box-shadow:0 12px 32px rgba(0,0,0,.45)";
+  banner.innerHTML =
+    `<div style="font-weight:700;margin-bottom:6px;color:var(--warning,#f59e0b)">⚠ Previous session ended without a clean save</div>` +
+    `<div style="font-size:11px;opacity:.85;margin-bottom:8px">Autosaved checkpoints of your project are available. Open a project first, then restore one.</div>` +
+    `<div data-recovery-outcome style="font-size:11px;opacity:.85;margin-bottom:8px">Checking the journal for unsaved work…</div>`;
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;gap:8px";
+  const open = document.createElement("button");
+  open.textContent = "How to recover";
+  open.style.cssText = "padding:4px 12px;background:var(--bg-hover,#232633);color:inherit;border:1px solid var(--border-default,#2a2e3a);border-radius:4px;cursor:pointer;font-size:11px";
+  open.onclick = () => {
+    bannerDismissedByUser = true;
+    banner.remove();
+    void confirmDialog("Recovering unsaved work",
+      "1. Open the affected project (File → Open Project…).\n" +
+      "2. Choose File → Recovery checkpoints… — every checkpoint lists what it contains.\n" +
+      "3. Restore: your current state is kept as a checkpoint first, so restoring is reversible.");
+  };
+  row.appendChild(open);
+  const close = document.createElement("button");
+  close.textContent = "Dismiss";
+  close.style.cssText = "padding:4px 12px;background:var(--bg-hover,#232633);color:inherit;border:1px solid var(--border-default,#2a2e3a);border-radius:4px;cursor:pointer;font-size:11px";
+  close.onclick = () => { bannerDismissedByUser = true; banner.remove(); };
+  row.appendChild(close);
+  banner.appendChild(row);
+  document.body.appendChild(banner);
+  return banner;
+}
+
+/** Dismissible banner after an unclean shutdown (once per page load). */
+function showRecoveryBanner(): void {
+  if (bannerShown) return;
+  bannerShown = true;
+  scheduleBannerDismiss(createRecoveryBanner());
+}
+
+/**
+ * Fill in the journal-replay outcome once boot recovery has run (#101).
+ * The banner is shown before recovery runs (it is the crash notice), so
+ * the outcome line starts as "Checking…" and is replaced here with what
+ * actually happened — never a claim of full recovery when it was partial.
+ * Also exposed as data attributes so the browser spec can assert the
+ * outcome without parsing prose.
+ *
+ * Rank 4: the banner's 30 s auto-dismiss starts at creation, but the
+ * outcome only arrives at the end of boot (main.ts step
+ * "project-crash-recovery"). On a slow boot the banner was already gone
+ * when the outcome landed and this function silently no-opped — the user
+ * never learned what was recovered. So if the banner is gone (and the
+ * user did not deliberately dismiss it), re-create it here and restart
+ * the 30 s clock from the outcome, not from mid-boot creation.
+ */
+export function updateRecoveryBanner(summary: CrashRecoverySummary): void {
+  let banner: HTMLElement | null = document.getElementById("obs-recovery-banner");
+  if (!banner) {
+    if (bannerDismissedByUser) return;
+    banner = createRecoveryBanner();
+  }
+  scheduleBannerDismiss(banner);
+  banner.dataset.recoveryStatus = summary.status;
+  banner.dataset.replayedCount = String(summary.appliedSeqs.length);
+  banner.dataset.quarantinedCount = String(summary.quarantined.length);
+  banner.dataset.restoredFrom = summary.restoredFrom;
+  const line = banner.querySelector("[data-recovery-outcome]");
+  if (!line) return;
+  const n = summary.appliedSeqs.length;
+  const q = summary.quarantined.length;
+  if (summary.status === "full") {
+    line.textContent = `Journal replay recovered ${n} change${n === 1 ? "" : "s"} (up to entry #${summary.lastAppliedSeq}) — your work is back.`;
+  } else if (summary.status === "partial") {
+    line.textContent = n > 0
+      ? `Journal replay recovered up to entry #${summary.lastAppliedSeq}; ${q} damaged ${q === 1 ? "entry was" : "entries were"} set aside (quarantined), not silently dropped.`
+      : `No journal entries could be replayed; ${q} damaged ${q === 1 ? "entry was" : "entries were"} set aside (quarantined). The last saved project was opened instead.`;
+  } else if (summary.status === "deleted") {
+    line.textContent = "The journal shows this project was deleted before the crash — nothing was restored.";
+  } else {
+    line.textContent = summary.journalAbsent
+      ? "No journal entries to replay — opened the last saved project."
+      : "Nothing to replay from the journal — opened the last saved project.";
+  }
+}
+
+function rowLabel(s: ProjectRecoverySnapshot): string {
+  const parts = [
+    `${s.elementCount} element${s.elementCount === 1 ? "" : "s"}`,
+    `${s.modelCount} model${s.modelCount === 1 ? "" : "s"}`,
+  ];
+  if (s.missingModelCount > 0) parts.push(`${s.missingModelCount} model payload(s) missing from that checkpoint`);
+  return parts.join(" · ");
+}
+
+/** Modal listing retained recovery checkpoints for the open project. */
+export function showProjectRecovery(): void {
+  const cur = getCurrentProject();
+  if (!cur) { toast("warn", "Open or create a project first — checkpoints are listed per project."); return; }
+
+  const overlay = document.createElement("div");
+  overlay.style.cssText = "position:fixed;inset:0;z-index:9100;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center";
+  const card = document.createElement("div");
+  card.style.cssText = "background:#1b1c26;border:1px solid #34353f;border-radius:10px;padding:16px;width:520px;max-width:92vw;max-height:80vh;overflow:auto;color:#e2e8f0;font:12px system-ui,sans-serif";
+  card.innerHTML =
+    `<div style="font-weight:700;font-size:14px;margin-bottom:2px">🛟 Recovery checkpoints</div>` +
+    `<div style="opacity:.6;margin-bottom:10px">Project “${esc(cur.name)}” · the current state is always kept as a checkpoint before any restore.</div>`;
+  const list = document.createElement("div");
+  list.textContent = "Loading checkpoints…";
+  list.style.cssText = "display:flex;flex-direction:column;gap:6px";
+  card.appendChild(list);
+
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "Close";
+  closeBtn.style.cssText = "margin-top:12px;padding:6px 14px;background:#24252f;color:inherit;border:1px solid #34353f;border-radius:6px;cursor:pointer;font-size:12px";
+  closeBtn.onclick = () => overlay.remove();
+  card.appendChild(closeBtn);
+  overlay.appendChild(card);
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+
+  void (async () => {
+    let snapshots: ProjectRecoverySnapshot[] = [];
+    let quarantined: QuarantinedCheckpointSummary[] = [];
+    try {
+      const listed = await listProjectRecoverySnapshots();
+      snapshots = listed.snapshots;
+      quarantined = listed.quarantined;
+    }
+    catch (e) {
+      list.textContent = "Could not read the recovery journal — see the console for details.";
+      console.error("[project-recovery] listing failed", e);
+      return;
+    }
+    list.innerHTML = "";
+    // Damaged checkpoints are set aside, never silently dropped and
+    // never offered as restorable: the notice names them, and the
+    // newest good checkpoint below is the last known-good offer.
+    if (quarantined.length) {
+      const notice = document.createElement("div");
+      notice.setAttribute("data-quarantined-notice", String(quarantined.length));
+      notice.style.cssText = "padding:9px 10px;border:1px solid #6b4d16;border-radius:8px;background:#2a2113;color:#f5c86b;font-size:11px";
+      notice.textContent = `${quarantined.length} checkpoint${quarantined.length === 1 ? " was" : "s were"} damaged and ${quarantined.length === 1 ? "has" : "have"} been set aside (quarantined) — kept as evidence, not deleted. The newest good checkpoint below is the last known-good state.`;
+      list.appendChild(notice);
+      for (const q of quarantined) {
+        const qrow = document.createElement("div");
+        qrow.setAttribute("data-quarantined-checkpoint", String(q.id));
+        qrow.style.cssText = "display:flex;align-items:center;gap:10px;padding:9px 10px;border:1px solid #2a2e3a;border-radius:8px;background:#17181f;opacity:.65";
+        const qinfo = document.createElement("div");
+        qinfo.style.cssText = "flex:1;min-width:0";
+        qinfo.innerHTML =
+          `<div style="font-weight:600">Damaged checkpoint — set aside</div>` +
+          `<div style="opacity:.7;font-size:11px;margin-top:2px">${esc(fmtDateTime(q.createdAt))} · ${esc(q.reason)}</div>`;
+        qrow.appendChild(qinfo);
+        list.appendChild(qrow);
+      }
+    }
+    if (!snapshots.length) {
+      list.innerHTML += `<div style="opacity:.6;padding:10px;border:1px dashed #34353f;border-radius:6px">No journal checkpoints yet. One is written automatically before each save that changes the document, before each model import, and before each restore.</div>`;
+    }
+    for (const s of snapshots) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:10px;padding:9px 10px;border:1px solid #2a2e3a;border-radius:8px;background:#20222d";
+      const info = document.createElement("div");
+      info.style.cssText = "flex:1;min-width:0";
+      info.innerHTML =
+        `<div style="font-weight:600">${esc(fmtDateTime(s.createdAt))} <span style="opacity:.55;font-weight:400">· ${esc(REASON_LABEL[s.reason] ?? s.reason)}${s.label ? ` — “${esc(s.label)}”` : ""}</span></div>` +
+        `<div style="opacity:.7;font-size:11px;margin-top:2px">${esc(rowLabel(s))}</div>`;
+      row.appendChild(info);
+      const btn = document.createElement("button");
+      btn.textContent = "Restore";
+      btn.style.cssText = "padding:5px 12px;background:#2b3a55;color:#cfe1ff;border:1px solid #3b5578;border-radius:5px;cursor:pointer;font-size:11px;white-space:nowrap";
+      btn.onclick = () => {
+        void (async () => {
+          const ok = await confirmDialog("Restore this checkpoint?",
+            `The project will be rolled back to the state from ${fmtDateTime(s.createdAt)} (${rowLabel(s)}).\n\n` +
+            `The CURRENT state is saved as a new checkpoint first, so this can be undone.`);
+          if (!ok) return;
+          btn.disabled = true;
+          btn.textContent = "Restoring…";
+          try {
+            const result = await restoreProjectRecoverySnapshot(s.id);
+            if (!result.restored) {
+              if (result.quarantined) {
+                toast("error", `That checkpoint was damaged and has been set aside — your current state was not touched. (${result.refusedReason ?? "validation failed"})`);
+              } else {
+                toast("error", "Checkpoint could not be restored (no longer retained).");
+              }
+              btn.disabled = false; btn.textContent = "Restore";
+              return;
+            }
+            overlay.remove();
+            const missing = result.missingModelIds.length
+              ? ` ${result.missingModelIds.length} model payload(s) were not in that checkpoint and show as missing.`
+              : "";
+            toast("success", `Checkpoint restored.${missing} Reloading the scene…`);
+            await openProject(getCurrentProject()!.id);
+          } catch (e) {
+            console.error("[project-recovery] restore failed", e);
+            toast("error", `Restore failed: ${e instanceof Error ? e.message : e}`);
+            btn.disabled = false; btn.textContent = "Restore";
+          }
+        })();
+      };
+      row.appendChild(btn);
+      list.appendChild(row);
+    }
+
+    // Linked .obsproj browser backups (File System Access / Save As path)
+    const fileBackups = await listBrowserRecoveryCopies(cur.id);
+    const sep = document.createElement("div");
+    sep.style.cssText = "margin-top:12px;padding-top:10px;border-top:1px solid #34353f;font-weight:600;font-size:12px";
+    sep.textContent = `File backups in this browser (newest ${BROWSER_RECOVERY_KEEP})`;
+    list.appendChild(sep);
+    if (!fileBackups.length) {
+      const empty = document.createElement("div");
+      empty.style.cssText = "opacity:.6;padding:8px 0;font-size:11px";
+      empty.textContent = "No .obsproj recovery copies yet. They are written before overwriting a linked project file (Save).";
+      list.appendChild(empty);
+    } else {
+      for (const b of fileBackups) {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid #34353f;border-radius:6px;background:#12131a";
+        const meta = document.createElement("div");
+        meta.style.cssText = "flex:1;min-width:0";
+        const when = fmtDateTime(b.createdAt);
+        const kb = Math.max(1, Math.round(b.blob.size / 1024));
+        meta.innerHTML = `<div style="font-weight:600">${esc(b.fileName)}</div>` +
+          `<div style="opacity:.65;font-size:11px">${esc(when)} · ${kb} KB · ${esc(b.reason)}</div>`;
+        const dl = document.createElement("button");
+        dl.textContent = "Download";
+        dl.style.cssText = "padding:5px 10px;background:#2a2b36;color:inherit;border:1px solid #454655;border-radius:6px;cursor:pointer;font-size:11px;flex:none";
+        dl.onclick = () => {
+          const url = URL.createObjectURL(b.blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = b.fileName || "project-recovery.obsproj";
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+        };
+        row.appendChild(meta);
+        row.appendChild(dl);
+        list.appendChild(row);
+      }
+    }
+  })();
+}
+
+export function setupProjectRecovery(): void {
+  window.addEventListener("obs:recovery-available", () => showRecoveryBanner());
+  // #101: boot recovery (main.ts) reports its outcome after the banner is
+  // already up; fill in the honest result (full / partial / none).
+  window.addEventListener("obs:recovery-replayed", (event) => {
+    try { updateRecoveryBanner((event as CustomEvent<CrashRecoverySummary>).detail); } catch { /* best-effort */ }
+  });
+  // Boot-ordering guard (#91): the persistence step runs BEFORE this one
+  // in main.ts, so it dispatches `obs:recovery-available` before this
+  // listener exists — without this check the banner would never appear
+  // after a real crash, and the (auto-dismissing) toast would be the
+  // only notice. Check for a pending crash marker at setup time too.
+  try {
+    if (readCrashMarker()) showRecoveryBanner();
+  } catch { /* marker unreadable: no banner, boot continues */ }
+  void import("./command-palette").then(({ registerCommand }) => {
+    registerCommand({
+      id: "project.recovery",
+      label: "Recovery checkpoints",
+      category: "Project",
+      hint: "Restore an earlier state of the open project",
+      run: () => showProjectRecovery(),
+    });
+  }).catch((e) => console.warn("[project-recovery] command registration failed", e));
+}

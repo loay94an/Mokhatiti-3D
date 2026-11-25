@@ -1,0 +1,25 @@
+{
+  "standards": {
+    "title": "Normas"
+  },
+  "meta": {
+    "name": "Portuguese (Brazil)",
+    "nativeName": "Português (Brasil)",
+    "dir": "ltr"
+  },
+  "app": {
+    "name": "Open BIM Studio",
+    "loading": "Carregando…",
+    "ready": "Pronto",
+    "cancel": "Cancelar",
+    "close": "Fechar",
+    "save": "Salvar",
+    "delete": "Excluir"
+  },
+  "counts": {
+    "elements": "{n, plural, one{# elemento} other{# elementos}}",
+    "selected": "{n, plural, one{# selecionado} other{# selecionados}}",
+    "authoredSelected": "{n, plural, one{# elemento criado selecionado} other{# elementos criados selecionados}}",
+    "clashes": "{n, plural, one{# conflito encontrado.} other{# conflitos encontrados.}}"
+  }
+}

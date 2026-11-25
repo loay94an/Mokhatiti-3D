@@ -1,0 +1,1941 @@
+import { preflightStep, parseStepHeader } from "../modules/ifc-semantics/step-preflight";
+import { assertValidStepPreflightResult, assertValidStepFileHeader } from "../core/safeLoad";
+import { assertFileAllowed, guardSize, guardZipDirectory } from "../core/file-guard";
+import { getCachedFrag, setCachedFrag, hashFileKey } from "./rvt-trust-gates";
+/**
+ * IFC importer with 5 BIM-style positioning modes + live offset control.
+ *
+ * Position pinning
+ * ────────────────
+ * Fragments sets `matrixAutoUpdate = false` on loaded models. The pin loop
+ * forces it true, writes position, and calls updateMatrix + updateMatrixWorld
+ * inside renderer.render so the SDK's auto-coordinator cannot shift models.
+ *
+ * Offsets
+ * ───────
+ * Each model has an "offset" (its world position). Default is (0,0,0).
+ * The alignment panel writes offsets; the pin loop enforces them forever.
+ */
+import * as THREE from "three";
+import * as FRAGS from "@thatopen/fragments";
+import * as WEBIFC from "web-ifc";
+import { ctx } from "../core/context";
+import {
+  computeSceneBounds, fitAll,
+  recenterSceneNow, resetOffsets, setRecenterEnabled,
+} from "./camera-tools";
+import { refreshModelSelectionUI } from "./clash";
+import { uiAlert } from "../core/notify";
+import { fmtNumber } from "../core/region";
+import { pauseRenderLoop } from "../core/renderer-lifecycle";
+
+// Injected by vite.config.ts (define) from node_modules/web-ifc/package.json.
+// The WASM is served from /web-ifc/<version>/ so a build can never be paired
+// with stale cached WASM bytes (service-worker precache / HTTP cache).
+declare const __WEB_IFC_VERSION__: string | undefined;
+
+export type PositioningMode =
+  | "origin-to-origin"
+  | "shared-coordinates"
+  | "center-to-center"
+  | "project-base-to-project-base"
+  | "manual";
+
+export interface PositioningModeInfo {
+  id: PositioningMode;
+  label: string;
+  description: string;
+}
+
+export const POSITIONING_MODES: PositioningModeInfo[] = [
+  {
+    id: "origin-to-origin",
+    label: "Origin to Origin",
+    description:
+      "Both files at (0,0,0). Works when the IFC were exported with Project Base Point positioning — geometry carries the shared offsets.",
+  },
+  {
+    id: "shared-coordinates",
+    label: "By Shared Coordinates",
+    description:
+      "Both files at (0,0,0). Same as origin-to-origin, but for IFC exported with Shared Coordinates (Survey Point).",
+  },
+  {
+    id: "center-to-center",
+    label: "Center to Center",
+    description:
+      "Aligns visible bounding box centers. Always stacks the models visually — use when files have different internal origins.",
+  },
+  {
+    id: "project-base-to-project-base",
+    label: "Project Base to Project Base",
+    description:
+      "Re-anchors each model's Project Base Point onto (0,0,0). Requires the IFC to carry PBP metadata.",
+  },
+  {
+    id: "manual",
+    label: "Manual",
+    description:
+      "No automatic placement. Drag models with the transform gizmo, or use the alignment panel.",
+  },
+];
+
+// ── Types ──
+type ImportStatus =
+  | "queued" | "reading" | "converting" | "loading"
+  | "done" | "failed" | "cancelled" | "skipped";
+
+import { buildInteropReport, formatInteropReport, type IfcInteropReport } from "../modules/ifc-semantics/interop-report";
+import { buildImportFidelityReport } from "../modules/ifc-semantics/per-entity-report";
+import {
+  computeImportTimeoutMs,
+  IFC_IMPORT_STALL_MS_DEFAULT,
+  IFC_IMPORT_TOTAL_MS_MIN,
+  IFC_IMPORT_STALL_MS_MIN,
+  IfcImportTimeoutError,
+  ImportTimeout,
+} from "../modules/ifc-semantics/import-timeout";
+
+/**
+ * Attach the per-entity fidelity report (#106) to an inventory report.
+ * Best-effort and isolated: a fidelity failure must never take down the
+ * inventory or the import — the semantic-model pass is a second, heavier
+ * parse of the same bytes, so it runs inside its own try/catch.
+ */
+function attachFidelity(report: IfcInteropReport | null, bytes: Uint8Array): IfcInteropReport | undefined {
+  if (!report) return undefined;
+  try {
+    const fidelity = buildImportFidelityReport(report.fileName, bytes);
+    if (fidelity) report.fidelity = fidelity;
+  } catch { /* fidelity optional */ }
+  return report;
+}
+
+interface ImportTask {
+  uid: number;
+  file: File;
+  sizeMB: number;
+  schema: string;
+  status: ImportStatus;
+  progress: number;
+  phase: string;
+  elapsedMs: number;
+  error?: string;
+  fragBytes?: Uint8Array;
+  modelId?: string;
+  elements?: number;
+  /** Per-entity STEP inventory (ifc-import-export Phase 4 report). */
+  interop?: IfcInteropReport;
+}
+
+export type IfcSettings = {
+  // "unpkg"/"jsdelivr" were removed: they were never wired into wasmPath()
+  // (dead controls) and a third-party WASM CDN would violate the app CSP
+  // (connect-src). Stale localStorage values degrade to "local" in wasmPath().
+  cdn: "local" | "custom";
+  customPath: string;
+  autoFit: boolean;
+  keepFragInMemory: boolean;
+  replaceExisting: boolean;
+  recenter: boolean;
+  maxSizeMB: number;
+  /**
+   * Soft ceiling for in-browser web-ifc conversion. Files above this are skipped
+   * unless allowUnsafeLargeIfc is true. The default 2300 MB is the user-facing
+   * "link IFC up to 2.3 GB / IFCZIP up to 700 MB" contract.
+   * Multi-hundred-MB IFCs may still OOM some devices —
+   * the ceiling is the attempt bound, not a success promise;
+   * for models that survive, Convert & link once (FRAG cache) or offline .frag is the reliable path.
+   * Users can raise this further in Importer settings.
+   */
+  browserSafeMaxMB: number;
+  /** User opts in to attempt conversion of files above browserSafeMaxMB. */
+  allowUnsafeLargeIfc: boolean;
+  /**
+   * Browser conversion stall bound in ms: no progress callback for this long
+   * means the conversion is stuck. 0 disables the stall bound. Values below
+   * 10 s are clamped up (see import-timeout.ts). Default 120 s.
+   */
+  importStallTimeoutMs: number;
+  /**
+   * Browser conversion total bound in ms. 0 (default) means auto-scaled from
+   * the file size: 5 min floor, 30 s per MB, 120 min ceiling. An explicit
+   * value overrides the auto-scaling (clamped to a 1 s minimum).
+   */
+  importTotalTimeoutMs: number;
+  useCoord: boolean;
+  coordX: number; coordY: number; coordZ: number;
+  positioning: PositioningMode;
+};
+
+const IFC_SETTINGS_KEY = "toc.ifc.settings.v1";
+
+const defaultIfcSettings: IfcSettings = {
+  cdn: "local", customPath: "",
+  autoFit: true, keepFragInMemory: true, replaceExisting: false,
+  recenter: false, maxSizeMB: 4000, browserSafeMaxMB: 2300, allowUnsafeLargeIfc: true,
+  importStallTimeoutMs: IFC_IMPORT_STALL_MS_DEFAULT, importTotalTimeoutMs: 0,
+  useCoord: false, coordX: 0, coordY: 0, coordZ: 0,
+  positioning: "origin-to-origin",
+};
+
+let ifcSettings: IfcSettings = { ...defaultIfcSettings };
+try {
+  const raw = localStorage.getItem(IFC_SETTINGS_KEY);
+  if (raw) {
+    ifcSettings = { ...defaultIfcSettings, ...JSON.parse(raw) };
+    if (!Number.isFinite(ifcSettings.browserSafeMaxMB)) ifcSettings.browserSafeMaxMB = 2300;
+    // Migrate older conservative defaults that blocked normal / large IFC+IFCZIP.
+    if (ifcSettings.browserSafeMaxMB > 0 && ifcSettings.browserSafeMaxMB <= 120) {
+      ifcSettings.browserSafeMaxMB = 2300;
+    }
+    if (ifcSettings.browserSafeMaxMB === 350 || ifcSettings.browserSafeMaxMB === 550) {
+      ifcSettings.browserSafeMaxMB = 2300;
+    }
+    // Migrate the previous 900 MB default (shipped before the 2.3 GB round) —
+    // same never-personalized treatment as the 350/550 fingerprints above.
+    if (ifcSettings.browserSafeMaxMB === 900) {
+      ifcSettings.browserSafeMaxMB = 2300;
+    }
+    if (!Number.isFinite(ifcSettings.maxSizeMB) || ifcSettings.maxSizeMB < 1500) {
+      ifcSettings.maxSizeMB = 4000;
+    }
+    if (typeof ifcSettings.allowUnsafeLargeIfc !== "boolean") ifcSettings.allowUnsafeLargeIfc = false;
+    // Import timeout bounds: fall back to defaults on garbage, clamp absurd
+    // values (a 1 s stall bound would fail every real import on a slow
+    // machine; see computeImportTimeoutMs for the full rule).
+    if (!Number.isFinite(ifcSettings.importStallTimeoutMs) || ifcSettings.importStallTimeoutMs < 0) {
+      ifcSettings.importStallTimeoutMs = IFC_IMPORT_STALL_MS_DEFAULT;
+    } else if (ifcSettings.importStallTimeoutMs > 0 && ifcSettings.importStallTimeoutMs < IFC_IMPORT_STALL_MS_MIN) {
+      ifcSettings.importStallTimeoutMs = IFC_IMPORT_STALL_MS_MIN;
+    }
+    if (!Number.isFinite(ifcSettings.importTotalTimeoutMs) || ifcSettings.importTotalTimeoutMs < 0) {
+      ifcSettings.importTotalTimeoutMs = 0;
+    } else if (ifcSettings.importTotalTimeoutMs > 0 && ifcSettings.importTotalTimeoutMs < IFC_IMPORT_TOTAL_MS_MIN) {
+      ifcSettings.importTotalTimeoutMs = IFC_IMPORT_TOTAL_MS_MIN;
+    }
+    if (!Number.isFinite(ifcSettings.maxSizeMB) || ifcSettings.maxSizeMB < 500) {
+      ifcSettings.maxSizeMB = Math.max(ifcSettings.maxSizeMB || 0, 1500);
+    }
+  }
+} catch { /* */ }
+
+function saveIfcSettings() {
+  try { localStorage.setItem(IFC_SETTINGS_KEY, JSON.stringify(ifcSettings)); } catch { /* */ }
+}
+
+function wasmPath(): string {
+  if (ifcSettings.cdn === "custom" && ifcSettings.customPath.trim()) {
+    let c = ifcSettings.customPath.trim();
+    if (!c.endsWith("/")) c += "/";
+    return c;
+  }
+  // Versioned folder (generated by scripts/sync-web-ifc-assets.mjs). Falls
+  // back to the root folder if the define is missing (e.g. non-vite builds).
+  // Relative to the page's own directory, not the origin: the app may be
+  // hosted under a subpath (and a published page always is), where an
+  // origin-absolute /web-ifc/… would 404. At the domain root this is
+  // identical to the old origin-absolute path.
+  const base =
+    typeof window !== "undefined"
+      ? new URL(".", window.location.href).href
+      : "";
+  const version = typeof __WEB_IFC_VERSION__ === "undefined" ? "" : __WEB_IFC_VERSION__;
+  return version ? `${base}web-ifc/${version}/` : `${base}web-ifc/`;
+}
+
+function snapshotBytes(src: any): Uint8Array {
+  try {
+    if (src instanceof Uint8Array) return src.slice();
+    if (src instanceof ArrayBuffer) return new Uint8Array(src);
+    if (ArrayBuffer.isView(src)) {
+      const v = src as ArrayBufferView;
+      return new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice();
+    }
+  } catch { /* */ }
+  return new Uint8Array(0);
+}
+
+// ── Importer lifecycle ──
+let ifcImporter: any = null;
+let cancelRequested = false;
+let cancelAllRequested = false;
+/** True when the active conversion was ended by the import timeout (not by the user). */
+let importTimedOut = false;
+let rejectActive: ((reason?: any) => void) | null = null;
+
+function getImporter(): any {
+  const path = wasmPath();
+
+  // Force single-thread: under Vite/ESM document.currentScript is undefined
+  // and the multi-thread worker URL becomes "undefined" → SyntaxError '<'
+  try {
+    const proto = (WEBIFC as any).IfcAPI?.prototype;
+    if (proto && typeof proto.Init === "function" && !(proto.Init as any).__obsForcedST) {
+      const origInit = proto.Init;
+      proto.Init = function (handler?: any, _forceST?: boolean) {
+        // Always force single-thread
+        return origInit.call(this, handler, true);
+      };
+      (proto.Init as any).__obsForcedST = true;
+      console.log("[importer] web-ifc Init patched → forceSingleThread=true");
+    }
+  } catch (e) {
+    console.warn("[importer] could not patch web-ifc Init", e);
+  }
+
+  // ABI safety for web-ifc StreamMeshes.
+  // Upstream 0.0.78 JS always calls wasmModule.StreamMeshes with 4 args
+  // (optional applyLinearScalingFactor defaults to true), but the shipped
+  // WASM still expects 3 → embind BindingError. Pin package to 0.0.77 and
+  // additionally clamp arg counts on the wasmModule after Init so a stale
+  // 0.0.78 JS chunk can never trigger the crash.
+  try {
+    const proto = (WEBIFC as any).IfcAPI?.prototype;
+    if (proto && !(proto as any).__obsStreamMeshesPatched) {
+      const prevInit = proto.Init;
+      if (typeof prevInit === "function") {
+        proto.Init = function (this: any, ...args: any[]) {
+          const ret = prevInit.apply(this, args);
+          try {
+            const wm = this.wasmModule;
+            if (wm && !(wm as any).__obsStreamMeshesPatched) {
+              const clamp: Record<string, number> = {
+                StreamMeshes: 3,
+                StreamAllMeshes: 2,
+                StreamAllMeshesWithTypes: 3,
+              };
+              for (const [n, arity] of Object.entries(clamp)) {
+                if (typeof wm[n] !== "function") continue;
+                const o = wm[n].bind(wm);
+                wm[n] = (...a: any[]) => o(...a.slice(0, arity));
+              }
+              (wm as any).__obsStreamMeshesPatched = true;
+              console.log("[importer] web-ifc wasmModule Stream* arity clamped");
+            }
+          } catch { /* */ }
+          return ret;
+        };
+      }
+      (proto as any).__obsStreamMeshesPatched = true;
+    }
+  } catch (e) {
+    console.warn("[importer] could not patch StreamMeshes ABI", e);
+  }
+
+  // Also make the page appear non-cross-origin-isolated during conversion
+  // so web-ifc never chooses the MT path
+  try {
+    if (typeof self !== "undefined" && self.crossOriginIsolated) {
+      Object.defineProperty(self, "crossOriginIsolated", {
+        get: () => false,
+        configurable: true,
+      });
+    }
+  } catch { /* ignore */ }
+
+  if (!ifcImporter) {
+    ifcImporter = new FRAGS.IfcImporter();
+  }
+  ifcImporter.wasm = { absolute: true, path };
+  // CRITICAL FIX: Force COORDINATE_TO_ORIGIN = false so web-ifc preserves
+  // absolute IFC world coordinates instead of recentering each file's
+  // geometry to its own first-element origin.
+  //
+  // The @thatopen/fragments IfcImporter defaults to
+  //   webIfcSettings: { COORDINATE_TO_ORIGIN: true }
+  // which tells web-ifc to translate every loaded IFC file so that its
+  // first element's placement becomes (0, 0, 0). This strips absolute
+  // world coordinates and breaks "Origin to Origin" linking — two IFC
+  // files exported from the same BIM project (linked origin-to-origin
+  // in BIM) end up at DIFFERENT local origins in openBIMstudio,
+  // appearing far apart.
+  //
+  // With COORDINATE_TO_ORIGIN = false, web-ifc preserves the absolute
+  // IFC ObjectPlacement coordinates. Two IFC files that share a BIM
+  // coordinate system will appear at the correct relative positions in
+  // openBIMstudio — matching BIM's "Origin to Origin" linking.
+  //
+  // Center-to-center positioning still works because it measures the
+  // actual mesh bounds after load (setModelOffset uses the bbox center).
+  // Manual positioning also still works (user picks an offset explicitly).
+  try {
+    ifcImporter.webIfcSettings = ifcImporter.webIfcSettings ?? {};
+    ifcImporter.webIfcSettings.COORDINATE_TO_ORIGIN = false;
+  } catch (e) {
+    console.warn("[importer] could not override COORDINATE_TO_ORIGIN", e);
+  }
+  return ifcImporter;
+}
+
+async function ensureWasmAvailable(): Promise<void> {
+  // Prefer versioned path (ABI-safe). If the deploy did not materialize
+  // public/web-ifc/<version>/ (prebuild skipped / cache), fall back to the
+  // root public/web-ifc/ assets that are committed in-repo.
+  const preferred = wasmPath();
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const candidates = [preferred];
+  const rootPath = `${origin}/web-ifc/`;
+  if (preferred !== rootPath) candidates.push(rootPath);
+
+  let lastError: Error | null = null;
+  for (const base of candidates) {
+    const join_ = (f: string) => (base.endsWith("/") ? `${base}${f}` : `${base}/${f}`);
+    const url = join_("web-ifc.wasm");
+    try {
+      const res = await fetch(url, { method: "GET", cache: "no-cache" });
+      if (!res.ok) {
+        lastError = new Error(`WASM HTTP ${res.status} at ${url}`);
+        continue;
+      }
+      const buf = await res.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      if (bytes.length > 0 && bytes[0] === 0x3c) {
+        lastError = new Error(`HTML instead of WASM at ${url}. Run npm run prebuild (sync-web-ifc-assets).`);
+        continue;
+      }
+      if (bytes.byteLength < 1000) {
+        lastError = new Error(`WASM too small at ${url}`);
+        continue;
+      }
+      // Pin importer to the base that actually served a valid WASM binary.
+      if (ifcImporter) {
+        ifcImporter.wasm = { absolute: true, path: base.endsWith("/") ? base : `${base}/` };
+      }
+      if (base !== preferred) {
+        console.warn(`[importer] versioned WASM missing; using fallback ${base}`);
+      }
+      return;
+    } catch (e: any) {
+      lastError = new Error(
+        `Network error fetching WASM: ${url}\n${e?.message || e}\n\n` +
+        `Run: npm install && npm run dev, then confirm ` +
+        `http://localhost:3000/web-ifc/web-ifc.wasm downloads a binary.`,
+      );
+    }
+  }
+  throw lastError ?? new Error("web-ifc WASM not available");
+}
+
+function disposeImporter() {
+  try { ifcImporter?.dispose?.(); } catch { /* */ }
+  ifcImporter = null;
+}
+
+function cancelActiveConversion() {
+  cancelRequested = true;
+  try { rejectActive?.(new Error("Cancelled by user")); } catch { /* */ }
+  disposeImporter();
+}
+
+/**
+ * End the active conversion because it exceeded its import timeout.
+ * Mirrors cancelActiveConversion but does NOT set cancelRequested: the
+ * importer's catch must classify a timeout as a failure, never as a user
+ * cancellation. Disposing the importer means the next import starts from a
+ * fresh instance instead of inheriting the timed-out conversion's state.
+ * Honest limit: this only unblocks the page for conversions that yield to
+ * the event loop. A synchronous hang inside one WASM call cannot be
+ * interrupted from the page (see import-timeout.ts).
+ */
+function timeoutActiveConversion(error: IfcImportTimeoutError) {
+  importTimedOut = true;
+  try { rejectActive?.(error); } catch { /* */ }
+  disposeImporter();
+}
+
+// ── Queue ──
+const importQueue: ImportTask[] = [];
+let queueUid = 0;
+let processing = false;
+
+function isActiveStatus(s: ImportStatus) {
+  return s === "reading" || s === "converting" || s === "loading";
+}
+
+export const loadStatusEl = document.createElement("div");
+loadStatusEl.style.cssText = "font-size:11px;margin-top:8px;color:#a5b4fc;line-height:1.4;min-height:1.2em";
+
+export const queueSummaryEl = document.createElement("div");
+queueSummaryEl.style.cssText = "margin:8px 0 4px;font-size:11px;color:#cbd5e1;line-height:1.5";
+
+export const queueListEl = document.createElement("div");
+
+const btnCss =
+  "font:500 10px system-ui;padding:3px 8px;background:#2a2a3a;color:#e2e8f0;border:1px solid #3a3a4a;border-radius:4px;cursor:pointer";
+
+const statusColor: Record<ImportStatus, string> = {
+  queued: "#94a3b8", reading: "#a5b4fc", converting: "#38bdf8",
+  loading: "#c084fc", done: "#22c55e", failed: "#ef4444",
+  cancelled: "#f59e0b", skipped: "#f59e0b",
+};
+
+function escapeHtml(s: string) {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" } as any)[c]);
+}
+function truncate(s: string, n: number) { return s.length > n ? s.slice(0, n) + "…" : s; }
+function fmtDur(ms: number) {
+  const s = ms / 1000;
+  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+}
+function errorMessage(err: any): string {
+  if (err instanceof Error) return err.message;
+  if (err?.message != null) return String(err.message);
+  return String(err);
+}
+function normalizeProgress(progress: any): number {
+  let pct = 0;
+  if (typeof progress === "number") pct = progress <= 1 ? Math.round(progress * 100) : Math.round(progress);
+  else if (progress && typeof progress.current === "number" && progress.total) {
+    pct = Math.round((progress.current / progress.total) * 100);
+  }
+  return Math.max(0, Math.min(100, pct));
+}
+function describePhase(data?: any): string {
+  if (data?.state) return `${data.process || "step"}: ${data.state}`;
+  if (data?.process) return String(data.process);
+  return "converting";
+}
+function detectSchema(bytes: Uint8Array): string {
+  try {
+    const text = new TextDecoder().decode(bytes.subarray(0, 8192));
+    const m = text.match(/FILE_SCHEMA\s*\(\s*\(\s*'([^']+)'/i);
+    if (m) return m[1].toUpperCase();
+    return /ISO-10303-21/i.test(text) ? "STEP (schema not found)" : "unknown";
+  } catch { return "unknown"; }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Position pinning + per-model offsets
+   ═════════════════════════════════════════════════════════════════════════ */
+
+/** Per-model offset (world position). Enforced by the pin loop. */
+const modelOffsets = new Map<string, THREE.Vector3>();
+const offsetsListeners = new Set<() => void>();
+
+function notifyOffsets() {
+  for (const cb of offsetsListeners) {
+    try { cb(); } catch { /* */ }
+  }
+}
+export function onOffsetsChanged(cb: () => void): () => void {
+  offsetsListeners.add(cb);
+  return () => offsetsListeners.delete(cb);
+}
+
+let pinLoopRunning = false;
+
+/** Per-model rotation about the world Y (up) axis, radians. */
+const modelRotations = new Map<string, number>();
+
+function enforcePins(): void {
+  for (const [id, off] of modelOffsets) {
+    const model: any = ctx.fragments.list.get(id);
+    const obj = model?.object;
+    if (!obj) continue;
+    if (obj.matrixAutoUpdate === false) obj.matrixAutoUpdate = true;
+    const p = obj.position;
+    const ry = modelRotations.get(id) ?? 0;
+    if (Math.abs(obj.rotation.y - ry) > 1e-9) {
+      obj.rotation.y = ry;
+      obj.updateMatrix();
+      obj.updateMatrixWorld(true);
+    }
+    if (
+      Math.abs(p.x - off.x) > 1e-6 ||
+      Math.abs(p.y - off.y) > 1e-6 ||
+      Math.abs(p.z - off.z) > 1e-6
+    ) {
+      p.set(off.x, off.y, off.z);
+      obj.updateMatrix();
+      obj.updateMatrixWorld(true);
+    }
+  }
+}
+
+function ensurePinLoop(): void {
+  if (pinLoopRunning) return;
+  pinLoopRunning = true;
+
+  try {
+    const renderer: any = (ctx.world as any)?.renderer?.three;
+    if (renderer && !renderer.__obsPinPatched) {
+      renderer.__obsPinPatched = true;
+      const orig = renderer.render.bind(renderer);
+      renderer.render = function (...args: any[]) {
+        enforcePins();
+        return orig(...args);
+      };
+    }
+  } catch (e) { console.warn("[positioning] renderer hook failed", e); }
+
+  try {
+    const core: any = ctx.fragments?.core;
+    if (core && typeof core.update === "function" && !core.__obsPinPatched) {
+      core.__obsPinPatched = true;
+      const orig = core.update.bind(core);
+      core.update = function (...args: any[]) {
+        const r = orig(...args);
+        enforcePins();
+        return r;
+      };
+    }
+  } catch (e) { console.warn("[positioning] core.update hook failed", e); }
+
+  // No permanent rAF loop here. The renderer.render hook and the
+  // fragments.core.update hook above already cover every path through
+  // which the SDK could move a model. A per-frame enforcePins() would
+  // walk every loaded model on every animation frame for the whole
+  // session -- the same CPU burn that camera-tools.ts explicitly warns
+  // against.
+}
+
+/** Register a model. Offset defaults to (0,0,0). */
+export function registerModel(modelId: string): void {
+  if (!modelOffsets.has(modelId)) {
+    modelOffsets.set(modelId, new THREE.Vector3(0, 0, 0));
+  }
+  ensurePinLoop();
+  notifyOffsets();
+}
+
+export function unregisterModel(modelId: string): void {
+  if (modelOffsets.delete(modelId)) notifyOffsets();
+}
+
+export function clearAllOffsets(): void {
+  modelOffsets.clear();
+  notifyOffsets();
+}
+
+/** Set a model's world position (the pin target). */
+export function setModelOffset(modelId: string, offset: [number, number, number]): void {
+  if (!modelOffsets.has(modelId)) modelOffsets.set(modelId, new THREE.Vector3());
+  const v = modelOffsets.get(modelId)!;
+  v.set(offset[0], offset[1], offset[2]);
+  enforcePins();
+  notifyOffsets();
+}
+
+/** Set a linked model's rotation about the vertical axis, in degrees. */
+export function setModelRotation(modelId: string, degrees: number): void {
+  modelRotations.set(modelId, (degrees * Math.PI) / 180);
+  if (!modelOffsets.has(modelId)) modelOffsets.set(modelId, new THREE.Vector3());
+  enforcePins();
+  notifyOffsets();
+}
+
+export function getModelRotation(modelId: string): number {
+  return ((modelRotations.get(modelId) ?? 0) * 180) / Math.PI;
+}
+
+export function getModelOffset(modelId: string): [number, number, number] | null {
+  const v = modelOffsets.get(modelId);
+  return v ? [v.x, v.y, v.z] : null;
+}
+
+export function listRegisteredModels(): string[] {
+  return Array.from(modelOffsets.keys());
+}
+
+/** Measure a model's visible bbox center (world space). */
+export async function getModelBBoxCenter(modelId: string): Promise<[number, number, number] | null> {
+  const model: any = ctx.fragments.list.get(modelId);
+  if (!model) return null;
+  try {
+    const ids = await model.getItemsIdsWithGeometry();
+    if (!ids?.length) return null;
+    const boxes = await model.getBoxes(ids);
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const b of boxes) {
+      if (!b || !b.min || !b.max) continue;
+      if (b.min.x < minX) minX = b.min.x;
+      if (b.max.x > maxX) maxX = b.max.x;
+      if (b.min.y < minY) minY = b.min.y;
+      if (b.max.y > maxY) maxY = b.max.y;
+      if (b.min.z < minZ) minZ = b.min.z;
+      if (b.max.z > maxZ) maxZ = b.max.z;
+    }
+    if (!isFinite(minX)) return null;
+    return [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
+  } catch {
+    return null;
+  }
+}
+
+/** Measure a model's visible bbox (min/max). */
+export async function getModelBBox(
+  modelId: string,
+): Promise<{ min: [number, number, number]; max: [number, number, number] } | null> {
+  const model: any = ctx.fragments.list.get(modelId);
+  if (!model) return null;
+  try {
+    const ids = await model.getItemsIdsWithGeometry();
+    if (!ids?.length) return null;
+    const boxes = await model.getBoxes(ids);
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const b of boxes) {
+      if (!b || !b.min || !b.max) continue;
+      if (b.min.x < minX) minX = b.min.x;
+      if (b.max.x > maxX) maxX = b.max.x;
+      if (b.min.y < minY) minY = b.min.y;
+      if (b.max.y > maxY) maxY = b.max.y;
+      if (b.min.z < minZ) minZ = b.min.z;
+      if (b.max.z > maxZ) maxZ = b.max.z;
+    }
+    if (!isFinite(minX)) return null;
+    return { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
+  } catch {
+    return null;
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Positioning modes
+   ═════════════════════════════════════════════════════════════════════════ */
+
+export function getPositioningMode(): PositioningMode {
+  return ifcSettings.positioning;
+}
+
+export function setPositioningMode(mode: PositioningMode, persist = true): void {
+  ifcSettings.positioning = mode;
+  if (persist) saveIfcSettings();
+  if (positioningSelect) positioningSelect.value = mode;
+}
+
+/**
+ * Apply a positioning mode to every currently loaded model.
+ * Called after queue finishes, after loadFragFiles, and by the alignment panel.
+ */
+export async function applyPositioningMode(mode: PositioningMode = ifcSettings.positioning): Promise<void> {
+  const ids = Array.from(ctx.fragments.list.keys());
+  if (!ids.length) return;
+  console.log(`[positioning] applying "${mode}" to ${ids.length} model(s)`);
+
+  // Always reset each model to (0,0,0) first, then compute per-mode offsets.
+  for (const id of ids) setModelOffset(id, [0, 0, 0]);
+  await new Promise((r) => requestAnimationFrame(r));
+
+  try {
+    if (mode === "manual") {
+      // no-op — user places models themselves
+    } else if (mode === "center-to-center") {
+      // Measure each model's current bbox center and pin to the negative
+      for (const id of ids) {
+        const c = await getModelBBoxCenter(id);
+        if (!c) continue;
+        setModelOffset(id, [-c[0], -c[1], -c[2]]);
+      }
+      // Now every visible bbox center is at (0,0,0) — models overlap.
+    } else if (mode === "project-base-to-project-base") {
+      // Best-effort: same as origin-to-origin for IFC that carries PBP.
+      for (const id of ids) setModelOffset(id, [0, 0, 0]);
+    } else {
+      // origin-to-origin | shared-coordinates
+      // Both files at (0,0,0). Geometry carries its own shared offsets.
+      for (const id of ids) setModelOffset(id, [0, 0, 0]);
+    }
+  } catch (err) {
+    console.warn("[positioning] apply failed", err);
+  }
+
+  try { computeSceneBounds(); } catch { /* */ }
+  try { fitAll(); } catch { /* */ }
+  notifyOffsets();
+}
+
+// ── Positioning UI (in-panel select) ──
+export const positioningSelect = document.createElement("select");
+positioningSelect.style.cssText =
+  "width:100%;box-sizing:border-box;padding:6px 9px;margin:4px 0 8px;" +
+  "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+  "border-radius:var(--r-sm,4px);color:var(--text-primary,#e8eaf0);font:12px system-ui;" +
+  "cursor:pointer;outline:none";
+positioningSelect.title = "How to place the next model relative to the ones already loaded";
+positioningSelect.innerHTML = POSITIONING_MODES
+  .map((m) => `<option value="${m.id}">Auto — ${m.label}</option>`)
+  .join("");
+positioningSelect.value = ifcSettings.positioning;
+positioningSelect.onchange = () => {
+  ifcSettings.positioning = positioningSelect.value as PositioningMode;
+  saveIfcSettings();
+  void applyPositioningMode(ifcSettings.positioning);
+};
+
+export function syncPositioningSelect(): void {
+  positioningSelect.value = ifcSettings.positioning;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Task rows
+   ═════════════════════════════════════════════════════════════════════════ */
+function renderTaskRow(t: ImportTask): HTMLElement {
+  const row = document.createElement("div");
+  row.dataset.uid = String(t.uid);
+  row.style.cssText =
+    "border:1px solid #2a2a35;border-radius:6px;padding:8px;margin:6px 0;background:#14141c;font-size:11px";
+  queueListEl.appendChild(row);
+  refreshTaskRow(t);
+  return row;
+}
+
+function refreshTaskRow(t: ImportTask) {
+  const row = queueListEl.querySelector<HTMLElement>(`[data-uid="${t.uid}"]`);
+  if (!row) return;
+
+  const col = statusColor[t.status] ?? "#94a3b8";
+  const active = isActiveStatus(t.status);
+  const size = t.sizeMB >= 1 ? `${t.sizeMB.toFixed(1)} MB` : `${(t.sizeMB * 1024).toFixed(0)} KB`;
+  const elements = t.elements != null ? ` · ${fmtNumber(t.elements)} elements` : "";
+  const eta = active && t.progress > 3 && t.progress < 100 && t.elapsedMs > 0
+    ? `ETA ~${fmtDur((t.elapsedMs / t.progress) * (100 - t.progress))}` : "";
+
+  const actions: string[] = [];
+  if (t.status === "queued") actions.push(`<button data-act="remove" style="${btnCss}">Remove</button>`);
+  if (active) actions.push(`<button data-act="cancel" style="${btnCss}">Cancel</button>`);
+  if (t.status === "done" && t.fragBytes && t.fragBytes.byteLength > 0)
+    actions.push(`<button data-act="download" style="${btnCss}">Save .frag</button>`);
+  if (t.status === "failed" || t.status === "cancelled" || t.status === "skipped")
+    actions.push(`<button data-act="retry" style="${btnCss}">Retry</button>`);
+
+  const showBar = active || (t.progress > 0 && t.status !== "done");
+  const bar = showBar
+    ? `<div style="height:5px;background:#0f1117;border-radius:3px;overflow:hidden;margin:4px 0 6px">
+         <div style="height:100%;width:${t.progress}%;background:${col};transition:width .25s"></div>
+       </div>` : "";
+
+  const interopHtml = t.interop
+    ? `<details style="margin-top:4px">
+         <summary style="cursor:pointer;opacity:.7;font-size:10px">Entity inventory — ${escapeHtml(t.interop.schema)} · ${fmtNumber(t.interop.totalEntities)} entities · ${t.interop.types.length} type(s)</summary>
+         <pre style="margin:4px 0 0;font-size:10px;opacity:.75;white-space:pre-wrap">${escapeHtml(formatInteropReport(t.interop).join("\n"))}</pre>
+       </details>`
+    : "";
+
+  row.innerHTML = `
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="width:8px;height:8px;border-radius:50%;background:${col};flex:none"></span>
+      <span style="font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(t.file.name)}">${escapeHtml(t.file.name)}</span>
+      <span style="opacity:.55;flex:none">${size}</span>
+    </div>
+    <div style="opacity:.6;margin:2px 0">${t.schema !== "—" ? escapeHtml(t.schema) + " · " : ""}${escapeHtml(t.phase)}${elements}</div>
+    ${bar}
+    ${interopHtml}
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+      <span style="color:${col};font-weight:700;font-size:10px;letter-spacing:.4px">${t.status.toUpperCase()}</span>
+      ${t.elapsedMs > 0 ? `<span style="opacity:.55">${fmtDur(t.elapsedMs)}</span>` : ""}
+      ${eta ? `<span style="opacity:.55">${eta}</span>` : ""}
+      ${t.error ? `<span style="color:#f87171" title="${escapeHtml(t.error)}">⚠ ${escapeHtml(truncate(t.error, 64))}</span>` : ""}
+      ${actions.join("")}
+    </div>`;
+
+  row.querySelectorAll<HTMLButtonElement>("button[data-act]").forEach((b) => {
+    b.onclick = () => taskAction(t, b.dataset.act!);
+  });
+}
+
+function taskAction(t: ImportTask, act: string) {
+  if (act === "remove") {
+    if (t.status !== "queued") return;
+    const i = importQueue.indexOf(t);
+    if (i >= 0) importQueue.splice(i, 1);
+    queueListEl.querySelector(`[data-uid="${t.uid}"]`)?.remove();
+    updateQueueSummary();
+  } else if (act === "cancel") {
+    if (t.status === "queued") {
+      t.status = "cancelled"; t.phase = "cancelled";
+      refreshTaskRow(t); updateQueueSummary();
+    } else if (isActiveStatus(t.status)) {
+      cancelActiveConversion();
+    }
+  } else if (act === "retry") {
+    t.status = "queued";
+    t.error = undefined;
+    t.progress = 0;
+    t.phase = "waiting";
+    t.elapsedMs = 0;
+    refreshTaskRow(t);
+    updateQueueSummary();
+    void processQueue();
+  } else if (act === "download") {
+    downloadFragBytes(t);
+  }
+}
+
+function downloadFragBytes(t: ImportTask) {
+  if (!t.fragBytes || t.fragBytes.byteLength === 0) {
+    uiAlert("The cached .frag bytes are no longer available.\nRe-import the IFC and try Save .frag again.");
+    return;
+  }
+  const blob = new Blob([t.fragBytes as unknown as BlobPart], { type: "application/octet-stream" });
+  if (blob.size === 0) {
+    uiAlert("Could not export: the byte cache was released.\nRe-import the IFC and try again.");
+    return;
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${t.modelId || "model"}.frag`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+function updateQueueSummary() {
+  const q = importQueue.filter((t) => t.status === "queued").length;
+  const act = importQueue.filter((t) => isActiveStatus(t.status)).length;
+  const done = importQueue.filter((t) => t.status === "done").length;
+  const bad = importQueue.filter((t) => ["failed", "skipped", "cancelled"].includes(t.status)).length;
+  const total = importQueue.reduce((a, t) => a + t.elapsedMs, 0);
+  queueSummaryEl.innerHTML =
+    `Queue: <b>${q}</b> pending · <b style="color:#38bdf8">${act}</b> active · ` +
+    `<b style="color:#22c55e">${done}</b> done · <b style="color:#ef4444">${bad}</b> failed` +
+    (total > 0 ? ` · total ${fmtDur(total)}` : "");
+}
+
+function clearFinishedTasks() {
+  for (let i = importQueue.length - 1; i >= 0; i--) {
+    const t = importQueue[i];
+    if (["done", "failed", "cancelled", "skipped"].includes(t.status)) {
+      importQueue.splice(i, 1);
+      queueListEl.querySelector(`[data-uid="${t.uid}"]`)?.remove();
+    }
+  }
+  updateQueueSummary();
+}
+
+function cancelQueueAll() {
+  cancelAllRequested = true;
+  for (const t of importQueue) {
+    if (t.status === "queued") {
+      t.status = "cancelled"; t.phase = "cancelled";
+      refreshTaskRow(t);
+    }
+  }
+  cancelActiveConversion();
+  updateQueueSummary();
+}
+
+async function nextModelId(fileName: string): Promise<string> {
+  const base = fileName.replace(/\.ifc$/i, "").replace(/\.frag$/i, "").trim() || `model-${Date.now()}`;
+  if (ifcSettings.replaceExisting) {
+    const existing = ctx.fragments.list.get(base);
+    if (existing) { try { await (existing as any).dispose?.(); } catch { /* */ } }
+    return base;
+  }
+  if (!ctx.fragments.list.has(base)) return base;
+  let i = 2;
+  while (ctx.fragments.list.has(`${base} (${i})`)) i++;
+  return `${base} (${i})`;
+}
+
+
+/** True when the payload is a ZIP (IFCZIP or misnamed .zip). */
+function looksLikeZip(bytes: Uint8Array): boolean {
+  return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && (bytes[2] === 0x03 || bytes[2] === 0x05 || bytes[2] === 0x07);
+}
+
+/**
+ * Expand .ifczip / .zip into one File per embedded .ifc.
+ * Large archives stream entry-by-entry to limit peak memory.
+ */
+export async function expandIfcSources(
+  files: File[],
+  onProgress?: (msg: string) => void,
+): Promise<File[]> {
+  const out: File[] = [];
+  for (const file of files) {
+    const name = file.name || "model";
+    const isZipName = /\.(ifczip|zip)$/i.test(name);
+
+    if (/\.ifc$/i.test(name) && !isZipName) {
+      out.push(file);
+      continue;
+    }
+
+    // Peek magic for misnamed IFCZIP uploaded as .ifc
+    let needUnzip = isZipName;
+    if (!needUnzip && /\.ifc$/i.test(name) && file.size > 64) {
+      try {
+        const head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+        if (looksLikeZip(head)) needUnzip = true;
+      } catch { /* */ }
+    }
+
+    if (!needUnzip) {
+      if (/\.ifc$/i.test(name)) out.push(file);
+      continue;
+    }
+
+    onProgress?.(`Unpacking ${name} (${(file.size / (1024 * 1024)).toFixed(0)} MB)…`);
+    try {
+      // Size bound BEFORE the whole archive is buffered (issue #90): a
+      // multi-GB .ifczip used to be fully read before any guard ran.
+      const sizeGuard = guardSize("ifc", file.size);
+      if (!sizeGuard.ok) throw new Error(`${name}: ${sizeGuard.reason} The file was not opened and your project is unchanged.`);
+      const JSZip = (await import("jszip")).default;
+      const zipBytes = new Uint8Array(await file.arrayBuffer());
+      const zipGuard = guardZipDirectory(zipBytes);
+      if (!zipGuard.ok) throw new Error(`${name}: ${zipGuard.reason}`);
+      const archive = await JSZip.loadAsync(zipBytes, { createFolders: false });
+      const entries: string[] = [];
+      archive.forEach((path, entry) => {
+        if (!entry.dir && /\.ifc$/i.test(path)) entries.push(path);
+      });
+      if (!entries.length) {
+        throw new Error(`No .ifc model found inside "${name}".`);
+      }
+      // Prefer root / shortest path first (main model often not nested deep)
+      entries.sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
+
+      for (let i = 0; i < entries.length; i++) {
+        const path = entries[i];
+        onProgress?.(`Extracting ${i + 1}/${entries.length}: ${path.split("/").pop()}…`);
+        const entry = archive.file(path);
+        if (!entry) continue;
+        const bytes = await entry.async("uint8array");
+        if (!bytes.byteLength) {
+          console.warn(`[importer] empty IFC entry "${path}" in ${name}`);
+          continue;
+        }
+        // Blob avoids an extra full copy that `new File([uint8array])` can trigger.
+        const blob = new Blob([bytes as BlobPart], { type: "application/octet-stream" });
+        const leaf = path.split("/").pop() || `${name.replace(/\.(ifczip|zip)$/i, "")}.ifc`;
+        out.push(new File([blob], leaf, { type: "application/octet-stream", lastModified: file.lastModified }));
+      }
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      throw new Error(`Failed to unpack "${name}": ${msg}`);
+    }
+  }
+  return out;
+}
+
+
+
+/** When true, large Link-IFC skips open convert&link without the modal. */
+const LARGE_IFC_AUTO_HANDOFF_KEY = "obs.ifc.autoHandoffFrag";
+function largeIfcAutoHandoff(): boolean {
+  try { return localStorage.getItem(LARGE_IFC_AUTO_HANDOFF_KEY) === "1"; } catch { return false; }
+}
+
+/** Critical large-model path: one-click handoff to IFC→FRAG instead of a dead-end alert. */
+function offerLargeIfcRecovery(files: File[]): void {
+  const names = files.map((f) => `• ${escapeHtml(f.name)} (${(f.size / (1024 * 1024)).toFixed(0)} MB)`).join("\n");
+  try {
+    const existing = document.getElementById("obs-large-ifc-recovery");
+    if (existing) existing.remove();
+    const overlay = document.createElement("div");
+    overlay.id = "obs-large-ifc-recovery";
+    overlay.style.cssText =
+      "position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.55);display:flex;" +
+      "align-items:center;justify-content:center;font:13px system-ui,sans-serif";
+    const card = document.createElement("div");
+    card.style.cssText =
+      "width:min(440px,92vw);background:#161922;border:1px solid #2a2e3a;border-radius:12px;" +
+      "box-shadow:0 16px 50px rgba(0,0,0,.5);color:#e8eaf0;overflow:hidden";
+    card.innerHTML =
+      `<div style="padding:12px 14px;border-bottom:1px solid #2a2e3a;font-weight:700">Large IFC — convert to FRAG</div>` +
+      `<div style="padding:12px 14px;font-size:12px;line-height:1.45;color:#c5cad6;white-space:pre-wrap">` +
+      `These file(s) are above the browser-safe direct-link limit:\n\n${names}\n\n` +
+      `Direct Link IFC often leaves an empty scene (OOM). Prefer Convert & link — builds .frag, links it, and fits the camera.` +
+      `</div>`;
+    const acts = document.createElement("div");
+    acts.style.cssText = "padding:10px 14px 14px;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end";
+    const mk = (label: string, primary: boolean, fn: () => void) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.style.cssText = primary
+        ? "padding:7px 12px;border-radius:6px;border:1px solid #0284c7;background:#0369a1;color:#fff;font-weight:600;cursor:pointer"
+        : "padding:7px 12px;border-radius:6px;border:1px solid #3a3f4d;background:#2a2e3a;color:#e8eaf0;cursor:pointer";
+      b.onclick = () => { try { fn(); } finally { overlay.remove(); } };
+      return b;
+    };
+    acts.append(
+      mk("Convert & link now", true, () => {
+        void import("./ifc-to-frag").then((m) => {
+          m.forceAutoLink?.(true);
+          m.showIfcToFragPanel?.();
+          void m.queueFiles?.(files);
+        }).catch((err) => {
+          console.warn("[importer] ifc-to-frag open failed", err);
+          try { uiAlert("Could not open IFC → FRAG converter. Use File / Insert → IFC → FRAG."); } catch { /* */ }
+        });
+      }),
+      mk("Allow unsafe + retry", false, () => {
+        ifcSettings.allowUnsafeLargeIfc = true;
+        try { saveIfcSettings(); } catch { /* */ }
+        enqueueIfc(files);
+      }),
+      mk("Close", false, () => {}),
+    );
+    card.appendChild(acts);
+    overlay.appendChild(card);
+    overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+  } catch {
+    try {
+      uiAlert(
+        `These IFC file(s) are too large for reliable in-browser link:\n\n${names}\n\n` +
+        `Use IFC → FRAG converter, then Insert → Link FRAG.`,
+      );
+    } catch { /* */ }
+  }
+}
+
+function enqueueIfc(files: File | File[]) {
+  const list = Array.isArray(files) ? files : [files];
+  for (const file of list) {
+    if (!/\.ifc$/i.test(file.name)) continue;
+    const sizeMB = file.size / (1024 * 1024);
+    const t: ImportTask = {
+      uid: ++queueUid, file, sizeMB, schema: "—",
+      status: "queued", progress: 0, phase: "waiting in queue", elapsedMs: 0,
+    };
+    if (sizeMB > ifcSettings.maxSizeMB) {
+      t.status = "skipped";
+      t.phase = "skipped";
+      t.error = `File is ${sizeMB.toFixed(0)} MB (hard limit ${ifcSettings.maxSizeMB} MB). Convert to .frag offline, or raise max size in Importer settings.`;
+    } else if (sizeMB > ifcSettings.browserSafeMaxMB && !ifcSettings.allowUnsafeLargeIfc) {
+      // Do not pre-skip: runTask checks FRAG cache first (Convert & link may have filled it).
+      t.phase = `large file (${sizeMB.toFixed(0)} MB) — will use FRAG cache if available`;
+    } else if (sizeMB > 80) {
+      t.phase = `large file (${sizeMB.toFixed(0)} MB) — conversion may take several minutes / risk OOM`;
+    }
+    importQueue.push(t);
+    renderTaskRow(t);
+  }
+  updateQueueSummary();
+  // Large files go through processQueue → runTask (cache hit loads instantly;
+  // cache miss opens Convert & link recovery there).
+  void processQueue();
+}
+
+async function processQueue() {
+  if (processing) return;
+  processing = true;
+  cancelAllRequested = false;
+
+  const loader = (ctx.features as any).appLoader;
+  const total = importQueue.filter((x) => x.status === "queued").length;
+
+  // Pause the 3D render loop while the queue mutates the scene. Measured on
+  // the bench harness (bench/probe-fed.mjs): with the loop live, a 4-file
+  // federation spends 6.9 s in conversion + 3.6 s in fragments load; paused,
+  // 1.6 s + 1.2 s — the software-GL frame cost was starving the main thread
+  // on every web-ifc progress message and fragments chunk. The guard
+  // composes with the plan-overlay pause (core/renderer-lifecycle.ts).
+  let restoreRenderer: (() => void) | null = null;
+  if (total) {
+    loader?.begin?.(`Importing ${total} file(s)…`, {
+      cancellable: true,
+      onCancel: () => cancelQueueAll(),
+    });
+    try {
+      restoreRenderer = pauseRenderLoop((ctx.world as any)?.renderer);
+    } catch { /* rendering is optional for import */ }
+  }
+
+  try {
+    for (;;) {
+      const t = importQueue.find((x) => x.status === "queued");
+      if (!t) break;
+      if (cancelAllRequested) {
+        for (const x of importQueue) {
+          if (x.status === "queued") { x.status = "cancelled"; x.phase = "cancelled"; refreshTaskRow(x); }
+        }
+        break;
+      }
+      await runTask(t);
+    }
+  } finally {
+    processing = false;
+    updateQueueSummary();
+
+    // Resume the 3D loop BEFORE positioning/fit so the final camera state
+    // actually renders (the guard restores the exact prior state — see
+    // pauseRenderLoop; when the plan overlay already paused the loop, this
+    // restore is a no-op and the plan keeps ownership).
+    try { restoreRenderer?.(); } catch { /* */ }
+    restoreRenderer = null;
+
+    // Linking sequence from working OpenBIMStudio: apply positioning, then
+    // origin-to-origin identity placement (no forced recenter) — same as BIM links.
+    try { await applyPositioningMode(ifcSettings.positioning); } catch (e) { console.warn(e); }
+    try {
+      if (ifcSettings.positioning === "origin-to-origin" || ifcSettings.positioning === "shared-coordinates") {
+        const { alignOriginToOrigin } = await import("./camera-tools");
+        alignOriginToOrigin();
+      }
+    } catch (e) { console.warn("[link-seq] alignOriginToOrigin", e); }
+
+    if (importQueue.some((t) => t.status === "done") && ifcSettings.autoFit) {
+      // Wait for the worker to stream geometry before measuring bounds.
+      void (async () => {
+        for (let i = 0; i < 30; i++) {
+          computeSceneBounds();
+          const { getSceneBox, fitAll } = await import("./camera-tools");
+          const b = getSceneBox?.();
+          if (b && !b.isEmpty()) { fitAll(); return; }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        fitAll();
+      })();
+    }
+    else computeSceneBounds();
+    try { refreshModelSelectionUI(); } catch { /* */ }
+
+    setTimeout(() => {
+      try { (ctx.cam as any)?.recoverView?.(); } catch { /* */ }
+    }, 400);
+
+    loader?.finish?.();
+  }
+}
+
+/**
+ * Import phase record for the reproducible benchmark harness
+ * (bench/bench-browser.mjs — read via __obsPerf.importPhases). Keeps the
+ * last 50 import results with per-phase timings — conversion (web-ifc →
+ * FRAG, worker) and scene load (fragments core). Read-only diagnostics;
+ * exposed through ctx.features.importer (no new window globals).
+ */
+interface ImportPhaseRecord {
+  file: string;
+  sizeMB: number;
+  convertMs: number;
+  fragLoadMs: number;
+  totalMs: number;
+  elements: number;
+  schema: string | null;
+  /** Set when the conversion ended by the import timeout instead of completing. */
+  timedOut?: boolean;
+}
+const importPhaseLog: ImportPhaseRecord[] = [];
+function recordImportPhase(t: ImportTask, convertMs: number, fragLoadMs: number, elements: number, opts?: { timedOut?: boolean }): void {
+  try {
+    importPhaseLog.push({
+      file: t.file.name,
+      sizeMB: Math.round(t.sizeMB * 10) / 10,
+      convertMs: Math.round(convertMs * 10) / 10,
+      fragLoadMs: Math.round(fragLoadMs * 10) / 10,
+      totalMs: Math.round(t.elapsedMs ?? 0),
+      elements,
+      schema: t.schema ?? null,
+      ...(opts?.timedOut ? { timedOut: true } : {}),
+    });
+    if (importPhaseLog.length > 50) importPhaseLog.shift();
+  } catch { /* diagnostics must never break the import */ }
+}
+
+async function runTask(t: ImportTask) {
+  const t0 = performance.now();
+  cancelRequested = false;
+  importTimedOut = false;
+  const loader = (ctx.features as any).appLoader;
+  // Phase instrumentation for the reproducible benchmark harness
+  // (bench/bench-browser.mjs) — read-only record, no behavior change.
+  let convertMs = 0;
+  let fragLoadMs = 0;
+  // Declared here so the catch can disarm it: a watchdog left armed after a
+  // user cancel would fire during a LATER import and kill that conversion.
+  let importTimeout: ImportTimeout | null = null;
+
+  try {
+    // Critical: FRAG cache hit skips convert (and unblocks large files already converted once)
+    let fragBytes: Uint8Array | null = null;
+    let cacheKey: string | null = null;
+    try {
+      cacheKey = await hashFileKey(t.file);
+      const cached = await getCachedFrag(cacheKey);
+      if (cached && cached.byteLength > 32) {
+        fragBytes = cached;
+        t.schema = "cached";
+        t.phase = "loaded from FRAG cache";
+        t.progress = 100;
+        // Inventory even on cache hits: the source file is still on hand.
+        try {
+          const cacheBytes = new Uint8Array(await t.file.arrayBuffer());
+          t.interop = attachFidelity(buildInteropReport(t.file.name, cacheBytes), cacheBytes);
+        } catch { /* optional */ }
+        refreshTaskRow(t);
+        console.log(`[importer] FRAG cache hit · ${t.file.name} · ${(cached.byteLength / (1024 * 1024)).toFixed(1)} MB`);
+      }
+    } catch {
+      /* cache optional */
+    }
+
+    if (!fragBytes && t.sizeMB > ifcSettings.browserSafeMaxMB && !ifcSettings.allowUnsafeLargeIfc) {
+      t.status = "skipped";
+      t.phase = "skipped — too large for browser";
+      t.error =
+        `IFC is ${t.sizeMB.toFixed(0)} MB. Browser conversion is limited to ~${ifcSettings.browserSafeMaxMB} MB. ` +
+        `Use Convert & link (IFC→FRAG) once — next Link IFC will use the FRAG cache — or enable "Allow unsafe large IFC".`;
+      refreshTaskRow(t);
+      try {
+        offerLargeIfcRecovery([t.file]);
+      } catch {
+        try { uiAlert(t.error); } catch { /* */ }
+      }
+      return;
+    }
+    if (!fragBytes && t.sizeMB > 200) {
+      // Fires regardless of allowUnsafeLargeIfc: the default path attempts
+      // large conversions, and the user must see the honest crash risk
+      // before the tab is committed.
+      t.phase = `⚠️ ${t.sizeMB.toFixed(0)} MB — high risk of tab crash`;
+      refreshTaskRow(t);
+    }
+
+    if (!fragBytes) {
+      t.status = "reading"; t.progress = 0; t.phase = "reading file…";
+      refreshTaskRow(t);
+      loader?.set?.(`Reading ${t.file.name}…`, 0.05);
+
+      // Keep FRAG bytes out of memory for huge files
+      if (t.sizeMB > 80) ifcSettings.keepFragInMemory = false;
+
+      // Size bound BEFORE the whole file is buffered (issue #90); the
+      // post-read assert below stays as defence in depth.
+      assertFileAllowed("ifc", t.file.name, t.file.size);
+      const buffer = await t.file.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      // Bounded structural check BEFORE the WASM parser: corrupt STEP can make web-ifc spin for minutes.
+      assertFileAllowed("ifc", t.file.name, bytes.length);
+      const pre = preflightStep(bytes);
+      // PE-20: the preflight result itself is schema-gated before its
+      // fields are trusted, and the STEP header must carry a schema
+      // identity before the bytes reach the WASM parser.
+      assertValidStepPreflightResult(pre, t.file.name);
+      if (!pre.ok) throw new Error(`This file is not a valid IFC (STEP) file: ${pre.reason}${pre.line ? ` (line ${pre.line})` : ""}. It was not opened.`);
+      const header = parseStepHeader(bytes);
+      if (!header.ok) throw new Error(`This file is not a valid IFC (STEP) file: ${header.error}. It was not opened.`);
+      // PE-20: the parsed header is Zod-validated at the load path (the
+      // preflight module itself stays dependency-free for the fuzz harness).
+      assertValidStepFileHeader(header.value, t.file.name);
+      t.schema = detectSchema(bytes);
+      // Per-entity interop report: one linear scan of the STEP instance table,
+      // plus the per-entity fidelity pass (#106) attached to the same report.
+      try { t.interop = attachFidelity(buildInteropReport(t.file.name, bytes), bytes); } catch { /* optional */ }
+      refreshTaskRow(t);
+
+      t.status = "converting"; t.phase = "checking WASM…"; refreshTaskRow(t);
+      loader?.set?.("Checking WASM…", 0.1);
+      await ensureWasmAvailable();
+
+      t.phase = "starting web-ifc worker…"; refreshTaskRow(t);
+      loader?.set?.("Converting IFC → FRAG…", 0.15);
+
+      const cancelPromise = new Promise<never>((_, rej) => { rejectActive = rej; });
+
+      // Browser parse timeout (#231 follow-up): the conversion used to race
+      // only against user cancel, so a stalled conversion wedged the queue
+      // on "converting…" forever. The watchdog re-arms on every progress
+      // callback and rejects through the same rejectActive the Cancel button
+      // uses — but as a failure, never as a cancellation (see
+      // timeoutActiveConversion). Honest limit: a synchronous hang inside
+      // one WASM call cannot be interrupted from the page; that class is
+      // stopped before WASM by the structural pre-flight.
+      importTimeout = new ImportTimeout(
+        t.file.name,
+        computeImportTimeoutMs(t.sizeMB, {
+          stallMs: ifcSettings.importStallTimeoutMs,
+          totalMs: ifcSettings.importTotalTimeoutMs || undefined,
+        }),
+        { onTimeout: (error) => timeoutActiveConversion(error) },
+      );
+
+      const settings: any = {
+        bytes,
+        progressCallback: (progress: any, data?: any) => {
+          // A conversion abandoned by timeout/cancel may still call back
+          // from WASM later; its updates belong to no live task anymore.
+          if (importTimedOut || cancelRequested) return;
+          importTimeout?.poke();
+          // poke() can fire the total bound synchronously (single-thread
+          // conversion); stop touching the task once it has.
+          if (importTimedOut || cancelRequested) return;
+          t.progress = normalizeProgress(progress);
+          t.phase = describePhase(data);
+          t.elapsedMs = performance.now() - t0;
+          refreshTaskRow(t);
+          loader?.set?.(`${t.phase} · ${t.progress}%`, 0.15 + 0.7 * (t.progress / 100));
+        },
+      };
+      if (ifcSettings.useCoord) {
+        settings.coordToPlace = [ifcSettings.coordX, ifcSettings.coordY, ifcSettings.coordZ];
+      }
+
+      const convertT0 = performance.now();
+      const processPromise = getImporter().process(settings);
+      processPromise.catch(() => { /* handled via race */ });
+      importTimeout.start();
+      const rawResult: any = await Promise.race([processPromise, cancelPromise]);
+      importTimeout.clear();
+      rejectActive = null;
+      convertMs = performance.now() - convertT0;
+
+      if (cancelRequested) throw new Error("Cancelled by user");
+
+      fragBytes = snapshotBytes(rawResult);
+      if (!fragBytes.byteLength) {
+        throw new Error(
+          "Converter returned empty data. For large IFCZIP/IFC this often means the browser ran out of memory " +
+          "during web-ifc conversion — try a machine with more RAM, split the model, or pre-convert to .frag.",
+        );
+      }
+      try {
+        if (cacheKey) await setCachedFrag(cacheKey, fragBytes);
+      } catch {
+        /* */
+      }
+    }
+
+    const projectBytes: Uint8Array = snapshotBytes(fragBytes);
+    if (ifcSettings.keepFragInMemory) t.fragBytes = snapshotBytes(fragBytes);
+
+    t.status = "loading"; t.progress = 100; t.phase = "loading fragments into scene…";
+    refreshTaskRow(t);
+    loader?.set?.("Loading fragments into scene…", 0.9);
+
+    const modelId = await nextModelId(t.file.name);
+    t.modelId = modelId;
+
+    const fragLoadT0 = performance.now();
+    await ctx.fragments.core.load(fragBytes, { modelId });
+    fragLoadMs = performance.now() - fragLoadT0;
+
+    registerModel(modelId);
+
+    try { computeSceneBounds(); } catch { /* */ }
+
+    // Critical: non-empty FRAG buffer can still have 0 drawable items (OOM / ABI).
+    // Do not report success with an empty scene.
+    let geomCount = -1;
+    try {
+      const model: any = ctx.fragments.list.get(modelId);
+      if (model && typeof model.getItemsIdsWithGeometry === "function") {
+        const ids = await model.getItemsIdsWithGeometry();
+        geomCount = Array.isArray(ids) ? ids.length : 0;
+        t.elements = geomCount;
+      }
+    } catch { /* count optional */ }
+    if (geomCount === 0) {
+      try { await (ctx.fragments.core as any)?.disposeModel?.(modelId); } catch { /* */ }
+      try { unregisterModel(modelId); } catch { /* */ }
+      throw new Error(
+        "IFC linked but the scene has 0 drawable elements (empty geometry). " +
+        "This usually means the browser ran out of memory mid-conversion or " +
+        "WASM/app versions are mismatched. Convert to .frag and use Link FRAG, " +
+        "or hard-reload (Ctrl+Shift+R) and retry.",
+      );
+    }
+
+    try {
+      (ctx.features.projects as any)?.onModelImported?.(modelId, t.file.name, projectBytes);
+    } catch (e) { console.warn("[ifc] project persistence hook failed", e); }
+
+    t.elapsedMs = performance.now() - t0;
+    t.status = "done";
+    t.phase = geomCount > 0 ? `done · ${geomCount} elements` : "done";
+    refreshTaskRow(t);
+
+    recordImportPhase(t, convertMs, fragLoadMs, geomCount);
+
+    if (geomCount < 0) {
+      const model: any = ctx.fragments.list.get(modelId);
+      (model as any)?.getItemsIdsWithGeometry?.()
+        ?.then((ids: number[]) => { t.elements = ids?.length ?? undefined; refreshTaskRow(t); })
+        .catch(() => { /* */ });
+    }
+  } catch (err: any) {
+    rejectActive = null;
+    try { importTimeout?.clear(); } catch { /* */ }
+    const msg = errorMessage(err);
+    const cancelled = cancelRequested || msg.toLowerCase().includes("cancel");
+    t.elapsedMs = performance.now() - t0;
+    // A timeout is observable in the bench phase log (bench/bench-browser.mjs
+    // reads lastImportPhases): the conversion is recorded with its elapsed
+    // time and timedOut set, so the bound shows up in measurements instead
+    // of vanishing. (The error message itself contains no "cancel", so the
+    // classification above already puts it in the failed branch.)
+    if (importTimedOut || err instanceof IfcImportTimeoutError) {
+      recordImportPhase(t, t.elapsedMs, 0, -1, { timedOut: true });
+    }
+    if (cancelled) { t.status = "cancelled"; t.phase = "cancelled by user"; }
+    else {
+      console.error("[ifc-import]", err);
+      // A wasm/embind BindingError about argument counts means the browser is
+      // running the bundled web-ifc glue against a STALE cached WASM (old
+      // service-worker / HTTP cache). Give the user the actual recovery action.
+      let userMsg = msg;
+      if (/BindingError|called with \d+ arguments/i.test(msg)) {
+        userMsg +=
+          " — your browser served a cached mix of app and WASM versions. " +
+          "Hard-reload once (Ctrl+Shift+R / empty cache) and retry.";
+      }
+      t.status = "failed"; t.phase = "failed";
+      t.error = userMsg;
+      // Large IFC/IFCZIP failures were previously only visible in the queue row.
+      try {
+        // Prefer recovery dialog for empty-geometry / OOM — not a dead-end alert
+        if (/0 drawable|out of memory|OOM|empty geometry|too large|BindingError/i.test(userMsg) || t.sizeMB > 80) {
+          offerLargeIfcRecovery([t.file]);
+        } else {
+          uiAlert(
+            `IFC import failed: ${t.file.name}\n\n${userMsg}\n\n` +
+            "Open Insert → Import Setup to inspect the queue and retry.",
+          );
+        }
+      } catch { /* */ }
+    }
+    refreshTaskRow(t);
+    disposeImporter();
+  } finally {
+    rejectActive = null;
+    updateQueueSummary();
+  }
+}
+
+// ── Settings ──
+const inpCss =
+  "width:100%;box-sizing:border-box;padding:4px 6px;background:#1a1a24;border:1px solid #3a3a4a;border-radius:4px;color:#e2e8f0;font-size:11px";
+
+export const settingsBox = document.createElement("details");
+settingsBox.style.cssText =
+  "margin:8px 0;border:1px solid #2a2a35;border-radius:6px;padding:8px;background:#14141c;font-size:11px";
+settingsBox.innerHTML = `
+  <summary style="cursor:pointer;font-weight:600;opacity:.85">Importer settings</summary>
+  <div style="margin-top:8px;display:grid;gap:8px">
+    <label style="display:grid;gap:2px">WASM source
+      <select id="ifcCdn" style="${inpCss}">
+        <option value="local">Local (recommended)</option>
+        <option value="custom">Custom path…</option>
+      </select>
+    </label>
+    <label id="ifcCustomRow" style="display:none;gap:2px">Custom WASM folder URL (must end with /)
+      <input id="ifcCustom" style="${inpCss}" placeholder="https://my-cdn/web-ifc/">
+    </label>
+    <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="ifcRecenter"> Recenter first model to origin</label>
+    <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="ifcKeep"> Keep converted .frag in memory</label>
+    <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="ifcReplace"> Replace existing model with same name</label>
+    <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="ifcFit"> Auto-fit camera after import</label>
+    <label style="display:grid;gap:2px">Hard max file size (MB)
+      <input id="ifcMax" type="number" min="1" style="${inpCss}">
+    </label>
+    <label style="display:grid;gap:2px">Browser-safe conversion limit (MB)
+      <input id="ifcSafeMax" type="number" min="10" style="${inpCss}">
+      <span style="opacity:.65;font-size:10px">Above this, IFC is skipped unless "Allow unsafe large IFC" is on. Default 2300 MB — linking IFC up to 2.3 GB and IFCZIP up to 700 MB converts in-browser. Honest caveat: conversion above ~700 MB risks running out of memory (tab crash) — for those, Convert &amp; link once (FRAG cache) or offline .frag is the reliable path.</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="ifcAllowUnsafe"> Allow unsafe large IFC (may crash the tab)</label>
+    <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="ifcAutoHandoff"> Auto convert+link large IFC (skip dialog)</label>
+  </div>`;
+
+function syncSettingsUI() {
+  const $ = (id: string) => settingsBox.querySelector(`#${id}`) as any;
+  $("ifcCdn").value = ifcSettings.cdn;
+  $("ifcCustom").value = ifcSettings.customPath;
+  $("ifcCustomRow").style.display = ifcSettings.cdn === "custom" ? "grid" : "none";
+  $("ifcRecenter").checked = !!ifcSettings.recenter;
+  $("ifcKeep").checked = ifcSettings.keepFragInMemory;
+  $("ifcReplace").checked = ifcSettings.replaceExisting;
+  $("ifcFit").checked = ifcSettings.autoFit;
+  $("ifcMax").value = String(ifcSettings.maxSizeMB);
+  $("ifcSafeMax").value = String(ifcSettings.browserSafeMaxMB ?? 2300);
+  $("ifcAllowUnsafe").checked = !!ifcSettings.allowUnsafeLargeIfc;
+  try { $("ifcAutoHandoff").checked = largeIfcAutoHandoff(); } catch { /* */ }
+}
+
+settingsBox.addEventListener("change", (e) => {
+  const el = e.target as HTMLInputElement;
+  const rebuild = () => disposeImporter();
+  switch (el.id) {
+    case "ifcCdn": ifcSettings.cdn = el.value as IfcSettings["cdn"]; syncSettingsUI(); rebuild(); break;
+    case "ifcCustom": ifcSettings.customPath = el.value.trim(); rebuild(); break;
+    case "ifcRecenter":
+      ifcSettings.recenter = el.checked;
+      setRecenterEnabled(el.checked);
+      if (el.checked) recenterSceneNow(); else resetOffsets();
+      break;
+    case "ifcKeep": ifcSettings.keepFragInMemory = el.checked; break;
+    case "ifcReplace": ifcSettings.replaceExisting = el.checked; break;
+    case "ifcFit": ifcSettings.autoFit = el.checked; break;
+    case "ifcMax": ifcSettings.maxSizeMB = Math.max(1, Number(el.value) || 4000); break;
+    case "ifcSafeMax": ifcSettings.browserSafeMaxMB = Math.max(10, Number(el.value) || 2300); break;
+    case "ifcAllowUnsafe": ifcSettings.allowUnsafeLargeIfc = el.checked; break;
+    case "ifcAutoHandoff": try { localStorage.setItem(LARGE_IFC_AUTO_HANDOFF_KEY, el.checked ? "1" : "0"); } catch { /* */ } break;
+  }
+  saveIfcSettings();
+});
+
+export const queueButtons = document.createElement("div");
+queueButtons.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:4px";
+queueButtons.innerHTML = `
+  <button data-qa="cancelCurrent" style="${btnCss}">Cancel current</button>
+  <button data-qa="cancelAll" style="${btnCss}">Cancel all</button>
+  <button data-qa="clearFinished" style="${btnCss}">Clear finished</button>`;
+
+// ═════════════════════════════════════════════════════════════════════════
+// PUBLIC LOADERS
+// ═════════════════════════════════════════════════════════════════════════
+
+export async function loadFragFiles(files: FileList | File[]) {
+  const list = Array.from(files);
+  if (!list.length) return;
+
+  const loader = (ctx.features as any).appLoader;
+  loader?.begin?.(`Loading ${list.length} .frag file(s)…`, { cancellable: false });
+
+  // Same measured contention as the IFC queue: N main-thread fragments loads
+  // while the 3D loop keeps rasterizing the (hidden-by-loader) scene. Pause
+  // for the loop, restore before the positioning/fit section below.
+  let restoreRenderer: (() => void) | null = null;
+  try {
+    restoreRenderer = pauseRenderLoop((ctx.world as any)?.renderer);
+  } catch { /* rendering is optional */ }
+
+  try {
+    let i = 0;
+    for (const file of list) {
+      i++;
+      loader?.set?.(`Loading ${i} / ${list.length} · ${file.name}`, i / list.length);
+      try {
+        if (file.size === 0) {
+          uiAlert(`"${file.name}" is empty (0 bytes).`);
+          continue;
+        }
+        // Size bound before the FRAG bytes are buffered or handed to the
+        // fragments parser (issue #90). FRAG has no public magic to check;
+        // the parser itself rejects corrupt content, and a 0-element model
+        // is disposed again below.
+        assertFileAllowed("frag", file.name, file.size);
+        const buffer = await file.arrayBuffer();
+        const projectBytes = new Uint8Array(buffer.slice(0));
+
+        const modelId = file.name.replace(/\.frag$/i, "").trim() || `model-${Date.now()}`;
+        let id = modelId;
+        try { if (ctx.fragments.list.has(id)) id = await nextModelId(file.name); }
+        catch { id = modelId; }
+
+        await ctx.fragments.core.load(buffer, { modelId: id });
+        registerModel(id);
+
+        try {
+          const model: any = ctx.fragments.list.get(id);
+          if (model?.getItemsIdsWithGeometry) {
+            const ids = await model.getItemsIdsWithGeometry();
+            if (Array.isArray(ids) && ids.length === 0) {
+              try { await (ctx.fragments.core as any)?.disposeModel?.(id); } catch { /* */ }
+              try { unregisterModel(id); } catch { /* */ }
+              throw new Error("FRAG has 0 drawable elements — file may be corrupt or incomplete.");
+            }
+          }
+        } catch (e) {
+          if (e instanceof Error && /0 drawable/.test(e.message)) throw e;
+          /* count optional */
+        }
+
+        try {
+          (ctx.features.projects as any)?.onModelImported?.(id, file.name, projectBytes);
+        } catch (e) { console.warn("[frag-load] project persistence hook failed", e); }
+      } catch (err: any) {
+        console.error("[frag-load]", err);
+        uiAlert(`Failed: ${file.name}\n${errorMessage(err)}`);
+      }
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    // Restore the render loop before positioning/fit so the final camera
+    // state renders; the guard composes with the plan-overlay pause.
+    try { restoreRenderer?.(); } catch { /* */ }
+    restoreRenderer = null;
+
+    // Linking sequence (old OpenBIMStudio FRAG linker): load as-is, apply mode,
+    // then origin-to-origin so federated models stay coordinated.
+    try { await applyPositioningMode(ifcSettings.positioning); } catch (e) { console.warn(e); }
+    try {
+      if (ifcSettings.positioning === "origin-to-origin" || ifcSettings.positioning === "shared-coordinates") {
+        const { alignOriginToOrigin } = await import("./camera-tools");
+        alignOriginToOrigin();
+      }
+    } catch (e) { console.warn("[link-seq] alignOriginToOrigin", e); }
+
+    try { computeSceneBounds(); } catch { /* */ }
+    try { fitAll(); } catch { /* */ }
+    try { refreshModelSelectionUI(); } catch { /* */ }
+
+    setTimeout(() => {
+      try { (ctx.cam as any)?.recoverView?.(); } catch { /* */ }
+    }, 400);
+  } finally {
+    // Defensive: never leave the 3D loop paused if an exception escaped the
+    // try block before the normal restore point. Idempotent (null-checked).
+    try { restoreRenderer?.(); } catch { /* */ }
+    restoreRenderer = null;
+    loader?.finish?.();
+  }
+}
+
+
+/**
+ * Convert a single IFC (or already-extracted) file to FRAG bytes without
+ * loading it into the 3D scene. Used by the IFC→FRAG tool so users can
+ * convert once, download .frag, and Link FRAG later (much lighter).
+ */
+export async function convertIfcToFragBytes(
+  file: File,
+  opts?: {
+    onProgress?: (pct: number, phase: string) => void;
+    /** When true, skip the browser-safe size guard (still may OOM). */
+    force?: boolean;
+  },
+): Promise<{ frag: Uint8Array; fileName: string; schema: string; sizeMB: number }> {
+  const sizeMB = file.size / (1024 * 1024);
+  const onProgress = opts?.onProgress ?? (() => {});
+
+  // Large-model path: reuse IndexedDB FRAG cache (RVT-class "convert once")
+  try {
+    const cacheKey = await hashFileKey(file);
+    const cached = await getCachedFrag(cacheKey);
+    if (cached && cached.byteLength > 32) {
+      onProgress(100, "loaded from FRAG cache");
+      return {
+        frag: cached,
+        fileName: file.name.replace(/\.ifc(zip)?$/i, "") + ".frag",
+        schema: "cached",
+        sizeMB,
+      };
+    }
+    (opts as any).__cacheKey = cacheKey;
+  } catch {
+    /* cache optional */
+  }
+
+  if (sizeMB > ifcSettings.maxSizeMB) {
+    throw new Error(
+      `File is ${sizeMB.toFixed(0)} MB (hard limit ${ifcSettings.maxSizeMB} MB).`,
+    );
+  }
+  if (sizeMB > ifcSettings.browserSafeMaxMB && !opts?.force && !ifcSettings.allowUnsafeLargeIfc) {
+    throw new Error(
+      `IFC is ${sizeMB.toFixed(0)} MB — above the browser-safe limit (${ifcSettings.browserSafeMaxMB} MB). ` +
+      `Enable "Allow unsafe large IFC" in Importer settings, or split the model. ` +
+      `Note: multi-hundred-MB IFCs usually crash the tab during conversion.`,
+    );
+  }
+
+  onProgress(2, "reading file…");
+  // Same pre-parse validation as the queued import path (issue #90): size
+  // bound before the read, STEP preflight before the WASM parser, so a
+  // corrupt file cannot make web-ifc spin (issue #231). The FRAG-cache hit
+  // above returns first: that file was validated when it was converted.
+  assertFileAllowed("ifc", file.name, file.size);
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const pre = preflightStep(bytes);
+  // PE-20: same preflight-result + header gates as the queued import path.
+  assertValidStepPreflightResult(pre, file.name);
+  if (!pre.ok) throw new Error(`This file is not a valid IFC (STEP) file: ${pre.reason}${pre.line ? ` (line ${pre.line})` : ""}. It was not opened.`);
+  const header = parseStepHeader(bytes);
+  if (!header.ok) throw new Error(`This file is not a valid IFC (STEP) file: ${header.error}. It was not opened.`);
+  // PE-20: same Zod header gate as the queued import path.
+  assertValidStepFileHeader(header.value, file.name);
+  const schema = detectSchema(bytes);
+
+  onProgress(8, "checking WASM…");
+  await ensureWasmAvailable();
+
+  onProgress(12, "converting IFC → FRAG…");
+  cancelRequested = false;
+  importTimedOut = false;
+  const cancelPromise = new Promise<never>((_, rej) => {
+    rejectActive = rej;
+  });
+
+  // Same browser parse timeout as the queue path (see runTask): the
+  // conversion races cancel AND the watchdog, so a stalled conversion fails
+  // with the bound that fired instead of hanging the caller forever.
+  const importTimeout = new ImportTimeout(
+    file.name,
+    computeImportTimeoutMs(sizeMB, {
+      stallMs: ifcSettings.importStallTimeoutMs,
+      totalMs: ifcSettings.importTotalTimeoutMs || undefined,
+    }),
+    { onTimeout: (error) => timeoutActiveConversion(error) },
+  );
+
+  const settings: any = {
+    bytes,
+    progressCallback: (progress: any, data?: any) => {
+      if (importTimedOut || cancelRequested) return;
+      importTimeout.poke();
+      // poke() can fire the total bound synchronously (single-thread
+      // conversion); stop touching the task once it has.
+      if (importTimedOut || cancelRequested) return;
+      const pct = normalizeProgress(progress);
+      onProgress(12 + Math.round(pct * 0.85), describePhase(data));
+    },
+  };
+  if (ifcSettings.useCoord) {
+    settings.coordToPlace = [ifcSettings.coordX, ifcSettings.coordY, ifcSettings.coordZ];
+  }
+
+  try {
+    const processPromise = getImporter().process(settings);
+    processPromise.catch(() => { /* raced */ });
+    importTimeout.start();
+    const rawResult: any = await Promise.race([processPromise, cancelPromise]);
+    importTimeout.clear();
+    if (cancelRequested) throw new Error("Cancelled by user");
+
+    const frag = snapshotBytes(rawResult);
+    if (!frag.byteLength) {
+      throw new Error(
+        "Converter returned empty data (often out-of-memory on large IFC). " +
+        "Try a smaller model or a machine with more RAM.",
+      );
+    }
+    onProgress(100, "done");
+    const base = file.name.replace(/\.ifc$/i, "") || "model";
+    try {
+      const ck = (opts as any)?.__cacheKey;
+      if (ck) await setCachedFrag(ck, frag);
+    } catch {
+      /* cache optional */
+    }
+    return { frag, fileName: `${base}.frag`, schema, sizeMB };
+  } finally {
+    importTimeout.clear();
+    rejectActive = null;
+    // Free WASM between large conversions
+    try { disposeImporter(); } catch { /* */ }
+  }
+}
+
+export function loadIfcFiles(files: FileList | File[]) {
+  const list = Array.from(files as FileList | File[]);
+  if (!list.length) {
+    uiAlert("Please select one or more .ifc / .ifczip files.");
+    return;
+  }
+  void (async () => {
+    const loader = (ctx.features as any).appLoader;
+    try {
+      try { (await import("./tool-windows")).openToolWindow("import"); } catch { /* */ }
+      loader?.begin?.("Preparing IFC…", { cancellable: false });
+      const expanded = await expandIfcSources(list, (msg) => {
+        try { loader?.set?.(msg, 0.08); } catch { /* */ }
+      });
+      if (!expanded.length) {
+        uiAlert("No IFC models found. For .ifczip, the archive must contain at least one .ifc entry.");
+        return;
+      }
+      const totalMb = expanded.reduce((s, f) => s + f.size, 0) / (1024 * 1024);
+      if (totalMb > ifcSettings.browserSafeMaxMB) {
+        console.warn(
+          `[importer] large IFC payload ${totalMb.toFixed(0)} MB — above browser-safe limit ` +
+          `(${ifcSettings.browserSafeMaxMB} MB); will skip unless allowUnsafeLargeIfc is on`,
+        );
+      }
+      enqueueIfc(expanded);
+    } catch (err: any) {
+      console.error("[importer] expandIfcSources", err);
+      uiAlert(errorMessage(err));
+    } finally {
+      try { loader?.finish?.(); } catch { /* */ }
+    }
+  })();
+}
+
+export function pickFiles(
+  accept: string,
+  multiple: boolean,
+  handler: (files: FileList) => void,
+) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = accept;
+  input.multiple = multiple;
+  input.onchange = () => { if (input.files?.length) handler(input.files); };
+  input.click();
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Setup
+// ═════════════════════════════════════════════════════════════════════════
+export function setupImporter() {
+  setRecenterEnabled(!!ifcSettings.recenter);
+  syncSettingsUI();
+  syncPositioningSelect();
+
+  queueButtons.addEventListener("click", (e) => {
+    const act = (e.target as HTMLElement).dataset?.qa;
+    if (act === "cancelCurrent") cancelActiveConversion();
+    else if (act === "cancelAll") cancelQueueAll();
+    else if (act === "clearFinished") clearFinishedTasks();
+  });
+
+  const dropHint = document.createElement("div");
+  dropHint.style.cssText =
+    "position:absolute;inset:0;display:none;align-items:center;justify-content:center;" +
+    "background:rgba(56,189,248,.08);border:2px dashed #38bdf8;z-index:50;" +
+    "pointer-events:none;color:#38bdf8;font:600 16px system-ui,sans-serif";
+  dropHint.textContent = "Drop .ifc / .ifczip / .frag files to import";
+  ctx.rightHost.appendChild(dropHint);
+
+  let dragDepth = 0;
+  ctx.rightHost.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    dragDepth++;
+    dropHint.style.display = "flex";
+  });
+  ctx.rightHost.addEventListener("dragover", (e) => e.preventDefault());
+  ctx.rightHost.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) dropHint.style.display = "none";
+  });
+  ctx.rightHost.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    dropHint.style.display = "none";
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    if (!files.length) return;
+    const fragFiles = files.filter((f) => /\.frag$/i.test(f.name));
+    const ifcFiles = files.filter((f) => /\.(ifc|ifczip)$/i.test(f.name));
+    if (fragFiles.length) void loadFragFiles(fragFiles);
+    if (ifcFiles.length) loadIfcFiles(ifcFiles);
+    // DWG/DXF has no place in the BIM scene — hand it to the CAD editor
+    // (opened lazily) instead of ignoring the drop silently.
+    const cadFiles = files.filter((f) => /\.(dwg|dxf)$/i.test(f.name));
+    if (cadFiles.length) {
+      void import("./cad-viewer").then((m) => {
+        for (const f of cadFiles) m.openCadViewer(f);
+      });
+    }
+    // Everything else (RVT, GLB/OBJ/FBX…, GeoJSON/Shapefile, ZIP…) goes through the universal importer, which
+    // batches same-kind files and shows an honest message for formats it cannot read, instead of ignoring the drop.
+    const others = files.filter((f) => !/\.(frag|ifc|ifczip|dwg|dxf)$/i.test(f.name));
+    if (others.length) void import("./file-interop").then((m) => m.importFiles(others));
+  });
+
+  ctx.features.importer = {
+    loadIfcFiles, loadFragFiles, cancelActiveConversion,
+    getPositioningMode, setPositioningMode, applyPositioningMode,
+    registerModel, unregisterModel, clearAllOffsets,
+    setModelOffset, getModelOffset, setModelRotation, getModelRotation, listRegisteredModels,
+    getModelBBox, getModelBBoxCenter,
+    onOffsetsChanged,
+    /** Benchmark diagnostics: per-file import phase timings (read-only). */
+    lastImportPhases: (): ImportPhaseRecord[] => [...importPhaseLog],
+    /** Interop reports of the last 50 imported IFC files (read-only). */
+    interopReports: (): IfcInteropReport[] =>
+      importQueue.map((t) => t.interop).filter(Boolean) as IfcInteropReport[],
+  };
+
+  console.log("[importer] ready · positioning modes + live offset control");
+}

@@ -1,0 +1,247 @@
+import * as THREE from "three";
+import { ctx } from "../core/context";
+import { notify } from "../core/notify";
+import { planeForAxis } from "./section-plane-math";
+import { isSectionOn, setSectionOn, deleteSectionPlanes, onSectionModeChange } from "./section";
+import { setMeasureEnabled } from "./measure";
+import { getSceneBox } from "./camera-tools";
+
+let modalEl: HTMLDivElement | null = null;
+let activePlane: THREE.Plane | null = null;
+let activeHelper: THREE.Mesh | null = null;
+let reversed = false;
+let offModeListener: (() => void) | null = null;
+
+export function setupSectionModal() {
+  console.log("[section-modal] Module loaded.");
+  (window as any).__obsOpenSectionModal = openSectionModal;
+}
+
+export function openSectionModal() {
+  if (modalEl) { modalEl.remove(); offModeListener?.(); offModeListener = null; }
+
+  // Reset only this window's own axis cut; interactive (double-click) planes are kept.
+  clearSection();
+  reversed = false;
+
+  // Floating window, NOT a blocking overlay: the viewport must stay clickable so planes can be
+  // created with a double-click on a face and dragged by their arrow while this window is open.
+  modalEl = document.createElement("div");
+  modalEl.style.cssText = "position:fixed;top:84px;right:18px;z-index:99999;pointer-events:none;font:13px system-ui,sans-serif;";
+  
+  const win = document.createElement("div");
+  win.style.cssText = "pointer-events:auto;background:#1e2029;border:1px solid #2a2e3a;border-radius:8px;width:380px;max-width:90vw;max-height:calc(100vh - 120px);overflow:auto;display:flex;flex-direction:column;color:#e8eaf0;box-shadow:0 20px 50px rgba(0,0,0,.5);";
+  
+  const header = document.createElement("div");
+  header.style.cssText = "padding:12px 16px;border-bottom:1px solid #2a2e3a;display:flex;justify-content:space-between;align-items:center;background:#161a22;border-radius:8px 8px 0 0;";
+  header.innerHTML = "<div style='font-weight:700;font-size:15px'>Section Cut</div>";
+  
+  const closeBtn = document.createElement("button");
+  closeBtn.innerHTML = "&#x2715;";
+  closeBtn.style.cssText = "background:transparent;border:none;color:#8b949e;font-size:18px;cursor:pointer;";
+  closeBtn.onclick = () => closeWindow();
+  header.appendChild(closeBtn);
+  win.appendChild(header);
+
+  const body = document.createElement("div");
+  body.style.cssText = "padding:16px;background:#0f1117;display:flex;flex-direction:column;gap:12px;";
+  
+  // ── Interactive section (formerly the Tools-panel "Section Cut" group)
+  const live = document.createElement("div");
+  live.style.cssText = "display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid #2a2e3a;border-radius:6px;background:#12151c;";
+  const liveTitle = document.createElement("div");
+  liveTitle.textContent = "Interactive section";
+  liveTitle.style.cssText = "font-weight:700;color:#e8eaf0;";
+  const liveRow = document.createElement("label");
+  liveRow.style.cssText = "display:flex;gap:8px;align-items:center;cursor:pointer;color:#cbd2dc;";
+  const liveChk = document.createElement("input");
+  liveChk.type = "checkbox";
+  liveChk.checked = isSectionOn();
+  liveChk.onchange = () => { setSectionOn(liveChk.checked); if (liveChk.checked) setMeasureEnabled(false); };
+  const liveTxt = document.createElement("span");
+  liveTxt.textContent = "Double-click a face to cut parallel to it";
+  liveRow.append(liveChk, liveTxt);
+  const liveHint = document.createElement("div");
+  liveHint.textContent = "Then drag the plane's arrow to move the cut forward / back. Esc cancels a drag.";
+  liveHint.style.cssText = "font-size:11px;color:#8b949e;";
+  const liveDel = document.createElement("button");
+  liveDel.textContent = "\u{1F5D1} Delete all planes";
+  liveDel.style.cssText = "padding:6px 10px;background:#3b0d0d;color:#fca5a5;border:1px solid #7f1d1d;border-radius:4px;cursor:pointer;font-weight:600;align-self:flex-start;";
+  liveDel.onclick = () => { deleteSectionPlanes(); };
+  live.append(liveTitle, liveRow, liveHint, liveDel);
+  body.appendChild(live);
+  offModeListener = onSectionModeChange((on) => { liveChk.checked = on; });
+
+  // ── Axis cut
+  const axisTitle = document.createElement("div");
+  axisTitle.textContent = "Cut by axis";
+  axisTitle.style.cssText = "font-weight:700;color:#e8eaf0;margin-top:2px;";
+  body.appendChild(axisTitle);
+
+  // ── Axis Selection
+  const axisRow = document.createElement("div");
+  axisRow.style.cssText = "display:flex;align-items:center;justify-content:space-between;";
+  axisRow.innerHTML = "<span style='color:#8b949e;'>Axis</span>";
+  
+  const axisSel = document.createElement("select");
+  axisSel.style.cssText = "padding:4px 8px;background:#0b0d12;color:#e6e8ee;border:1px solid #2a2e3a;border-radius:4px;";
+  axisSel.innerHTML = `<option value="x">X (East/West)</option><option value="y">Y (Up/Down)</option><option value="z">Z (North/South)</option>`;
+  axisRow.appendChild(axisSel);
+  body.appendChild(axisRow);
+
+  // ── Position Slider
+  const posRow = document.createElement("div");
+  posRow.style.cssText = "display:flex;flex-direction:column;gap:4px;";
+  
+  const posLabel = document.createElement("div");
+  posLabel.style.cssText = "display:flex;justify-content:space-between;color:#8b949e;";
+  posLabel.innerHTML = "<span>Position</span><span id='obs-sec-pos-val'>0.00 m</span>";
+  
+  const posSlider = document.createElement("input");
+  posSlider.type = "range";
+  // Range follows the model bounds (±20% margin) instead of a hardcoded
+  // ±50 m so a small house isn't chopped at ±50 m and a 200 m plant isn't
+  // out of reach. Falls back to ±50 m when the scene is empty.
+  const posRange = (() => {
+    try {
+      const box = getSceneBox();
+      if (box && Number.isFinite(box.min.x) && !box.isEmpty()) {
+        const c = box.getCenter(new THREE.Vector3());
+        const s = box.getSize(new THREE.Vector3());
+        const half = Math.max(s.x, s.y, s.z) / 2 + c.length();
+        const r = Math.ceil(Math.max(5, half * 1.2) * 10) / 10;
+        return { min: -r, max: r };
+      }
+    } catch { /* scene not ready */ }
+    return { min: -50, max: 50 };
+  })();
+  posSlider.min = String(posRange.min);
+  posSlider.max = String(posRange.max);
+  posSlider.step = "0.1";
+  posSlider.value = "0";
+  posSlider.style.cssText = "width:100%;cursor:pointer;";
+  
+  posRow.appendChild(posLabel);
+  posRow.appendChild(posSlider);
+
+  // Exact dimension: type the cut position, and reverse the cut direction.
+  const exactRow = document.createElement("div");
+  exactRow.style.cssText = "display:flex;gap:8px;align-items:center;margin-top:4px";
+  const exactInp = document.createElement("input");
+  exactInp.type = "number"; exactInp.step = "0.01"; exactInp.value = "0.00";
+  exactInp.title = "Exact cut position in metres";
+  exactInp.style.cssText = "flex:1;padding:5px 8px;background:#0b0d12;color:#e6e8ee;border:1px solid #2a2e3a;border-radius:4px;font:12px ui-monospace,monospace";
+  const revBtn = document.createElement("button");
+  const paintRev = () => { revBtn.textContent = reversed ? "\u21c4 Reversed (keeps lower side)" : "\u21c4 Reverse direction"; revBtn.style.borderColor = reversed ? "#ef4444" : "#3d4250"; };
+  revBtn.style.cssText = "padding:5px 10px;background:#2a2e3a;color:#e8eaf0;border:1px solid #3d4250;border-radius:4px;cursor:pointer;white-space:nowrap";
+  paintRev();
+  exactRow.append(exactInp, revBtn);
+  posRow.appendChild(exactRow);
+  body.appendChild(posRow);
+
+  // ── Apply buttons
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;justify-content:space-between;margin-top:8px;";
+  
+  const btnClear = document.createElement("button");
+  btnClear.textContent = "Clear Section";
+  btnClear.style.cssText = "padding:8px 12px;background:#3b0d0d;color:#fca5a5;border:1px solid #7f1d1d;border-radius:4px;cursor:pointer;font-weight:bold;";
+  btnClear.onclick = () => { clearSection(); posSlider.value = "0"; exactInp.value = "0.00"; reversed = false; paintRev(); updatePosLabel(); };
+  
+  const btnApply = document.createElement("button");
+  btnApply.textContent = "Apply Section";
+  btnApply.style.cssText = "padding:8px 12px;background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:bold;";
+  btnApply.onclick = () => applySection(axisSel.value as "x"|"y"|"z", Number.isFinite(parseFloat(exactInp.value)) ? parseFloat(exactInp.value) : parseFloat(posSlider.value));
+
+  btnRow.appendChild(btnClear);
+  btnRow.appendChild(btnApply);
+  body.appendChild(btnRow);
+  win.appendChild(body);
+
+  const footer = document.createElement("div");
+  footer.style.cssText = "padding:12px 16px;border-top:1px solid #2a2e3a;display:flex;justify-content:flex-end;background:#161a22;border-radius:0 0 8px 8px;";
+  const closeFooterBtn = document.createElement("button");
+  closeFooterBtn.textContent = "Close";
+  closeFooterBtn.style.cssText = "padding:6px 16px;background:#2a2e3a;color:#e8eaf0;border:none;border-radius:4px;cursor:pointer;";
+  closeFooterBtn.onclick = () => closeWindow();
+  footer.appendChild(closeFooterBtn);
+  win.appendChild(footer);
+
+  const updatePosLabel = (v?: number) => {
+    const el = document.getElementById("obs-sec-pos-val");
+    if (el) el.textContent = `${(v ?? parseFloat(posSlider.value)).toFixed(2)} m`;
+  };
+
+  const currentPos = () => parseFloat(exactInp.value);
+  exactInp.onkeydown = (e) => e.stopPropagation();
+  exactInp.oninput = () => {
+    const v = currentPos();
+    if (!Number.isFinite(v)) return;
+    posSlider.value = String(Math.max(posRange.min, Math.min(posRange.max, v)));
+    updatePosLabel(v);
+    applySection(axisSel.value as "x"|"y"|"z", v);
+  };
+  revBtn.onclick = () => {
+    reversed = !reversed; paintRev();
+    const v = currentPos();
+    applySection(axisSel.value as "x"|"y"|"z", Number.isFinite(v) ? v : parseFloat(posSlider.value));
+  };
+  posSlider.oninput = () => {
+    exactInp.value = parseFloat(posSlider.value).toFixed(2);
+    updatePosLabel();
+    applySection(axisSel.value as "x"|"y"|"z", parseFloat(posSlider.value));
+  };
+  
+  axisSel.onchange = () => {
+    applySection(axisSel.value as "x"|"y"|"z", Number.isFinite(currentPos()) ? currentPos() : parseFloat(posSlider.value));
+  };
+
+  modalEl.appendChild(win);
+  document.body.appendChild(modalEl);
+}
+
+function closeWindow(): void {
+  modalEl?.remove(); modalEl = null;
+  offModeListener?.(); offModeListener = null;
+}
+
+function applySection(axis: "x"|"y"|"z", pos: number) {
+  clearSection();
+
+  // Plane keeps n.p + c >= 0. Reversed flips the normal so the opposite side is kept.
+  const pl = planeForAxis(axis, pos, reversed);
+  activePlane = new THREE.Plane(new THREE.Vector3(pl.normal.x, pl.normal.y, pl.normal.z), pl.constant);
+
+  // Apply to the global Three.js renderer (clipping)
+  const renderer = ctx.world.renderer.three as THREE.WebGLRenderer;
+  if (renderer) {
+    renderer.localClippingEnabled = true;
+    renderer.clippingPlanes = [activePlane];
+  }
+
+  // Add a visual helper box to show the cut
+  const helperGeo = new THREE.PlaneGeometry(100, 100);
+  const helperMat = new THREE.MeshBasicMaterial({ color: 0xef4444, transparent: true, opacity: 0.2, side: THREE.DoubleSide });
+  activeHelper = new THREE.Mesh(helperGeo, helperMat);
+  
+  if (axis === "x") activeHelper.rotation.y = Math.PI / 2;
+  else if (axis === "y") activeHelper.rotation.x = -Math.PI / 2;
+  else activeHelper.rotation.y = 0; // z
+
+  activeHelper.position[axis] = pos;
+  ctx.world.scene.three.add(activeHelper);
+}
+
+function clearSection() {
+  const renderer = ctx.world.renderer.three as THREE.WebGLRenderer;
+  if (renderer) {
+    renderer.clippingPlanes = [];
+  }
+
+  if (activeHelper) {
+    ctx.world.scene.three.remove(activeHelper);
+    activeHelper.geometry.dispose();
+    (activeHelper.material as THREE.Material).dispose();
+    activeHelper = null;
+  }
+}
