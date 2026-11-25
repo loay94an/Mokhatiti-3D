@@ -425,10 +425,13 @@ class PlanCanvasView(context: Context) : View(context) {
             furniture.clear(); furniture.addAll(snapshot.furniture)
             levels.clear(); levels.addAll(snapshot.levels)
             activeLevelId = snapshot.activeLevelId.takeIf { id -> levels.any { it.id == id } } ?: levels.first().id
-        } else if(plan.isNotEmpty()) {
-            val removed = plan.removeAt(plan.lastIndex)
-            openings.removeAll { it.wallId == removed.id }
-            rooms.clear()
+        } else {
+            val lastActiveWall = plan.indexOfLast { it.levelId == activeLevelId }
+            if (lastActiveWall >= 0) {
+                val removed = plan.removeAt(lastActiveWall)
+                openings.removeAll { it.wallId == removed.id }
+                rooms.removeAll { it.levelId == activeLevelId }
+            }
         }
         selectedWallId = null
         selectedFurnitureId = null
