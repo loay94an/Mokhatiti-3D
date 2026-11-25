@@ -32,10 +32,9 @@ jobs:
           tmp="$(mktemp -d)"
           git clone --filter=blob:none https://github.com/laanlabs/openPlan3D.git "$tmp/upstream"
           git -C "$tmp/upstream" checkout --detach "$upstream_sha"
-          mkdir -p integrations/openPlan3D
-          git -C "$tmp/upstream" archive "$upstream_sha" | tar -x -C "$tmp"
-          rsync -a --ignore-existing "$tmp/" integrations/openPlan3D/
-          # The temporary clone metadata is never part of the imported tree.
+          mkdir -p "$tmp/snapshot" integrations/openPlan3D
+          git -C "$tmp/upstream" archive "$upstream_sha" | tar -x -C "$tmp/snapshot"
+          rsync -a --ignore-existing "$tmp/snapshot/" integrations/openPlan3D/
           rm -rf integrations/openPlan3D/.git
           test -f integrations/openPlan3D/package.json
           test -f integrations/openPlan3D/src/app.html
