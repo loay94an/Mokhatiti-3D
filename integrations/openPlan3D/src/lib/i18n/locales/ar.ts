@@ -1634,6 +1634,7 @@ export const ar: Partial<Record<TranslationKey, string>> = {
   "renderLab.errorJson": "بيانات GLB الوصفية ليست JSON صالحاً."
 
   "provider.errorAbsoluteUrl": "أدخل عنوان URL مطلقاً للمزوّد، مثل https://api.openai.com/v1.",
+  "provider.errorRequestFailed": "فشل طلب المزوّد (HTTP {status})."
   "provider.errorHttps": "استخدم HTTPS للمزوّدات البعيدة. يُسمح بـ HTTP فقط مع localhost أو 127.0.0.1 أو [::1].",
   "provider.errorCredentials": "يجب ألا يحتوي عنوان URL للمزوّد على بيانات اعتماد أو استعلام أو جزء إضافي. أدخل المفتاح بشكل منفصل.",
   "provider.errorNoProxy": "اختر عنوان URL لمزوّد الذكاء الاصطناعي. لا يستضيف هذا التطبيق وسيطاً للذكاء الاصطناعي.",
