@@ -8,7 +8,7 @@
     "dir": "rtl"
   },
   "app": {
-    "name": "استوديو نمذجة معلومات البناء المفتوح",
+    "name": "Open BIM Studio",
     "loading": "جارٍ التحميل…",
     "ready": "جاهز",
     "cancel": "إلغاء",
