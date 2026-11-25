@@ -40,14 +40,21 @@ Do not overwrite the repository root, Android wrapper, or existing Sweet Home 3D
 
 ## Current import progress
 
-The source archive is being transferred in sequential batches to branch `feat/openplan3d-import-arabic`, under `integrations/openPlan3D/`. The first seven batches have committed **60 upstream source/project files** so far, including:
+The full supplied source snapshot is now present in `integrations/openPlan3D/`.
 
-- MIT license and runtime/package/build configuration
-- Svelte application shell and TypeScript declarations
-- Original locale engine and label maps
-- Selected geometry, export, canvas, camera, drawing-scheduler, image utilities, deployment services, UI alert components and an initial set of regression tests/fixtures
+- The supplied ZIP contains 1,161 files.
+- The Git tree contains 1,163 files under the integration directory: the 1,161 upstream files plus this status report and the import/validation workflow.
+- Five independent Git blob hashes were compared with the supplied archive and matched exactly: `package.json`, `src/app.html`, `src/lib/i18n/index.ts`, `src/lib/i18n/locales/en.ts`, and `docs/curved-wall-hit-performance.md`.
+- The original source package configuration and MIT license remain in place.
+- The existing Sweet Home 3D project remains outside this integration directory.
 
-The existing Arabic starter dictionary and this status report are additional integration files, not part of the 33 upstream source files. The upload is still partial: the archive contains 1,161 files. No claim is made that all assets, models, tests, documentation or application modules have been transferred.
+## Arabic localization progress
+
+- Added the Arabic locale option to the settings dialog.
+- Added Arabic language metadata and automatic `dir="rtl"` / `dir="ltr"` switching through the existing locale store.
+- Added initial RTL CSS safeguards: left-aligned UI text mirrors in RTL, canvas elements retain LTR direction, and technical URL/email/password/numeric fields remain LTR.
+- Added the first reviewed Arabic dictionary batch: 185 of 1,567 source keys (11.8%). Untranslated keys currently fall back to English; the Arabic locale is therefore explicitly incomplete.
+- The existing interpolation placeholders are preserved in the translated strings.
 
 ## Remaining work
 
@@ -74,3 +81,8 @@ that are not already present, and pushes the remaining source/assets/tests to
 this integration branch. Existing localization work is preserved. This import
 must finish and its resulting file count must be audited before localization
 and build validation proceed.
+
+
+## 2026-11-25 continuation
+
+A root GitHub Actions workflow now imports any missing upstream files without overwriting existing work, then runs Node.js 24 dependency installation, Svelte/type checks, unit tests, and a production build. Its run result must be inspected before treating validation as passed.
