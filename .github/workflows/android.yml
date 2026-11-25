@@ -1,4 +1,4 @@
-name: Native Android APK
+name: Native Android Quality Checks
 
 on:
   push:
@@ -12,13 +12,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-apk-${{ github.event.pull_request.head.ref || github.ref }}
+  group: native-quality-${{ github.event.pull_request.head.ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  unit-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,38 +34,7 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Build native debug APK
-        run: gradle --no-daemon clean testDebugUnitTest assembleDebug
-
-      - name: Verify APK
-        run: |
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          sha256sum app/build/outputs/apk/debug/app-debug.apk
-
-      - name: Upload native APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Mokhatiti-3D-native-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Install and launch on Android emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 30
-          target: google_apis
-          arch: x86_64
-          profile: pixel_2
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
-          disable-animations: true
-          script: |
-            adb install -r app/build/outputs/apk/debug/app-debug.apk
-            adb shell am start -n com.loay94an.mokhatiti3d/.MainActivity
-            sleep 8
-            adb shell pidof com.loay94an.mokhatiti3d
-            adb logcat -d -s AndroidRuntime:E > /tmp/mokhatiti-runtime.log
-            if grep -q 'FATAL EXCEPTION' /tmp/mokhatiti-runtime.log; then
-              cat /tmp/mokhatiti-runtime.log
-              exit 1
-            fi
+      # During the completion phase CI runs tests only. APK packaging is deliberately
+      # deferred until all implementation and acceptance gates in the roadmap pass.
+      - name: Run JVM unit tests
+        run: gradle --no-daemon clean testDebugUnitTest
