@@ -86,7 +86,7 @@
   }
 
   function createFromTemplate(index: number) { return createProject(houseTemplates[index].create); }
-  function newProject() { return createProject(() => createDefaultProject()); }
+  function newProject() { return createProject(() => createDefaultProject($t('library.untitled'))); }
 
   /** The last copy Duplicate made: named in a status line and outlined in the list. */
   let duplicatedId = $state<string | null>(null);
