@@ -38,14 +38,21 @@ Keep the application isolated under:
 
 Do not overwrite the repository root, Android wrapper, or existing Sweet Home 3D engine.
 
-## Current implementation state
+## Current import progress
 
-The branch `feat/openplan3d-import-arabic` and draft PR #6 contain an initial Arabic translation resource and integration notes. The partial resource is not connected to the app and is not a complete translation. The uploaded archive has been inspected locally, but the full source tree has **not** been committed to the target repository.
+The source archive is being transferred in sequential batches to branch `feat/openplan3d-import-arabic`, under `integrations/openPlan3D/`. The first four batches have committed **33 source/project files** so far, including:
+
+- MIT license and runtime/package/build configuration
+- Svelte application shell and TypeScript declarations
+- Original locale engine and label maps
+- Selected geometry, export, canvas, camera, drawing-scheduler and image utility modules
+
+The existing Arabic starter dictionary and this status report are additional integration files, not part of the 33 upstream source files. The upload is still partial: the archive contains 1,161 files. No claim is made that all assets, models, tests, documentation or application modules have been transferred.
 
 ## Remaining work
 
-1. Resolve and document the source repository/provenance discrepancy against the supplied archive.
-2. Copy the complete source tree under `integrations/openPlan3D/`, preserving LICENSE, notices, assets, tests and project configuration.
+1. Continue transferring the complete source tree in batches, preserving original paths, binary assets, notices, tests and configuration.
+2. Verify every archive entry against the committed tree; account for all 1,161 files.
 3. Integrate Arabic into the locale type, dictionaries, selector and persistence; set `lang="ar"` and `dir="rtl"` correctly.
 4. Translate all 1,567 English locale keys and audit additional user-facing strings outside the dictionaries, including canvas-rendered labels and errors.
 5. Preserve interpolation placeholders and technical file formats/units.
@@ -55,4 +62,4 @@ The branch `feat/openplan3d-import-arabic` and draft PR #6 contain an initial Ar
 
 ## Import transport limitation
 
-The supplied ZIP is available for local inspection, but the current GitHub connection exposes individual Git object/file operations and no archive upload or bulk directory import operation. The execution container also cannot resolve `github.com` for a direct Git clone/push. Therefore this audit does not claim that the archive has been imported or that the application has been built or tested.
+The supplied ZIP is available for local inspection, but the current GitHub connection exposes individual Git object/file operations and no archive upload or bulk directory import operation. The execution container also cannot resolve `github.com` for a direct Git clone/push. Therefore the transfer is being performed through individual file commits in batches. Build and test validation have not yet been run against a complete imported tree.
