@@ -104,7 +104,7 @@
         throw new CaptureImportError('captureImport.format');
       }
       // A sibling planner's plan keeps its own title; iPhone captures keep the code-based name.
-      const project = createProjectFromRoomPlan(data, interchangeProjectName(data, `Room Capture ${code}`));
+      const project = createProjectFromRoomPlan(data, interchangeProjectName(data, $t('roomPlanDialog.captureProjectName', { code })));
       loadProject(project);
       // A storage failure must not discard a successfully downloaded capture.
       await autoSave();
