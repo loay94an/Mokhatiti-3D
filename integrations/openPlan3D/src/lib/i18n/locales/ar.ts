@@ -1585,6 +1585,8 @@ export const ar: Partial<Record<TranslationKey, string>> = {
   "renderLab.title": "مختبر التصيير",
   "renderLab.localFloorplan": "مخطط محلي",
   "renderLab.viewerCanvas": "تصيير تفاعلي للمخطط",
+  "renderLab.captureStudy": "دراسة الالتقاط",
+  "renderLab.loadFailed": "تعذر تحميل هذا النموذج. تحقق من الملف وحاول مجدداً."
   "renderLab.browserRendering": "التصيير عبر المتصفح",
   "renderLab.localWorkspace": "مساحة عمل محلية",
   "renderLab.eyebrow": "دراسة التصيير / 01",
