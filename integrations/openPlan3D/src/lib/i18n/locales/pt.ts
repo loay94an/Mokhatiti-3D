@@ -1638,8 +1638,8 @@ export const pt = {
   "provider.errorTimeout": "A solicitação ao provedor expirou. Ela não foi repetida; verifique o provedor antes de gerar novamente.",
   "provider.errorCancelled": "Solicitação cancelada. O provedor ainda pode concluir e cobrar pelo trabalho já iniciado.",
   "provider.errorConnection": "Não foi possível conectar diretamente ao provedor. Verifique a URL, HTTPS e as permissões CORS/rede local do navegador. Nenhum proxy ou nova tentativa automática foi usado.",
-  "provider.errorNoImage": "Nenhuma imagem foi retornada. Este provedor e modelo precisam oferecer suporte a POST /responses com a ferramenta image_generation. Tente outro modelo."
-"floorName.ground": "Térreo",
+  "provider.errorNoImage": "Nenhuma imagem foi retornada. Este provedor e modelo precisam oferecer suporte a POST /responses com a ferramenta image_generation. Tente outro modelo.",
+  "floorName.ground": "Térreo",
   "floorName.basement": "Subsolo",
   "floorName.basementNumber": "Subsolo {count}",
   "floorName.levelNumber": "Andar {count}",
