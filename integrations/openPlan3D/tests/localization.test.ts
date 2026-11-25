@@ -4,6 +4,7 @@ import { initializeLocale, locale, t, translate, type Locale } from '../src/lib/
 import { en } from '../src/lib/i18n/locales/en';
 import { pt } from '../src/lib/i18n/locales/pt';
 import { ar } from '../src/lib/i18n/locales/ar';
+import { defaultFloorName } from '../src/lib/utils/floors';
 
 afterEach(() => { vi.unstubAllGlobals(); locale.set('en'); });
 
@@ -22,6 +23,14 @@ describe('locale preferences', () => {
       expect(ar[key].trim()).not.toBe('');
       expect(ar[key].match(/\{\w+\}/g) ?? []).toEqual(en[key].match(/\{\w+\}/g) ?? []);
     }
+  });
+  it('uses the active language for generated floor names', () => {
+    locale.set('ar');
+    expect(defaultFloorName(0)).toBe('الطابق الأرضي');
+    expect(defaultFloorName(-2)).toBe('القبو 2');
+    expect(defaultFloorName(3)).toBe('الطابق 3');
+    locale.set('en');
+    expect(defaultFloorName(0)).toBe('Ground Floor');
   });
   it('updates subscribed text, persists the choice and sets document language', () => {
     const setItem = vi.fn();
