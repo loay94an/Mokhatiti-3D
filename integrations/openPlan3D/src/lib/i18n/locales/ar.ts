@@ -1587,7 +1587,7 @@ export const ar: Partial<Record<TranslationKey, string>> = {
   "renderLab.localFloorplan": "مخطط محلي",
   "renderLab.viewerCanvas": "تصيير تفاعلي للمخطط",
   "renderLab.captureStudy": "دراسة الالتقاط",
-  "renderLab.loadFailed": "تعذر تحميل هذا النموذج. تحقق من الملف وحاول مجدداً."
+  "renderLab.loadFailed": "تعذر تحميل هذا النموذج. تحقق من الملف وحاول مجدداً.",
   "renderLab.browserRendering": "التصيير عبر المتصفح",
   "renderLab.localWorkspace": "مساحة عمل محلية",
   "renderLab.eyebrow": "دراسة التصيير / 01",
@@ -1625,17 +1625,17 @@ export const ar: Partial<Record<TranslationKey, string>> = {
   "renderLab.embeddedGlbRequired": "استخدم ملف GLB مستقلاً يحتوي على خامات مضمّنة.",
   "renderLab.invalidBounds": "حدود النموذج غير صالحة أو فارغة.",
   "renderLab.pathTracingUnavailable": "تتبع المسار غير متاح: {error}. لا تزال المعاينة التفاعلية متاحة.",
-  "renderLab.pathTracingStopped": "توقف تتبع المسار: {error}"
+  "renderLab.pathTracingStopped": "توقف تتبع المسار: {error}",
 
   "renderLab.errorIncompleteGlb": "ملف GLB غير مكتمل.",
   "renderLab.errorValidGlb": "اختر ملف glTF 2.0 ثنائياً صالحاً بامتداد .glb.",
   "renderLab.errorMetadata": "بيانات GLB الوصفية غير صالحة أو يتجاوز حجمها الحد المسموح.",
   "renderLab.errorEmbeddedAssets": "استخدم ملف GLB مستقلاً يحتوي على خامات مضمّنة.",
   "renderLab.errorVertexLimit": "يدعم هذا العارض مليوني رأس شبكة كحد أقصى.",
-  "renderLab.errorJson": "بيانات GLB الوصفية ليست JSON صالحاً."
+  "renderLab.errorJson": "بيانات GLB الوصفية ليست JSON صالحاً.",
 
   "provider.errorAbsoluteUrl": "أدخل عنوان URL مطلقاً للمزوّد، مثل https://api.openai.com/v1.",
-  "provider.errorRequestFailed": "فشل طلب المزوّد (HTTP {status})."
+  "provider.errorRequestFailed": "فشل طلب المزوّد (HTTP {status}).",
   "provider.errorHttps": "استخدم HTTPS للمزوّدات البعيدة. يُسمح بـ HTTP فقط مع localhost أو 127.0.0.1 أو [::1].",
   "provider.errorCredentials": "يجب ألا يحتوي عنوان URL للمزوّد على بيانات اعتماد أو استعلام أو جزء إضافي. أدخل المفتاح بشكل منفصل.",
   "provider.errorNoProxy": "اختر عنوان URL لمزوّد الذكاء الاصطناعي. لا يستضيف هذا التطبيق وسيطاً للذكاء الاصطناعي.",
