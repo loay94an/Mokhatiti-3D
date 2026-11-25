@@ -340,7 +340,9 @@ class PlanCanvasView(context: Context) : View(context) {
                             val angle = Math.toRadians(-item.rotationDegrees.toDouble())
                             val localX = dx * kotlin.math.cos(angle).toFloat() - dy * kotlin.math.sin(angle).toFloat()
                             val localY = dx * kotlin.math.sin(angle).toFloat() + dy * kotlin.math.cos(angle).toFloat()
-                            abs(localX) <= item.width / 2f && abs(localY) <= item.depth / 2f
+                            val hitPaddingMetres = (12f * resources.displayMetrics.density) / pixelsPerMetre
+                            abs(localX) <= item.width / 2f + hitPaddingMetres &&
+                                abs(localY) <= item.depth / 2f + hitPaddingMetres
                         }
                     }
                     if (furnitureHit != null) {
@@ -353,8 +355,9 @@ class PlanCanvasView(context: Context) : View(context) {
                         drawing = false; invalidate(); return true
                     }
                     selectedFurnitureId = null
+                    val hitToleranceMetres = (24f * resources.displayMetrics.density) / pixelsPerMetre
                     val hit = plan.filter { it.levelId == activeLevelId }.minByOrNull { distanceToSegment(startX, startY, it) }
-                        ?.takeIf { distanceToSegment(startX, startY, it) <= 0.35f }
+                        ?.takeIf { distanceToSegment(startX, startY, it) <= hitToleranceMetres }
                     selectedWallId = hit?.id
                     selectionStartX = startX
                     selectionStartY = startY
@@ -633,8 +636,8 @@ class PlanCanvasView(context: Context) : View(context) {
         }
     }
 
-    fun loadPlan() {
-        val raw = prefs.getString("plan_json", null) ?: return
-        importPlanJson(raw)
+    fun loadPlan(): Boolean {
+        val raw = prefs.getString("plan_json", null) ?: return false
+        return importPlanJson(raw)
     }
 }
