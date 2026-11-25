@@ -1638,8 +1638,8 @@ export const en = {
   "provider.errorTimeout": "The provider request timed out. It was not retried; check the provider before generating again.",
   "provider.errorCancelled": "Request cancelled. The provider may still finish and charge for work already started.",
   "provider.errorConnection": "Cannot connect directly to the provider. Check its URL, HTTPS and browser CORS/local-network permissions. No proxy or automatic retry was used.",
-  "provider.errorNoImage": "No image returned. This provider and model must support POST /responses with the image_generation tool. Try another model."
-"floorName.ground": "Ground Floor",
+  "provider.errorNoImage": "No image returned. This provider and model must support POST /responses with the image_generation tool. Try another model.",
+  "floorName.ground": "Ground Floor",
   "floorName.basement": "Basement",
   "floorName.basementNumber": "Basement {count}",
   "floorName.levelNumber": "Floor {count}",
