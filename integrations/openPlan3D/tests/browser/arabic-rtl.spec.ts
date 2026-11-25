@@ -6,7 +6,8 @@ test('first visit starts in Arabic RTL, preserves the editor, and switches back 
   await expect(page.locator('html')).toHaveAttribute('lang', 'ar');
   await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
   await expect(page.getByRole('button', { name: 'الإعدادات', exact: true })).toBeVisible();
-  await expect(page.getByText('الطابق الأرضي', { exact: true })).toBeVisible();
+  const floorSelect = page.getByRole('combobox', { name: 'الطابق الحالي', exact: true });
+  await expect(floorSelect.locator('option:checked')).toHaveText('الطابق الأرضي');
   const canvas = page.locator('canvas').first();
   if (await canvas.count()) expect(await canvas.evaluate(element => getComputedStyle(element).direction)).toBe('ltr');
 
