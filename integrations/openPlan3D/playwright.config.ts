@@ -9,9 +9,8 @@ export default defineConfig({
   workers: 1,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
-  // Finish with reports before the job's 15-minute limit, even if a runner
-  // cannot provide graphics or many workflows fail for the same reason.
-  globalTimeout: process.env.CI ? 12 * 60_000 : undefined,
+  // Finish the broad localization browser suite within the workflow's 30-minute limit.
+  globalTimeout: process.env.CI ? 20 * 60_000 : undefined,
   maxFailures: process.env.CI ? 5 : undefined,
   timeout: 60_000,
   expect: { timeout: 10_000 },
