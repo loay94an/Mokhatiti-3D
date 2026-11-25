@@ -6,7 +6,7 @@ import { ar } from './locales/ar';
 export type Locale = 'en' | 'pt' | 'ar';
 export type TranslationKey = keyof typeof en;
 const dictionaries: Record<'en' | 'pt', Record<TranslationKey, string>> = { en, pt };
-const preference = writable<Locale>('en');
+const preference = writable<Locale>('ar');
 const isLocale = (value: unknown): value is Locale => value === 'en' || value === 'pt' || value === 'ar';
 
 export function translate(language: Locale, key: TranslationKey, variables: Record<string, string | number> = {}): string {
@@ -30,11 +30,11 @@ export const locale = {
   },
 };
 
-/** Run after hydration; SSR and the first client render always agree on English. */
+/** Run after hydration; Arabic is the first-visit language and saved choices remain respected. */
 export function initializeLocale() {
   let saved: unknown;
   try { saved = localStorage.getItem('o3d_locale'); } catch { /* Storage can be disabled. */ }
-  locale.set(isLocale(saved) ? saved : 'en');
+  locale.set(isLocale(saved) ? saved : 'ar');
 }
 
 /** Svelte's $t subscription updates labels without remounting dialogs or inputs. */
