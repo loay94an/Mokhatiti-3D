@@ -48,4 +48,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "Import OpenBIMStudio upstream source at f683696"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push --force origin "HEAD:${GITHUB_REF_NAME}"
