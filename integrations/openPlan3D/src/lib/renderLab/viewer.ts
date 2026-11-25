@@ -5,6 +5,10 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { WebGLPathTracer, DenoiseMaterial } from 'three-gpu-pathtracer';
 import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
+import { get } from 'svelte/store';
+import { locale, translate, type TranslationKey } from '$lib/i18n';
+
+const tr = (key: TranslationKey, variables?: Record<string, string | number>) => translate(get(locale), key, variables);
 
 export type LabStatus = { samples: number; triangles: number; mode: string; error?: string };
 export async function createViewer(host: HTMLElement, report: (status: LabStatus) => void) {
@@ -15,7 +19,7 @@ export async function createViewer(host: HTMLElement, report: (status: LabStatus
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   host.append(renderer.domElement);
-  renderer.domElement.setAttribute('aria-label', 'Interactive floorplan render');
+  renderer.domElement.setAttribute('aria-label', tr('renderLab.viewerCanvas'));
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#e8e5df');
   const camera = new THREE.PerspectiveCamera(35, 1, .05, 300);
@@ -86,7 +90,7 @@ export async function createViewer(host: HTMLElement, report: (status: LabStatus
     validateLocalGLB(buffer);
     const manager = new THREE.LoadingManager();
     // Embedded assets only. A model cannot request external textures or buffers.
-    manager.setURLModifier(url => { if (/^(blob:|data:)/.test(url)) return url; throw new Error('Use a self-contained GLB with embedded textures.'); });
+    manager.setURLModifier(url => { if (/^(blob:|data:)/.test(url)) return url; throw new Error(tr('renderLab.errorEmbeddedAssets')); });
     const gltf = await new GLTFLoader(manager).parseAsync(buffer, '');
     if (disposed) { release(gltf.scene); return; }
     if (model) { scene.remove(model); release(model); }
@@ -101,7 +105,7 @@ export async function createViewer(host: HTMLElement, report: (status: LabStatus
       }
     });
     const bounds = new THREE.Box3().setFromObject(model);
-    if (bounds.isEmpty() || !Number.isFinite(bounds.max.length())) { release(model); model = undefined; throw new Error('The model has invalid or empty bounds.'); }
+    if (bounds.isEmpty() || !Number.isFinite(bounds.max.length())) { release(model); model = undefined; throw new Error(tr('renderLab.invalidBounds')); }
     bounds.getCenter(center); model.position.sub(center);
     const size = bounds.getSize(new THREE.Vector3()); span = Math.max(size.x, size.z, size.y, 1);
     ground.position.y = bounds.min.y - center.y - .025;
@@ -124,7 +128,7 @@ export async function createViewer(host: HTMLElement, report: (status: LabStatus
       tracer.textureSize.set(1024, 1024); tracer.setScene(scene, camera);
     } catch (error) {
       tracer?.dispose(); tracer = undefined; quality = false;
-      notify(`Path tracing unavailable: ${error instanceof Error ? error.message : String(error)}. Interactive preview is available.`);
+      notify(tr('renderLab.pathTracingUnavailable', { error: error instanceof Error ? error.message : String(error) }));
     }
     ready = true; dirty = true; notify();
   }
@@ -134,7 +138,7 @@ export async function createViewer(host: HTMLElement, report: (status: LabStatus
     if (document.hidden) return;
     controls.update();
     if (ready && quality && tracer && !paused && tracer.samples < 512) {
-      try { tracer.renderSample(); } catch (error) { quality = false; notify(`Path tracing stopped: ${String(error)}`); }
+      try { tracer.renderSample(); } catch (error) { quality = false; notify(tr('renderLab.pathTracingStopped', { error: String(error) })); }
     } else if (dirty) { renderer.render(scene, camera); }
     dirty = false;
     if (time - lastReport > 300) { lastReport = time; notify(); }
