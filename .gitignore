@@ -1,0 +1,90 @@
+﻿# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Vite / env
+.env
+.env.*
+!.env.example
+
+# Logs & OS junk
+*.log
+npm-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Large BIM samples (uncomment if you have them)
+# samples/
+# *.ifc
+# *.ifcZIP
+
+# Old chunked text (keep out of the source tree)
+Project_Part_*.txt
+*.bak-*
+*.bak
+*.disabled
+
+# Bundle artifacts (local diagnostics only)
+obs-p*-*.txt
+
+# Local deploy backups (deploy-cad-update.ps1)
+_backup/
+
+# Test & diagnostic artifacts
+*.ifc
+# ...except the golden IFC corpus, which must be version-controlled so the
+# golden-roundtrip CI gate compares against committed sources + snapshots
+!tests/fixtures/ifc-corpus/*.ifc
+# ...and the invalid-model fixtures used by the semantics/fuzz gates
+!tests/fixtures/ifc-corpus/invalid/*.ifc
+# ...and the minimal malformed-input regression fixtures (issue #231)
+!tests/fixtures/ifc-corpus/malformed/*.ifc
+!tests/fixtures/ifc-corpus/extended/*.ifc
+# ...and the vendored third-party models (Duplex, Gymzaal — CC BY 4.0)
+!tests/fixtures/ifc-corpus/third-party/*.ifc
+obs-*.txt
+
+# Generated build-time WASM copy (scripts/copy-libredwg-wasm.mjs)
+public/libredwg/
+
+# temp dirs left by dwg isolation tests
+.dwg-iso-*/
+.dwg-lifecycle-*/
+
+# Wrangler local dev cache
+.wrangler/
+interop-report.json
+
+# Generated versioned web-ifc assets (scripts/sync-web-ifc-assets.mjs)
+public/web-ifc/0.*/
+.cad-dwg-export-independent-*/
+
+# RVT reader built from rvt-rs (scripts/build-rvt-wasm.mjs, committed by the "Build RVT reader" workflow); only generated extras are ignored
+public/rvt/*.d.ts
+public/rvt/package.json
+public/rvt/.gitignore
+.sketch-test-*/
+.vtc-test-*/
+.m3d-test-*/
+.dwg-test-*/
+.tmp-pdf-vector-test/
+.tmp-hatch-test/
+.tmp-draworder-test/
+test-results/
+.v69-engine-ui-test-
+.type-swap-test-
+
+# Generated OCR runtime (scripts/sync-ocr-assets.mjs)
+public/ocr/

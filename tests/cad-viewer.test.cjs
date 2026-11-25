@@ -1,0 +1,165 @@
+const { execSync } = require("child_process"); const fs=require("fs"),os=require("os"),path=require("path"),assert=require("assert");
+const out=fs.mkdtempSync(path.join(os.tmpdir(),"cv-"));
+execSync(`npx tsc src/modules/cad-viewer/viewer-math.ts --outDir ${out} --module commonjs --target es2020 --skipLibCheck --ignoreDeprecations 5.0`,{stdio:"inherit"});
+const find=(d,n)=>{for(const f of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,f.name);if(f.isDirectory()){const r=find(p,n);if(r)return r}else if(f.name===n)return p}};
+const m=require(find(out,"viewer-math.js"));
+let pass=0,fail=0;const t=(n,f)=>{try{f();pass++;console.log("  PASS "+n)}catch(e){fail++;console.log("  FAIL "+n+": "+e.message)}};
+const near=(a,b,e=1e-6)=>assert.ok(Math.abs(a-b)<e,`${a}!=${b}`);
+const L=(x1,y1,x2,y2,layer="0")=>({type:"LINE",layer,start:{x:x1,y:y1},end:{x:x2,y:y2}});
+const C=(x,y,r)=>({type:"CIRCLE",layer:"0",center:{x,y},radius:r});
+const A=(x,y,r,s,e)=>({type:"ARC",layer:"0",center:{x,y},radius:r,startAngle:s,endAngle:e});
+const P=(pts,closed)=>({type:"LWPOLYLINE",layer:"0",points:pts.map(([x,y])=>({x,y})),closed});
+const T=(x,y,h,v,rot=0)=>({type:"TEXT",layer:"0",position:{x,y},height:h,value:v,rotation:rot});
+const v0={cx:0,cy:0,scale:2,w:800,h:600};
+t("world/screen round trip, y flipped",()=>{const s=m.worldToScreen(v0,10,5);near(s.x,420);near(s.y,290);const w=m.screenToWorld(v0,s.x,s.y);near(w.x,10);near(w.y,5)});
+t("zoomAt keeps the point under the cursor",()=>{const before=m.screenToWorld(v0,300,200);const z=m.zoomAt(v0,300,200,3);const after=m.screenToWorld(z,300,200);near(before.x,after.x);near(before.y,after.y);near(z.scale,6)});
+t("zoom is clamped",()=>near(m.zoomAt(v0,0,0,1e12,1e-6,100).scale,100));
+t("fitView centres and fits the box",()=>{const v=m.fitView({minX:0,minY:0,maxX:100,maxY:50},800,600,0);near(v.cx,50);near(v.cy,25);near(v.scale,8)});
+t("panBy moves the content with the drag",()=>{const p=m.panBy(v0,20,-10);const s=m.worldToScreen(p,0,0);near(s.x,400+20);near(s.y,300-10)});
+t("zoomWindow fills the view with the rectangle",()=>{const z=m.zoomWindow(v0,{x:300,y:200},{x:500,y:400});const a=m.screenToWorld(v0,300,200),b=m.screenToWorld(v0,500,400);near(z.cx,(a.x+b.x)/2);near(z.cy,(a.y+b.y)/2);assert.ok(z.scale>v0.scale)});
+t("arc bbox includes quadrant extremes",()=>{const b=m.entityBBox(A(0,0,10,-45,45));near(b.maxX,10);near(b.minY,-Math.sin(Math.PI/4)*10);near(b.minX,Math.cos(Math.PI/4)*10)});
+t("angleInArc handles wrap-around",()=>{assert.ok(m.angleInArc(350,300,60));assert.ok(m.angleInArc(10,300,60));assert.ok(!m.angleInArc(180,300,60))});
+t("distance to entities",()=>{near(m.distToEntity(L(0,0,10,0),5,3),3);near(m.distToEntity(L(0,0,10,0),13,4),5);near(m.distToEntity(C(0,0,5),8,0),3);near(m.distToEntity(A(0,0,5,0,90),-3,-4),Math.hypot(0-(-3),5-(-4)) < Math.hypot(5+3,4) ? Math.hypot(3,9) : Math.hypot(8,4),1e-6)});
+t("closed polyline includes the closing edge",()=>{near(m.distToEntity(P([[0,0],[10,0],[10,10]],true),4,5),Math.SQRT1_2);assert.ok(m.distToEntity(P([[0,0],[10,0],[10,10]],false),4,5)>3)});
+t("text hit box",()=>{near(m.distToEntity(T(0,0,2,"abcd"),1,1),0);assert.ok(m.distToEntity(T(0,0,2,"abcd"),20,20)>10)});
+t("measure helpers",()=>{near(m.distance({x:0,y:0},{x:3,y:4}),5);near(m.angleAt({x:0,y:0},{x:1,y:0},{x:0,y:1}),90);near(m.angleAt({x:0,y:0},{x:1,y:0},{x:-1,y:0}),180);near(m.polygonArea([{x:0,y:0},{x:4,y:0},{x:4,y:3},{x:0,y:3}]),12);near(m.pathLength([{x:0,y:0},{x:3,y:0},{x:3,y:4}]),7);near(m.pathLength([{x:0,y:0},{x:3,y:0},{x:3,y:4}],true),12)});
+t("entity metrics",()=>{near(m.entityMetrics(C(0,0,2)).area,Math.PI*4);near(m.entityMetrics(A(0,0,2,0,90)).length,Math.PI);near(m.entityMetrics(P([[0,0],[2,0],[2,2],[0,2]],true)).area,4);near(m.entityMetrics(L(0,0,0,5)).angle,90)});
+t("unit conversion",()=>{near(m.convertLength(1000,"mm","m"),1);near(m.convertLength(1,"ft","in"),12);near(m.convertLength(1,"m","cm",2),10000);near(m.convertLength(7,"unitless","m"),7);near(m.convertLength(7,"mm","drawing"),7);assert.strictEqual(m.unitLabel("unitless","drawing"),"units");assert.strictEqual(m.formatQty(2500,"mm","m"),"2.500 m")});
+const ents=[L(0,0,10,0),L(5,-5,5,5),C(20,0,3),P([[30,0],[40,0],[40,10]],false)];
+const idx=m.buildIndex(ents,{minX:0,minY:-5,maxX:43,maxY:10});
+t("pick finds the nearest entity within tolerance",()=>{assert.strictEqual(m.pickEntity(idx,ents,2,0.2,0.5),0);assert.strictEqual(m.pickEntity(idx,ents,5.1,3,0.5),1);assert.strictEqual(m.pickEntity(idx,ents,23,0,0.5),2);assert.strictEqual(m.pickEntity(idx,ents,15,8,0.5),-1)});
+t("pick respects layer visibility",()=>assert.strictEqual(m.pickEntity(idx,ents,2,0.2,0.5,()=>false),-1));
+t("snap: endpoint, midpoint, center, quadrant",()=>{assert.deepStrictEqual(m.findSnap(idx,ents,0.1,0.1,0.5)?.kind,"endpoint");assert.strictEqual(m.findSnap(idx,ents,2.4,5-0.0-5+0.1,0.3,["midpoint"]),null);const mid=m.findSnap(idx,ents,5.05,0.0,0.3,["midpoint"]);near(mid.x,5);assert.strictEqual(m.findSnap(idx,ents,20.1,0.1,0.5)?.kind,"center");assert.strictEqual(m.findSnap(idx,ents,23.05,0.05,0.3)?.kind,"quadrant")});
+t("snap: intersection of crossing lines beats nearest",()=>{const s=m.findSnap(idx,ents,5.1,0.1,0.4,["intersection","nearest"]);assert.strictEqual(s.kind,"intersection");near(s.x,5);near(s.y,0)});
+t("snap: nearest on a line when nothing else is close",()=>{const s=m.findSnap(idx,ents,7.3,0.2,0.5,["nearest"]);assert.strictEqual(s.kind,"nearest");near(s.x,7.3);near(s.y,0)});
+t("snap modes can be switched off",()=>assert.strictEqual(m.findSnap(idx,ents,0.1,0.1,0.5,["midpoint"]),null));
+t("spatial index works with a huge entity",()=>{const e2=[L(-1000,0,1000,0),L(3,3,4,4)];const i2=m.buildIndex(e2,{minX:-1000,minY:0,maxX:1000,maxY:4});assert.strictEqual(m.pickEntity(i2,e2,500,0.1,0.5),0)});
+t("text search",()=>{const e3=[T(1,1,1,"Living Room"),T(5,5,1,"Kitchen"),L(0,0,1,1)];const h=m.searchText(e3,"room");assert.strictEqual(h.length,1);assert.strictEqual(h[0].index,0);assert.strictEqual(m.searchText(e3," ").length,0);assert.strictEqual(m.searchText(e3,"zzz").length,0)});
+t("counts",()=>{assert.strictEqual(m.countByType(ents).get("LINE"),2);assert.strictEqual(m.countByLayer(ents).get("0"),4)});
+t("window vs crossing selection",()=>{const es=[L(0,0,10,0),L(-5,5,15,5),C(20,0,3),T(1,1,1,"hi")];const ix=m.buildIndex(es,{minX:-5,minY:-3,maxX:23,maxY:5});const r={minX:-1,minY:-1,maxX:12,maxY:2};assert.deepStrictEqual(m.selectInRect(ix,es,r,"window"),[0,3]);assert.deepStrictEqual(m.selectInRect(ix,es,r,"crossing"),[0,3]);const r2={minX:4,minY:-1,maxX:6,maxY:6};assert.deepStrictEqual(m.selectInRect(ix,es,r2,"crossing"),[0,1]);assert.deepStrictEqual(m.selectInRect(ix,es,r2,"window"),[]);const r3={minX:16,minY:-1,maxX:18,maxY:1};assert.deepStrictEqual(m.selectInRect(ix,es,r3,"crossing"),[2])});
+t("crossing needs a real touch for segments",()=>{const es=[L(0,0,10,10)];const ix=m.buildIndex(es,{minX:0,minY:0,maxX:10,maxY:10});assert.deepStrictEqual(m.selectInRect(ix,es,{minX:6,minY:0,maxX:10,maxY:3},"crossing"),[]);assert.deepStrictEqual(m.selectInRect(ix,es,{minX:4,minY:4,maxX:6,maxY:6},"crossing"),[0])});
+t("bboxOfSet, rectOf",()=>{const es=[L(0,0,1,1),L(5,5,6,7)];const ix=m.buildIndex(es,{minX:0,minY:0,maxX:6,maxY:7});const b=m.bboxOfSet(ix,[0,1]);near(b.maxY,7);near(b.minX,0);assert.strictEqual(m.bboxOfSet(ix,[]),null);near(m.rectOf({x:3,y:4},{x:1,y:9}).minX,1)});
+t("scale bar and grid are round numbers",()=>{const sb=m.niceScaleBar(2.7);assert.ok([1,2,5].includes(sb.length/Math.pow(10,Math.floor(Math.log10(sb.length)))));assert.ok(sb.px>40&&sb.px<300);const g=m.gridStep(0.5);assert.ok(g*0.5>=18)});
+t("csv escapes quotes",()=>assert.strictEqual(m.resultsToCsv(['Say "x"']),'No,Measurement\n1,"Say ""x"""'));
+t("text anchoring shifts the box",()=>{const base=T(10,10,2,"abcd");const c={...base,align:"center",valign:"middle"};const r={...base,align:"right",valign:"top"};const b0=m.entityBBox(base),b1=m.entityBBox(c),b2=m.entityBBox(r);near(b1.minX,b0.minX-(b0.maxX-b0.minX)/2);near(b1.minY,b0.minY-1);near(b2.maxX,10);near(b2.maxY,10);near(m.distToEntity(c,10,10),0)});
+t("text fonts: SHX stroke fonts map to sans/mono/serif, TTF keeps its family, bold/italic prefix, width factor widens the box",()=>{const b=T(0,0,2,"abcd");const f=(o)=>m.textFontCss({...b,...o},10);assert.strictEqual(f({}),"10px sans-serif");assert.strictEqual(f({font:"simplex.shx"}),"10px sans-serif");assert.ok(/monospace$/.test(f({font:"txt.shx"})));assert.ok(/serif$/.test(f({font:"romanc.shx"}))&&!/sans/.test(f({font:"romanc.shx"})));assert.ok(f({font:"Arial",bold:true,italic:true}).startsWith("italic bold 10px \"Arial\""));near(m.textBox({...b,widthFactor:2}).w,2*m.textBox(b).w)});
+t("multi-line text: taller box, one baseline per line, top-anchored block hangs below the anchor",()=>{const one=T(0,0,2,"ab"),two={...T(0,0,2,"ab\ncd"),valign:"top"};near(m.textBox(two).h,2+2*m.TEXT_LINE_PITCH);assert.ok(m.textBox(two).h>m.textBox(one).h);const bl=m.textLineBaselines(two);assert.strictEqual(bl.length,2);near(bl[0],-2);near(bl[1],-2-2*m.TEXT_LINE_PITCH);const bot={...two,valign:"bottom"};near(m.textLineBaselines(bot)[1],0);near(m.textLineBaselines(one)[0],0)});
+t("hatch bbox covers every loop",()=>{const h={type:"LWPOLYLINE",layer:"0",closed:true,points:[{x:0,y:0},{x:4,y:0},{x:4,y:4}],hatch:{solid:true,loops:[[{x:0,y:0},{x:4,y:0},{x:4,y:4}],[{x:-9,y:-9},{x:1,y:1},{x:2,y:2}]]}};const b=m.entityBBox(h);near(b.minX,-9)});
+t("hatch families by name, scale and angle",()=>{const f=m.hatchFamilies("ANSI31",0,2);assert.strictEqual(f.length,1);near(f[0].spacing,6.35);near(f[0].angle,45);const g=m.hatchFamilies("ANSI37",10,1);assert.strictEqual(g.length,2);near(g[1].angle,145);assert.strictEqual(m.hatchFamilies(undefined).length,1);near(m.hatchFamilies("ANSI31",0,-4)[0].spacing,3.175)});
+t("hatch lines are evenly spaced and cover the box",()=>{const ls=m.hatchLineSegments({minX:0,minY:0,maxX:10,maxY:10},0,2);assert.strictEqual(ls.length,6);for(const l of ls)near(l[1],l[3]);near(ls[1][1]-ls[0][1],2);const d=m.hatchLineSegments({minX:0,minY:0,maxX:10,maxY:10},45,3);assert.strictEqual(d.length,5);assert.strictEqual(m.hatchLineSegments({minX:0,minY:0,maxX:1e6,maxY:1e6},0,1).length,0);assert.strictEqual(m.hatchLineSegments({minX:0,minY:0,maxX:1,maxY:1},0,0).length,0)});
+t("linetype dashes: defined, fallback, continuous, too dense",()=>{assert.deepStrictEqual(m.resolveDash("Continuous",undefined,1,5),[]);assert.deepStrictEqual(m.resolveDash(undefined,undefined,1,5),[]);const d=m.resolveDash("DASHED",{DASHED:[12,-6]},1,2);assert.deepStrictEqual(d,[24,12]);assert.deepStrictEqual(m.resolveDash("DASHED",{DASHED:[12,-6]},2,2),[48,24]);assert.deepStrictEqual(m.resolveDash("DASHED",{DASHED:[12,-6]},1,0.01),[]);assert.ok(m.resolveDash("HIDDEN",undefined,1,1).length>=2);assert.ok(m.resolveDash("ACAD_ISO02W100",undefined,1,1).length>=2);assert.deepStrictEqual(m.resolveDash("MYSTERY",undefined,1,1),[]);const dot=m.resolveDash("DOT",{DOT:[0,-6]},1,2);assert.strictEqual(dot[0],1)});
+t("viewport maps model to sheet",()=>{const vp={center:{x:200,y:100},width:100,height:50,viewCenter:{x:1000,y:500},viewHeight:5000};near(m.viewportScale(vp),0.01);const p=m.modelToSheet(vp,{x:1000,y:500});near(p.x,200);near(p.y,100);const q=m.modelToSheet(vp,{x:2000,y:500});near(q.x,210);near(q.y,100);const r=m.viewportRect(vp);near(r.minX,150);near(r.maxY,125);const tw=m.modelToSheet({...vp,twist:90},{x:2000,y:500});near(tw.x,200,1e-6);near(tw.y,90,1e-6)});
+t("layout bounds include entities and viewports",()=>{const b=m.layoutBounds({name:"L",entities:[L(0,0,10,5)],viewports:[{center:{x:50,y:20},width:20,height:10,viewCenter:{x:0,y:0},viewHeight:10}]});near(b.minX,0);near(b.maxX,60);near(b.maxY,25);assert.strictEqual(m.layoutBounds({name:"E",entities:[],viewports:[]}),null)});
+t("hatch: area minus holes, picked after a nearby line, never snapped",()=>{const sq=(a,b)=>[{x:a,y:a},{x:b,y:a},{x:b,y:b},{x:a,y:b}];const h={type:"LWPOLYLINE",layer:"0",closed:true,points:sq(0,10),hatch:{solid:true,loops:[sq(0,10),sq(2,4)]}};near(m.entityMetrics(h).area,96);const es=[h,L(0,0.1,10,0.1)];const ix=m.buildIndex(es,{minX:0,minY:0,maxX:10,maxY:10});assert.strictEqual(m.pickEntity(ix,es,5,0.15,0.5),1);assert.strictEqual(m.pickEntity(ix,es,0.05,5,0.5),0);assert.strictEqual(m.findSnap(m.buildIndex([h],{minX:0,minY:0,maxX:10,maxY:10}),[h],0.05,0.05,0.5,["endpoint"]),null)});
+t("diff: unchanged, removed and added",()=>{const A=[L(0,0,10,0),L(0,0,0,10),C(5,5,2),T(1,1,1,"x")];const B=[L(10,0,0,0),C(5,5,2),C(9,9,1),T(1,1,1,"y")];const d=m.diffEntities(A,B,0.01);assert.deepStrictEqual(d.removed,[1,3]);assert.deepStrictEqual(d.added,[2,3]);assert.strictEqual(d.same,2)});
+t("diff: duplicates are counted, tolerance absorbs noise",()=>{const A=[L(0,0,1,0),L(0,0,1,0)];const B=[L(0,0,1,0)];const d=m.diffEntities(A,B,0.01);assert.strictEqual(d.removed.length,1);assert.strictEqual(d.added.length,0);const e=m.diffEntities([L(0,0,1,0)],[L(0,0.0004,1,0.0004)],0.01);assert.strictEqual(e.removed.length+e.added.length,0);assert.ok(m.compareTolerance({minX:0,minY:0,maxX:1e5,maxY:10})>=1)});
+t("diff: reversed polyline is the same",()=>{const a=P([[0,0],[1,0],[1,1]],false),b=P([[1,1],[1,0],[0,0]],false);const d=m.diffEntities([a],[b],0.01);assert.strictEqual(d.removed.length+d.added.length,0)});
+t("paper sizes and plot pixels",()=>{const p=m.paperMm("A3",true);near(p.w,420);near(p.h,297);const q=m.paperMm("nope",false);near(q.w,210);near(q.h,297);const px=m.plotPixels(420,297,8,150);assert.ok(px.w>2300&&px.w<2500);const big=m.plotPixels(1189,841,8,300);assert.ok(Math.max(big.w,big.h)<=6000)});
+t("quick measure parts",()=>{const c=m.quickMeasureParts(C(0,0,2));assert.ok(c.some(x=>x.label==="R"&&x.value===2));assert.ok(c.some(x=>x.label==="Area"&&x.power===2));assert.strictEqual(m.quickMeasureParts(T(0,0,1,"a")).length,0);const l=m.quickMeasureParts(L(0,0,3,4));near(l[0].value,5)});
+// ── MTEXT fidelity: column wrap, inline runs, line spacing ──
+const MT=(over)=>({type:"TEXT",layer:"0",position:{x:0,y:0},height:2,value:"",...over});
+const lineText=(lines)=>lines.map(l=>l.map(r=>r.text).join(""));
+t("textRuns: MTEXT wraps at its column width like native CAD",()=>{ // charW = 2*0.6 = 1.2 -> 9/1.2 = 7 chars per line
+  const lines=m.textRuns(MT({value:"aaa bbb ccc ddd",wrapWidth:9}));
+  assert.deepStrictEqual(lineText(lines),["aaa bbb","ccc ddd"]);
+});
+t("textRuns: a word longer than the column is hard-split",()=>{
+  const lines=m.textRuns(MT({value:"ABCDEFGHIJ",wrapWidth:4.8})); // maxChars = 4
+  assert.deepStrictEqual(lineText(lines),["ABCD","EFGH","IJ"]);
+});
+t("textRuns: styled runs split on explicit breaks and keep their colour",()=>{
+  const e=MT({value:"Red\nWhite",runs:[{text:"Red\n",color:1},{text:"White",color:7}]});
+  const lines=m.textRuns(e);
+  assert.deepStrictEqual(lineText(lines),["Red","White"]);
+  assert.strictEqual(lines[0][0].color,1);assert.strictEqual(lines[1][0].color,7);
+});
+t("MTEXT line-spacing factor scales the pitch; plain TEXT keeps 5/3",()=>{
+  const base=MT({value:"a\nb"}); // pitch = 2*5/3
+  const spaced=MT({value:"a\nb",lineSpacing:2}); // pitch = 2*2*5/3
+  near(m.textLineBaselines(base)[1],-2*5/3);
+  near(m.textLineBaselines(spaced)[1],-2*2*5/3);
+  near(m.textBox(spaced).h,2+2*2*5/3);
+  // box width follows the longest wrapped line, never the raw 16-char value
+  const wrapped=MT({value:"aaa bbb ccc ddd",wrapWidth:9});
+  near(m.textBox(wrapped).w,2*0.6*7);
+});
+t("viewport query matches a brute-force bbox scan and keeps draw order",()=>{
+  const es=[L(0,0,10,0),L(40,40,50,50),C(5,5,2),P([[20,20],[22,20],[22,22]],true),T(100,100,2,"offscreen")];
+  const ix=m.buildIndex(es,{minX:0,minY:0,maxX:110,maxY:110});
+  const box={minX:-1,minY:-1,maxX:25,maxY:25};
+  const expected=es.map((e,i)=>({e,i})).filter(({e})=>{const b=m.entityBBox(e);return !(b.maxX<box.minX||b.minX>box.maxX||b.maxY<box.minY||b.minY>box.maxY)}).map(({i})=>i);
+  assert.deepStrictEqual(m.queryIndexBox(ix,es,box),expected);
+});
+t("viewport query always retains off-screen anchored construction lines",()=>{
+  const ray={type:"RAY",layer:"0",start:{x:-1000,y:500},direction:{x:1,y:0}};
+  const xline={type:"XLINE",layer:"0",start:{x:1000,y:-500},direction:{x:0,y:1}};
+  const es=[L(500,500,510,510),ray,xline];
+  const ix=m.buildIndex(es,{minX:-1000,minY:-500,maxX:1000,maxY:500});
+  assert.deepStrictEqual(m.queryIndexBox(ix,es,{minX:0,minY:0,maxX:10,maxY:10}),[1,2]);
+});
+t("infinite RAY/XLINE remain pickable when their anchors are off-screen",()=>{
+  const es=[
+    {type:"RAY",layer:"0",start:{x:-1000,y:5},direction:{x:1,y:0}},
+    {type:"XLINE",layer:"0",start:{x:5,y:-1000},direction:{x:0,y:1}},
+    {type:"RAY",layer:"0",start:{x:20,y:15},direction:{x:1,y:0}}
+  ];
+  const ix=m.buildIndex(es,{minX:-1000,minY:-1000,maxX:20,maxY:20});
+  assert.strictEqual(m.pickEntity(ix,es,30,5,0.1),0);
+  assert.strictEqual(m.pickEntity(ix,es,5,20,0.1),1);
+  assert.strictEqual(m.pickEntity(ix,es,10,15,0.1),-1,"a ray pointing away from the cursor must not be picked");
+  const snap=m.findSnap(ix,es,30,5,0.1,["nearest"]);
+  assert.strictEqual(snap.kind,"nearest");near(snap.x,30);near(snap.y,5);
+});
+t("crossing selection detects infinite lines but window selection does not",()=>{
+  const es=[
+    {type:"RAY",layer:"0",start:{x:-1000,y:5},direction:{x:1,y:0}},
+    {type:"XLINE",layer:"0",start:{x:5,y:-1000},direction:{x:0,y:1}},
+    {type:"RAY",layer:"0",start:{x:20,y:5},direction:{x:1,y:0}},
+    {type:"RAY",layer:"0",start:{x:-1000,y:20},direction:{x:0,y:0}}
+  ];
+  const ix=m.buildIndex(es,{minX:-1000,minY:-1000,maxX:20,maxY:20});
+  const rect={minX:0,minY:0,maxX:10,maxY:10};
+  assert.deepStrictEqual(m.selectInRect(ix,es,rect,"crossing"),[0,1]);
+  assert.deepStrictEqual(m.selectInRect(ix,es,rect,"window"),[]);
+});
+t("viewport query culls large drawings to local candidates",()=>{
+  const many=Array.from({length:5000},(_,i)=>L(i*10,i*10,i*10+2,i*10+2));
+  const ix=m.buildIndex(many,{minX:0,minY:0,maxX:50000,maxY:50000});
+  const local=m.queryIndexBox(ix,many,{minX:0,minY:0,maxX:20,maxY:20});
+  assert.ok(local.length>0);
+  assert.ok(local.length<many.length/10,"expected local query to skip most of 5000 entities; got "+local.length);
+  assert.deepStrictEqual(local,[...local].sort((a,b)=>a-b));
+});
+t("CAD window and crossing selection use spatial candidates",()=>{
+  const src=fs.readFileSync(path.join(__dirname,"../src/modules/cad-viewer/viewer-math.ts"),"utf8");
+  assert.match(src,/for \(const i of queryIndexBox\(idx, entities, rect\)\)/);
+});
+t("CAD renderer uses viewport candidates and cursor-only status updates",()=>{
+  const src=fs.readFileSync(path.join(__dirname,"../src/features/cad-viewer.ts"),"utf8");
+  assert.match(src,/M\.queryIndexBox\(ix, list, cull\)/);
+  // Fast path: cheap text updates (coords + optional quick-measure readout) then
+  // early return — the full status bar must NOT be rebuilt on every cursor sample.
+  assert.match(src,/coords\.textContent = xy;/);
+  assert.match(src,/quickReadout\.textContent = quickMeasureText\(p\);[\s\S]{0,160}?return;/);
+});
+t("polar tracking quantizes direction and preserves cursor distance",()=>{
+  const a={x:10,y:20};
+  const p=m.polarConstrain(a,{x:13,y:24},90);
+  near(Math.hypot(p.x-a.x,p.y-a.y),5);
+  near(p.x,a.x);
+  const q=m.polarConstrain(a,{x:13,y:24},45);
+  near(Math.atan2(q.y-a.y,q.x-a.x)*180/Math.PI,45);
+  near(Math.hypot(q.x-a.x,q.y-a.y),5);
+});
+t("polar tracking supports negative directions and custom increments",()=>{
+  const p=m.polarConstrain({x:0,y:0},{x:-4,y:-3},30);
+  near(Math.atan2(p.y,p.x)*180/Math.PI,-150);
+  near(Math.hypot(p.x,p.y),5);
+});
+t("polar tracking safely handles invalid increments and zero-length vectors",()=>{
+  const b={x:3,y:4};
+  assert.deepStrictEqual(m.polarConstrain({x:0,y:0},b,0),b);
+  assert.deepStrictEqual(m.polarConstrain({x:0,y:0},b,NaN),b);
+  assert.deepStrictEqual(m.polarConstrain({x:2,y:2},{x:2,y:2},15),{x:2,y:2});
+});
+console.log(`=== Result: ${pass} passed, ${fail} failed ===`);process.exit(fail?1:0);

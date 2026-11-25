@@ -1,0 +1,168 @@
+# Content Security Policy — openBIMstudio
+
+Remediation program Phase 1.5. **Status: ENABLED in `index.html` (v0.74.0).**
+The API server additionally sends a strict header policy
+(`server/security.mjs`). **Any change to the policy must be verified against a
+production build** (`npm run build && npm run preview`) with the browser
+console open — a too-strict directive breaks features silently; a too-loose
+one weakens the platform. The regression pins live in
+`tests/dependency-safety.test.cjs` (meta present, no blanket `https:`,
+same-origin workers, no unpkg references, self-hosted Fragments worker).
+
+## Former enablement blocker — RESOLVED (2026-10-26, v0.74.0)
+
+With the first policy draft applied as a meta tag, the app aborted boot with
+"Fragments worker failed to load". Root-cause chain, verified by evidence:
+
+1. **The real cause was an undeclared runtime CDN dependency, not a missing
+   directive.** `OBC.FragmentsManager.getWorker()` (the SDK-recommended boot
+   call used in `src/core/setup.ts`) fetches the Fragments worker script
+   **from unpkg.com at runtime** and returns a blob URL. Under the policy that
+   fetch violates `connect-src` (unpkg is not an enumerated provider), and a
+   blob worker would inherit the document policy for its import chain. Beyond
+   CSP this was a supply-chain and privacy defect: every boot phoned a public
+   npm CDN, the worker version depended on live unpkg availability, and the
+   app could not run offline.
+2. **Fix — self-host the worker.** `src/core/setup.ts` now imports the
+   package-shipped worker via the official subpath export
+   (`import fragmentsWorkerUrl from "@thatopen/fragments/worker?url"`) and
+   passes that same-origin URL to `fragments.init()`. In dev Vite serves the
+   file directly; in build it is emitted as `assets/worker-*.mjs`. The
+   `getWorker()` call is banned by test (`tests/dependency-safety.test.cjs`).
+3. **Collateral verified defect fixed in the same stage.** While verifying
+   boot with a real IFC import, a second pre-existing breakage was found:
+   every IFC conversion died with `LinkError: … "__cxa_throw"` /
+   `BindingError: function StreamMeshes called with 4 arguments, expected 3`.
+   Cause: the bundled `web-ifc` JS glue (npm 0.0.78, 4-arg `StreamMeshes`)
+   fetched the WASM binaries from `public/web-ifc/`, which still held the
+   0.0.77 binaries (3-arg embind) — a dependency bump without asset re-pin.
+   0.0.78's own browser pair is also internally incoherent. The whole stack
+   is pinned to **web-ifc 0.0.77** (JS + browser/node WASM mutually coherent;
+   Node isolation harness: `StreamAllMeshes` OK), and
+   `tests/dependency-safety.test.cjs` now asserts `public/web-ifc/*` are
+   byte-identical to `node_modules/web-ifc/*` so the two can never drift
+   again.
+
+## Directive-by-directive justification
+
+| Directive | Value | Why |
+|---|---|---|
+| `default-src` | `'self'` | Everything not explicitly listed falls back to same-origin only. |
+| `script-src` | `'self'` `'wasm-unsafe-eval'` | Bundled app + same-origin lazy-loaded modules. `'wasm-unsafe-eval'` is required by web-ifc and LibreDWG WebAssembly compilation (no general `'unsafe-eval'` granted). PDF.js is bundled from the pinned `pdfjs-dist` dependency; no script CDN is required. PDFs are parsed locally; no project data is uploaded anywhere by that feature. |
+| `worker-src` | `'self'` `blob:` | The Fragments worker and PDF.js worker are emitted as same-origin build assets; `blob:` covers workers built from inline bundles. |
+| `style-src` | `'self'` `'unsafe-inline'` | Emotion/MUI inject runtime `<style>` elements — impossible without `'unsafe-inline'`. This is the industry-standard trade-off for CSS-in-JS; scripts remain restricted. |
+| `img-src` | `'self'` `data:` `blob:` | Icons/manifest assets are same-origin; screenshots, IFC texture atlases and canvas exports appear as data/blob URLs. |
+| `font-src` | `'self'` `data:` | No external font CDN is used. |
+| `connect-src` | `'self'` + enumerated providers + localhost any-port | See the provider table below. `http://localhost:*` / `http://127.0.0.1:*` (and `ws:`/`wss:`) cover the local collaboration server default (`http://localhost:4000/api`) and the **default local AI provider** (Ollama at `http://localhost:11434`). |
+| `frame-src` | `'none'` | The app uses no iframes (the Autodesk Viewer is opened in a new tab via `window.open`, never embedded). |
+| `object-src` | `'none'` | No plugins/objects — kills legacy plug-in attack surface. |
+| `base-uri` | `'self'` | Prevents `<base>` hijacking of relative URLs. |
+| `form-action` | `'self'` | No cross-site form posts. |
+
+Note: `frame-ancestors` cannot be expressed in a `<meta>` policy; the API
+server sets it via header (`server/security.mjs` `SECURITY_HEADERS`). For
+strict clickjacking protection of the app itself, deploy behind a reverse
+proxy that sends the same policy as an HTTP header (headers support
+`frame-ancestors`).
+
+## Network endpoint inventory (connect-src)
+
+Endpoints are also listed in `docs/engineering/BASELINE.md` §7. Every
+outbound connection is opt-in through the user's own configuration:
+
+| Provider | Host | Feature | Privacy note |
+|---|---|---|---|
+| APS (Autodesk Platform Services) | `developer.api.autodesk.com` | RVT/NWD/NWC→IFC conversion | Explicit user action + configured credentials; files leave the machine only after upload consent |
+| Microsoft Graph / SharePoint | `graph.microsoft.com`, `*.sharepoint.com` | CDE provider | User-configured |
+| Dalux | `field.dalux.com` | CDE provider | User-configured |
+| Google Drive / Gemini | `www.googleapis.com`, `generativelanguage.googleapis.com` | CDE / AI provider | User-configured |
+| AI providers (Claude uses the native `/v1/messages` API with the user's own key) | `api.openai.com`, `api.anthropic.com`, `api.groq.com`, `openrouter.ai`, `api.cerebras.ai`, `api.deepseek.com`, `api.mistral.ai`, `api.together.xyz`, `api.x.ai`, `api.fireworks.ai`, `api.sambanova.ai`, `api.hyperbolic.xyz`, `integrate.api.nvidia.com`, `api.moonshot.ai`, `dashscope-intl.aliyuncs.com` | AI assistant | Auto-redaction applies before any cloud call (`src/features/ai-privacy.ts`) |
+| Dropbox | `api.dropboxapi.com`, `content.dropboxapi.com` | File storage | User-configured |
+| Usage badge telemetry | `ipapi.co` (and an optional counter service set with `VITE_COUNTER_API`; the old default `api.counterapi.dev` is gone and was removed) | Optional global "visits worldwide" counter + country flag on the welcome badge (`src/features/usage-stats.ts`) | Non-critical, no project data leaves the browser; badge degrades silently if blocked |
+| Local services | `localhost` / `127.0.0.1` any port, `ws://`/`wss://` localhost | Collaboration server, local AI (Ollama), dev HMR | Local-first default |
+
+## External AI destinations
+
+The AI assistant header provides an **Open DeepSeek Chat** link to
+`https://chat.deepseek.com/`. It opens the official DeepSeek website in a
+separate browser tab using `target="_blank"` and
+`rel="noopener noreferrer"`. DeepSeek handles sign-in, cookies, and its own
+chat session. This is a website shortcut only: it does not embed DeepSeek,
+does not pass the openBIMstudio conversation or model data to DeepSeek, and
+does not provide API access to the website session.
+
+The application intentionally keeps `frame-src 'none'`; the third-party chat
+site is not embedded because its authentication and framing behavior are not
+controlled or verified by openBIMstudio. Users who need AI responses inside
+the native assistant must configure a supported model provider separately.
+
+## Known limitation (visible, documented)
+
+The AI provider settings accept an **arbitrary endpoint URL** (e.g. a LAN
+inference server at `http://192.168.1.50:1234`). A static CSP cannot
+enumerate dynamic hosts, so such endpoints are blocked by `connect-src` unless
+the deployment extends the policy. Affected users should run the app behind a
+reverse proxy that appends their endpoint to the CSP header, or front their
+inference server via an SSH/localhost tunnel (covered by `http://localhost:*`).
+The UI shows the provider's connection error in that case; this limitation is
+recorded in `docs/engineering/BASELINE.md`.
+
+## DWG reader isolation — scoped 'unsafe-eval' (2026-10-27, v0.74.0)
+
+**Root cause (verified empirically and statically):** `@mlightcad/libredwg-web`'s
+wasm imports `_embind_register_class/_embind_register_function/_emval_*` and
+registers its entire API during `__wasm_call_ctors`. Emscripten embind creates
+each invoker with `new Function(...)` — JavaScript string evaluation, which the
+main document CSP correctly blocks (`'wasm-unsafe-eval'` covers wasm compilation
+only, never `eval`/`new Function`). The reader failed on every import with
+"could not start the DWG reader (WASM failed to load): Evaluating a string as
+JavaScript violates ... script-src". 0.8.2 is the newest published package and
+no embind-free build exists; rebuilding LibreDWG cannot remove embind's dynamic
+invoker generation.
+
+**Selected remediation (isolate, don't weaken):** the parser runs in a dedicated
+module worker (`src/modules/cad-link/dwg-reader-worker.ts`). Worker documents
+get their CSP from their own HTTP response, so the worker script is served with
+a **scoped** policy that permits dynamic execution for this one document:
+
+```
+default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'
+```
+
+The **main document CSP is unchanged** — no `'unsafe-eval'` there, ever.
+
+Boundary contract: the worker receives `{ id, kind: "parse", bytes, fileName }`
+and returns structured JSON (DxfDocument or `{ code, message, detail }`). No
+DOM, no BIM state, no network beyond same-origin wasm assets. Error codes:
+`init-failed | invalid-file | unsupported-version | parse-failed | internal`.
+
+Where the scoped header lives (must stay identical — pinned by
+`tests/dwg-reader-isolation.test.cjs`):
+
+| Surface | Location | Matched path |
+|---|---|---|
+| Vite dev server | `vite.config.ts` `crossOriginIsolation()` middleware | `*/dwg-reader-worker*` (source URL) |
+| Vite preview (prod check) | same middleware | `/assets/dwg-reader-worker-*.js` |
+| Vercel | `vercel.json` headers | `/assets/dwg-reader-worker-(.*)` |
+| Cloudflare Workers assets | `public/_headers` | `/assets/dwg-reader-worker-*` |
+
+Deployment note: a host that strips these headers serves the worker without a
+CSP — the feature still works, it is simply less hardened; the main app policy
+is unaffected. Maintenance rules #4 gains one exception clause: `'unsafe-eval'`
+is permitted **only** in the DWG reader worker document listed above.
+
+## Maintenance rules
+
+1. Adding a new cloud provider → add its host to `connect-src` **and** to the
+   table above **and** to `docs/INTEROPERABILITY_MATRIX.md` privacy column.
+2. Adding a new externally loaded library → review CSP, pin the version, and add
+   a privacy note in the feature docs. Prefer bundled dependencies over runtime CDNs.
+3. Never add blanket `https:` to `connect-src` — it would silently allow any
+   project data to leave the machine and defeat the AI redaction audit trail.
+4. Never add `'unsafe-eval'` to the main document — WASM uses
+   `'wasm-unsafe-eval'`; if a dependency demands full eval, replace the
+   dependency. Sole exception: the scoped DWG reader worker document above.
+5. Verify: `npm run build && npm run preview`, open the app, run an IFC
+   import, a clash run, an export, and the AI panel with the console open —
+   zero CSP violations is the acceptance bar (Phase 7 browser E2E automates
+   console-error collection).

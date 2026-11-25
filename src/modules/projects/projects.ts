@@ -1,0 +1,920 @@
+/** Project lifecycle: create/open/save/close + import persistence hook.
+ *
+ *  Offsets
+ *  ───────
+ *  Each model has an offset stored in the doc at `models[].position`.
+ *  On save we read the live offset from importer; on open we restore it.
+ *  If the doc has no offsets (fresh project, or pre-migration), the
+ *  saved positioning mode is applied instead.
+ */
+import { getNorthState, loadNorth, resetNorth } from "../north/north";
+import { ctx } from "../../core/context";
+import { services } from "../../core/services";
+import * as store from "./store";
+import type { ProjectDoc, ProjectTemplate, ProjectStatus, ProjectUnits } from "./types";
+import {
+  establishSceneOffset, computeSceneBounds, fitAll,
+  resetPlacementState, updateClipping, resetToDefaultView, resetCameraUpright,
+} from "../../features/camera-tools";
+import {
+  setElements, getElements, clearElements,
+  getGrids, setGrids, getLevels, setLevels,
+} from "../../features/authoring";
+import { refreshModelSelectionUI, clearClash } from "../../features/clash";
+import { getIssues, setIssues, onIssuesChanged } from "../issues/issues";
+import { exportConstraints, importConstraints } from "../parametric-constraints/types";
+import { getCostData, setCostData, onCostChanged } from "../cost/cost";
+import { uiAlert, notify as toast } from "../../core/notify";
+import { history } from "../../features/history";
+import { isQuotaError } from "./project-schema";
+import { recordLastProjectId, clearLastProjectId, readLastProjectId as readLastProjectIdSafe } from "./auto-reopen";
+
+let current: ProjectDoc | null = null;
+let dirty = false;
+let detachedModels = 0;
+const listeners = new Set<() => void>();
+let workPlaneListenerInstalled = false;
+let restoringWorkPlanes = false;
+
+/* ── Save-state machine ──────────────────────────────────────────────────
+ * dirtyGeneration increments on every markDirty(). saveProject() captures
+ * the generation when it starts collecting state; only if no edit happened
+ * during the async write is the project marked clean. Edits made while a
+ * save is in flight therefore stay dirty and the next autosave flushes
+ * them — they can no longer be silently declared saved.
+ */
+let dirtyGeneration = 0;
+let saving = false;
+/** Guards open/create transitions: hydration must never mark the document
+ * dirty (a half-restored doc must not be autosaved). */
+let transitioning = false;
+export type SaveState =
+  | { state: "idle" }
+  | { state: "saving"; startedAt: number }
+  | { state: "saved"; at: number }
+  | { state: "error"; at: number; message: string; quota: boolean };
+let saveState: SaveState = { state: "idle" };
+let lastSilentErrorToastAt = 0;
+
+export function getSaveState(): SaveState {
+  return saveState;
+}
+/** True while open/create is tearing down or rehydrating the scene. */
+export function isTransitioning(): boolean {
+  return transitioning;
+}
+function setSaveState(next: SaveState) {
+  saveState = next;
+  try { window.dispatchEvent(new CustomEvent("obs:save-state", { detail: { ...next } })); } catch { /* */ }
+}
+
+async function restoreProjectWorkPlanes(snapshot: ProjectDoc["workPlanes"]): Promise<void> {
+  restoringWorkPlanes = true;
+  try {
+    const workPlanes = await import("../work-planes/types");
+    workPlanes.restoreWorkPlanes(snapshot ?? { schemaVersion: 1, activeId: null, planes: [] });
+  } finally {
+    restoringWorkPlanes = false;
+  }
+}
+
+export function getCurrentProject() { return current; }
+export function isDirty() { return dirty; }
+export function getDetachedModelCount() { return detachedModels; }
+export function onProjectChanged(cb: () => void) { listeners.add(cb); }
+function notify() {
+  for (const cb of listeners) {
+    try { cb(); } catch { /* */ }
+  }
+}
+/** Mark the document dirty. Suppressed during open/create transitions so
+ * hydration side effects (issues/cost restore, level seeds) cannot flag a
+ * half-restored document for autosave. */
+export function markDirty() {
+  if (transitioning) return;
+  dirty = true;
+  dirtyGeneration += 1;
+  notify();
+}
+
+export type ProjectMetaPatch = Partial<Pick<
+  ProjectDoc,
+  "name" | "projectNumber" | "client" | "phase" | "description" | "status" | "units" | "owner"
+>>;
+
+export function updateProjectMeta(patch: ProjectMetaPatch): void {
+  if (!current) return;
+  const next = patch.name !== undefined ? String(patch.name).trim() : undefined;
+  if (next !== undefined) current.name = next || "Untitled project";
+  if (patch.projectNumber !== undefined) current.projectNumber = String(patch.projectNumber).trim() || undefined;
+  if (patch.client !== undefined) current.client = String(patch.client).trim() || undefined;
+  if (patch.phase !== undefined) current.phase = String(patch.phase).trim() || undefined;
+  if (patch.description !== undefined) current.description = String(patch.description).trim() || undefined;
+  if (patch.owner !== undefined) current.owner = String(patch.owner).trim() || undefined;
+  if (patch.status !== undefined) current.status = patch.status as ProjectStatus;
+  if (patch.units !== undefined) current.units = patch.units as ProjectUnits;
+  markDirty();
+}
+
+function esc(s: string) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" } as any)[c]);
+}
+
+function snapshotAppState() {
+  const cam = ctx.world.camera.three;
+  const t: any = (ctx.world.camera.controls as any).target;
+  return {
+    cam: [cam.position.x, cam.position.y, cam.position.z] as [number, number, number],
+    target: t?.isVector3 ? ([t.x, t.y, t.z] as [number, number, number]) : undefined,
+  };
+}
+
+/** List retained recovery checkpoints for the active project, plus the
+ *  checkpoints that were damaged and set aside (quarantined) — the
+ *  newest verified checkpoint is always listed first, so the user is
+ *  offered the last known-good, never a corrupt entry. Quarantined
+ *  entries found by this listing are merged with ones quarantined by
+ *  earlier sessions, newest first. */
+export async function listProjectRecoverySnapshots(): Promise<{ snapshots: store.ProjectRecoverySnapshot[]; quarantined: store.QuarantinedCheckpointSummary[] }> {
+  if (!current) return { snapshots: [], quarantined: [] };
+  const listed = await store.listProjectRecoverySnapshots(current.id);
+  const previous = await store.listQuarantinedRecoverySnapshots(current.id);
+  const seen = new Set<number>();
+  const quarantined: store.QuarantinedCheckpointSummary[] = [];
+  for (const q of [...listed.quarantined, ...previous]) {
+    if (seen.has(q.id)) continue;
+    seen.add(q.id);
+    quarantined.push(q);
+  }
+  quarantined.sort((a, b) => b.id - a.id);
+  return { snapshots: listed.snapshots, quarantined };
+}
+
+/** Restore a checkpoint and its linked model bytes; the scene must then be reopened. */
+export async function restoreProjectRecoverySnapshot(snapshotId: number): Promise<{ restored: boolean; missingModelIds: string[]; reopenRequired: boolean; quarantined?: boolean; refusedReason?: string }> {
+  if (!current) return { restored: false, missingModelIds: [], reopenRequired: false };
+  const projectId = current.id;
+  const result = await store.restoreProjectSnapshot(projectId, snapshotId);
+  if (!result.restored) return { ...result, reopenRequired: false };
+  const restored = await store.getProject(projectId);
+  if (restored) { current = restored; dirty = false; notify(); }
+  return { ...result, reopenRequired: true };
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Save
+   ═════════════════════════════════════════════════════════════════════════ */
+export async function saveProject(silent = false) {
+  if (!current) {
+    if (!silent) uiAlert("No project is open.");
+    return;
+  }
+  if (saving) return; // a write is already in flight; the generation check keeps newer edits dirty
+  saving = true;
+  setSaveState({ state: "saving", startedAt: Date.now() });
+  const gen = dirtyGeneration;
+  try {
+    current.elements = getElements();
+    try {
+      const lifecycle = (ctx.features as any).mep?.lifecycle;
+      if (typeof lifecycle?.snapshot === "function") current.mepLifecycle = lifecycle.snapshot();
+    } catch (e) { console.warn("[projects] MEP lifecycle snapshot failed", e); }
+    current.grids = getGrids();
+    current.levels = getLevels();
+    try {
+      const workPlanes = await import("../work-planes/types");
+      current.workPlanes = workPlanes.serializeWorkPlanes();
+    } catch (e) { console.warn("[projects] work plane snapshot failed", e); }
+    // Parametric persistence: locked dimensions + the constraint store survive reloads.
+    try {
+      current.parametricConstraints = exportConstraints();
+    } catch (e) { console.warn("[projects] constraint export failed", e); }
+    try {
+      const locks = (ctx.features as any).authoring?.getDimLocks?.();
+      current.dimLocks = Array.isArray(locks) ? locks : [];
+    } catch (e) { console.warn("[projects] dim-lock export failed", e); }
+    current.issues = getIssues();
+    current.cost = getCostData();
+    current.appState = snapshotAppState();
+    current.north = getNorthState();
+
+    // Persist per-model offset from importer.
+    try {
+      const importer: any = (ctx.features as any).importer;
+      for (const meta of current.models ?? []) {
+        const off = importer?.getModelOffset?.(meta.id);
+        if (off) meta.position = [off[0], off[1], off[2]];
+        const rot = importer?.getModelRotation?.(meta.id);
+        if (rot) meta.rotationY = rot;
+      }
+    } catch (e) {
+      console.warn("[projects] offset persistence failed", e);
+    }
+
+    try {
+      const m = (ctx.features as any).importer?.getPositioningMode?.();
+      if (m) (current as any).positioningMode = m;
+    } catch { /* */ }
+
+    // openbim-levels:ui-wired:projects
+    try {
+      const activeId = (ctx.features as any).authoring?.getActiveLevelId?.() ?? null;
+      (current as any).activeLevelId = activeId;
+    } catch { /* */ }
+
+    try {
+      const serialize = (ctx.features as any).fragEdit?.serialize;
+      if (typeof serialize === "function") {
+        const edits = serialize();
+        (current as any).fragEdits = edits; // v48 legacy compatibility
+        (current as any).nativeTwins = edits; // rich Native Twin payload
+      }
+    } catch { /* */ }
+
+    try {
+      const clash = services.tryUse("clash");
+      (current as any).clashStates = clash?.serializeStates?.() ?? [];
+      // Saved scenarios travel with the project (previously localStorage-only,
+      // so a project moved between machines lost every saved clash test).
+      (current as any).clashScenarios = clash?.serializeScenarios?.() ?? [];
+    } catch { /* */ }
+
+    // Classification assignments (UniFormat II / Uniclass 2015 EF / OmniClass
+    // Table 21) travel with the project — they drive IFC export, the QTO
+    // classification roll-up and schedules grouped by classification code.
+    try {
+      const cl = await import("../classification");
+      (current as any).classificationAssignments = cl.serializeAssignments();
+    } catch { /* classification optional */ }
+
+    // User families travel with the project — a project opened on
+    // another machine keeps its custom families instead of losing them
+    // while its instances keep dangling familyIds.
+    try {
+      const fam = await import("../families/store");
+      (current as any).userFamilies = fam.familyStore.serializeUserFamilies();
+    } catch { /* families optional */ }
+
+    try {
+      const annot = await import("../views/annotation-store");
+      current.annotations = annot.serializeAll();
+    } catch { /* annotations store optional */ }
+
+    // Production sheets + titleblocks: flush the live sheet store into the doc
+    // so sheets, viewports, titleblock fields and sheet annotations survive
+    // save / reload exactly like every other project datum.
+    try {
+      const sheetsMod = await import("../sheets/sheets");
+      const snap = sheetsMod.getSheetsForSave();
+      current.sheets = snap.sheets;
+      current.titleblocks = snap.titleblocks;
+    } catch (e) { console.warn("[projects] sheet snapshot failed", e); }
+
+    // Documentation system: view templates + view bindings, revisions +
+    // clouds travel with the project (previously localStorage-only, so a
+    // project moved between machines lost all of them).
+    try {
+      const docMod = await import("../documentation/documentation-persistence");
+      current.documentation = docMod.serializeDocumentation();
+    } catch (e) { console.warn("[projects] documentation snapshot failed", e); }
+
+    try {
+      const pd = (window as any).__obsPlanDims?.serialize?.();
+      if (Array.isArray(pd)) current.planDimensions = pd;
+      const pa = (window as any).__obsPlanAnno?.serialize?.();
+      if (pa) current.planAnnotations = pa;
+      const pr = (window as any).__obsPlanRegions?.serialize?.();
+      if (Array.isArray(pr)) current.planRegions2d = pr;
+    } catch { /* plan dimensions optional */ }
+
+    current.updatedAt = Date.now();
+    await store.putProject(current);
+    // Only declare the document clean when nothing was edited while the write
+    // ran; otherwise the in-flight edits stay dirty for the next save.
+    if (dirtyGeneration === gen) dirty = false;
+    setSaveState({ state: "saved", at: current.updatedAt });
+    notify();
+    try { window.dispatchEvent(new CustomEvent("obs:project-saved", { detail: { silent } })); } catch { /* */ }
+  } catch (err) {
+    // A failed save must never look like a successful one. Keep the dirty
+    // flag, surface the reason, and let the status bar offer a retry.
+    dirty = true;
+    dirtyGeneration += 1;
+    const quota = isQuotaError(err);
+    const message = err instanceof Error ? err.message : String(err);
+    setSaveState({ state: "error", at: Date.now(), message: quota ? "Browser storage is full." : message, quota });
+    console.error("[projects] SAVE FAILED — project remains dirty", err);
+    if (!silent) {
+      uiAlert(quota
+        ? `Could not save: browser storage is full. Free space (or save a .obsproj backup via File → Save As) and try again.\n\n${message}`
+        : `Could not save the project: ${message}`);
+    } else if (Date.now() - lastSilentErrorToastAt > 60_000) {
+      // Autosave failures must not be silent either — but an alert on every
+      // 25 s tick would make the app unusable, so throttle the toast.
+      lastSilentErrorToastAt = Date.now();
+      toast("error", quota
+        ? "Autosave failed: browser storage is full. Save a .obsproj backup (File → Save As) to protect your work."
+        : `Autosave failed: ${message}`);
+    }
+    try { window.dispatchEvent(new CustomEvent("obs:save-failed", { detail: { message, quota, silent } })); } catch { /* */ }
+  } finally {
+    saving = false;
+    notify();
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Scene teardown
+   ═════════════════════════════════════════════════════════════════════════ */
+async function clearScene() {
+  try { await (ctx.highlighter as any).clear?.(); } catch { /* */ }
+  try { ctx.clipper.deleteAll(); } catch { /* */ }
+  try { await clearClash(); } catch { /* */ }
+
+  try { (ctx.features as any).importer?.clearAllOffsets?.(); } catch { /* */ }
+
+  const ids = Array.from(ctx.fragments.list.keys());
+  for (const id of ids) {
+    try { await (ctx.fragments.list.get(id) as any)?.dispose?.(); } catch { /* */ }
+    try { (ctx.fragments.list as any).delete?.(id); } catch { /* */ }
+  }
+  try { (ctx.fragments.list as any).clear?.(); } catch { /* */ }
+
+  clearElements();
+  try { (ctx.features as any).fileInterop?.clearAux?.(); } catch { /* */ }
+  try { (ctx.features as any).fragEdit?.clearAll?.(); } catch { /* */ }
+  resetPlacementState();
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Viewpoint pruning
+   ═════════════════════════════════════════════════════════════════════════ */
+function pruneViewpoint(vp: any, missing: Set<string>) {
+  if (!vp || typeof vp !== "object") return;
+  if (vp.selection && typeof vp.selection === "object") {
+    for (const k of Object.keys(vp.selection)) if (missing.has(k)) delete vp.selection[k];
+  }
+  if (vp.hidden && typeof vp.hidden === "object") {
+    for (const k of Object.keys(vp.hidden)) if (missing.has(k)) delete vp.hidden[k];
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Worker-probe verification
+   ═════════════════════════════════════════════════════════════════════════ */
+async function verifyLoadedModels(loadedIds: Set<string>): Promise<string[]> {
+  const stale: string[] = [];
+  for (const id of Array.from(loadedIds)) {
+    if (id.startsWith("aux-")) continue;
+    const model: any = ctx.fragments.list.get(id);
+    if (!model) { stale.push(id); continue; }
+    try {
+      const probe = await model.getItemsIdsWithGeometry?.();
+      if (!Array.isArray(probe) || probe.length === 0) { stale.push(id); continue; }
+    } catch { stale.push(id); }
+  }
+  for (const id of stale) {
+    try { (ctx.fragments.list as any).delete?.(id); } catch { /* */ }
+    loadedIds.delete(id);
+  }
+  return stale;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   New project
+   ═════════════════════════════════════════════════════════════════════════ */
+export interface CreateProjectOptions {
+  template?: ProjectTemplate;
+  projectNumber?: string;
+  client?: string;
+  phase?: string;
+  units?: ProjectUnits;
+  owner?: string;
+  description?: string;
+}
+
+export async function createProject(name: string, options: CreateProjectOptions = {}) {
+  const resumeHistory = await history.beginDocumentTransition();
+  transitioning = true; // hydration side effects must not mark the new document dirty
+  const loader = (ctx.features as any).appLoader;
+  try {
+    // Flush the outgoing document while its scene is still available. The
+    // history boundary above prevents new edits from racing this snapshot.
+    if (current && dirty) await saveProject(true);
+    loader?.begin?.(`Creating project · ${name || "Untitled"}`, { cancellable: false });
+    loader?.set?.("Clearing current scene…", 0.2);
+    await clearScene();
+    try { (ctx.features as any).mep?.lifecycle?.hydrate?.({ connectors: [], connections: [], panels: [], loads: [] }); } catch (e) { console.warn("[projects] MEP lifecycle reset failed", e); }
+    loader?.set?.("Preparing document…", 0.6);
+
+    const now = Date.now();
+    current = {
+      id: (crypto as any).randomUUID?.() ?? `p-${now}`,
+      name: name || "Untitled project",
+      createdAt: now,
+      updatedAt: now,
+      projectNumber: options.projectNumber?.trim() || undefined,
+      client: options.client?.trim() || undefined,
+      phase: options.phase?.trim() || undefined,
+      description: options.description?.trim() || undefined,
+      owner: options.owner?.trim() || undefined,
+      status: "active",
+      units: options.units ?? "metric",
+      template: options.template ?? "blank",
+      elements: [], models: [], issues: [], cost: undefined,
+      grids: [], levels: [], appState: {},
+      positioningMode: "origin-to-origin",
+    } as ProjectDoc;
+    detachedModels = 0;
+    setIssues([]); setCostData(null);
+    setGrids([]); setLevels([]);
+    try {
+      await restoreProjectWorkPlanes({ schemaVersion: 1, activeId: null, planes: [] });
+    } catch (e) { console.warn("[projects] work plane reset failed", e); }
+    dirty = false;
+
+    // openbim-levels:ui-wired:projects
+    try {
+      const levelsMod: any = await import("../levels/levels");
+      const seeded = levelsMod.levels.ensureSeed();
+      if (seeded.length) levelsMod.levels.setActiveId(seeded[0].id);
+    } catch (e) {
+      console.warn("[projects] level seed failed", e);
+    }
+
+    loader?.set?.("Writing to storage…", 0.85);
+    await store.putProject(current);
+    computeSceneBounds();
+    try { void refreshModelSelectionUI(); } catch { /* */ }
+    resetNorth();
+    resetToDefaultView();     // empty scene: fitAll has nothing to frame, so never keep the old project's camera
+    fitAll();
+    recordLastProjectId(current.id); // so the next boot can auto-reopen
+    loader?.set?.("Done.", 1);
+    notify();
+  } finally {
+    transitioning = false;
+    resumeHistory();
+    setTimeout(() => loader?.finish?.(), 150);
+  }
+}
+
+/**
+ * Adopt the live scene as a project without clearing it.
+ *
+ * A fresh authoring session has no project: the user can draw and import
+ * (detached) before ever creating one, and createProject() clears the scene,
+ * so "create a project, then share" would destroy the very model being
+ * shared. Adopting builds the same project record createProject() builds,
+ * then saveProject() flushes the live elements / grids / levels into it and
+ * persists it. Model files imported while detached were never stored (their
+ * bytes are dropped by onModelImported), so an adopted project carries the
+ * authored elements, not those model blobs.
+ */
+export async function adoptSceneAsProject(name = "Untitled project"): Promise<ProjectDoc> {
+  if (current) return current;
+  const now = Date.now();
+  current = {
+    id: (crypto as any).randomUUID?.() ?? `p-${now}`,
+    name: name || "Untitled project",
+    createdAt: now,
+    updatedAt: now,
+    status: "active",
+    units: "metric",
+    template: "blank",
+    elements: [], models: [], issues: [], cost: undefined,
+    grids: [], levels: [], appState: {},
+    positioningMode: "origin-to-origin",
+  } as ProjectDoc;
+  detachedModels = 0;
+  await saveProject(true);
+  recordLastProjectId(current.id); // so the next boot can auto-reopen
+  notify();
+  return current;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Open project
+   ═════════════════════════════════════════════════════════════════════════ */
+export async function openProject(id: string) {
+  const loader = (ctx.features as any).appLoader;
+  if (loader?.isActive?.()) return;
+
+  // Crash triage for a manual open (#101 follow-up, rank 4): the boot
+  // step only recovers the auto-reopen target, and only when it runs — a
+  // crash whose marker was never triaged (boot recovery failed and kept
+  // the marker) must be replayed HERE, before loadProjectDoc refuses a
+  // corrupt primary record or concludes "project not found". Gated on
+  // the marker for THIS project only: no marker, no journal read — a
+  // clean open never touches the journal. Dynamic imports keep the
+  // persistence cycle (persistence imports projects) out of the static
+  // graph; both modules are loaded by the time any open runs.
+  try {
+    const { readCrashMarker } = await import("./persistence");
+    const marker = readCrashMarker();
+    if (marker && marker.projectId === id) {
+      const { recoverCrashedProject, dispatchRecoveryOutcome } = await import("./journal-recovery");
+      const outcome = await recoverCrashedProject(id);
+      dispatchRecoveryOutcome(outcome);
+      if (outcome.suppressReopen) {
+        toast("warn", "This project was deleted before the crash — it will not be reopened.");
+        return;
+      }
+      if (outcome.error) {
+        console.warn("[projects] crash recovery reported an error; opening the last saved record", outcome.error);
+        toast("warn", `Crash recovery ran into a problem — opening the last saved project instead. (${outcome.error})`);
+      } else if (outcome.restored) {
+        const n = outcome.appliedSeqs.length;
+        toast("success", outcome.status === "partial"
+          ? `Journal replay recovered ${n} change${n === 1 ? "" : "s"} up to entry #${outcome.lastAppliedSeq}; ${outcome.quarantined.length} damaged ${outcome.quarantined.length === 1 ? "entry was" : "entries were"} set aside.`
+          : `Journal replay recovered ${n} change${n === 1 ? "" : "s"} — your work is back.`);
+      }
+    }
+  } catch (e) {
+    // Recovery must never block opening: fall through to the normal
+    // load, which reports a corrupt primary honestly.
+    console.warn("[projects] manual-open crash recovery failed; opening the last saved record", e);
+  }
+
+  // Triage the stored document BEFORE touching the scene: a corrupted or
+  // newer-schema record is reported here, never silently discarded.
+  const load = await store.loadProjectDoc(id);
+  if (!load.loaded) {
+    if (load.fatal === "Project not found.") {
+      uiAlert("Project not found.");
+      return;
+    }
+    console.error("[projects] refusing to open corrupted project", id, load.fatal, load.issues);
+    uiAlert(`This project's stored data is damaged and cannot be opened safely.\n\n${load.fatal}` +
+      (load.issues.length ? `\n\nDetails:\n· ${load.issues.join("\n· ")}` : "") +
+      `\n\nYour data was NOT deleted — restore a checkpoint via File → Recovery checkpoints…, or open a .obsproj backup.`);
+    return;
+  }
+  const doc = load.doc;
+
+  const resumeHistory = await history.beginDocumentTransition();
+  transitioning = true; // hydration must not flag the document dirty (set after the await above so a rejection cannot latch it on)
+  try {
+    // Persist the outgoing project before tearing down its scene.
+    if (current && current.id !== id && dirty) await saveProject(true);
+    loader?.begin?.(`Opening ${doc.name}…`, { cancellable: false });
+    loader?.set?.("Clearing current scene…", 0.05);
+    await clearScene();
+
+    current = doc;
+    dirty = false;
+    detachedModels = 0;
+
+    loader?.set?.("Reading stored blobs…", 0.12);
+    const blobs = await store.getModelBlobs(id);
+    const loadedIds = new Set<string>();
+    const missingModels: string[] = [];
+    const importer = (ctx.features as any).importer;
+
+    for (let i = 0; i < blobs.length; i++) {
+      const b = blobs[i];
+      const pct = 0.15 + 0.6 * ((i + 1) / Math.max(1, blobs.length));
+      loader?.set?.(`Loading model ${i + 1} / ${blobs.length} · ${b.name}`, pct);
+      try {
+        if (b.modelId.startsWith("aux-")) {
+          await (ctx.features as any).fileInterop?.restoreAux?.(b.blob, b.name, b.modelId);
+          loadedIds.add(b.modelId);
+          continue;
+        }
+        const buf = await b.blob.arrayBuffer();
+        await ctx.fragments.core.load(new Uint8Array(buf), { modelId: b.modelId });
+
+        // Register (default offset 0,0,0) and immediately apply saved offset.
+        importer?.registerModel?.(b.modelId);
+        const meta = doc.models?.find((m) => m.id === b.modelId);
+        if (meta?.position) {
+          importer?.setModelOffset?.(b.modelId, meta.position);
+          if (meta.rotationY) importer?.setModelRotation?.(b.modelId, meta.rotationY);
+          console.log(
+            `[projects] applied offset for "${b.modelId}" → ` +
+              `(${meta.position[0].toFixed(3)}, ${meta.position[1].toFixed(3)}, ${meta.position[2].toFixed(3)})`,
+          );
+        }
+        establishSceneOffset(b.modelId);
+        loadedIds.add(b.modelId);
+      } catch (e) {
+        console.error("[projects] model load failed:", b.name, e);
+        try { (ctx.fragments.list as any).delete?.(b.modelId); } catch { /* */ }
+        missingModels.push(b.modelId);
+      }
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    for (const m of doc.models ?? []) {
+      if (!loadedIds.has(m.id) && !missingModels.includes(m.id)) {
+        missingModels.push(m.id);
+        try { (ctx.fragments.list as any).delete?.(m.id); } catch { /* */ }
+      }
+    }
+
+    loader?.set?.("Verifying loaded models…", 0.78);
+    const stale = await verifyLoadedModels(loadedIds);
+    for (const sid of stale) if (!missingModels.includes(sid)) missingModels.push(sid);
+
+    if (missingModels.length) {
+      const missing = new Set(missingModels);
+      for (const m of doc.models ?? []) if (missing.has(m.id)) (m as any).missing = true;
+      for (const issue of doc.issues ?? []) {
+        pruneViewpoint(issue.viewpoint, missing);
+        for (const c of issue.comments ?? []) if (c.viewpoint) pruneViewpoint(c.viewpoint, missing);
+      }
+    }
+
+    loader?.set?.("Restoring project data…", 0.82);
+    setIssues(doc.issues ?? []);
+    setCostData(doc.cost ?? null);
+    setGrids(doc.grids ?? []);
+    setLevels(doc.levels ?? []);
+    setElements(doc.elements ?? []);
+    // Parametric restore: constraints + dim locks back into their stores
+    // (passive — the saved elements already sit at their locked values).
+    try {
+      const n = importConstraints((doc as any).parametricConstraints ?? []);
+      if (n > 0) console.log(`[projects] restored ${n} parametric constraint(s)`);
+    } catch (e) { console.warn("[projects] constraint restore failed", e); }
+    try {
+      const locks = (doc as any).dimLocks ?? [];
+      const restored = (ctx.features as any).authoring?.setDimLocks?.(locks);
+      if (restored > 0) console.log(`[projects] restored ${restored} dimension lock(s)`);
+    } catch (e) { console.warn("[projects] dim-lock restore failed", e); }
+    try {
+      await restoreProjectWorkPlanes(doc.workPlanes);
+    } catch (e) { console.warn("[projects] work plane restore failed", e); }
+    try {
+      const lifecycle = (ctx.features as any).mep?.lifecycle;
+      if (typeof lifecycle?.hydrate === "function") lifecycle.hydrate(doc.mepLifecycle ?? {});
+    } catch (e) { console.warn("[projects] MEP lifecycle restore failed", e); }
+
+    // openbim-levels:ui-wired:projects
+    try {
+      const levelsMod: any = await import("../levels/levels");
+      const seeded = levelsMod.levels.ensureSeed();
+      const savedActive = (doc as any).activeLevelId;
+      if (savedActive && seeded.some((l: any) => l.id === savedActive)) {
+        levelsMod.levels.setActiveId(savedActive);
+      } else if (seeded.length) {
+        levelsMod.levels.setActiveId(seeded[0].id);
+      }
+    } catch (e) {
+      console.warn("[projects] level restore failed", e);
+    }
+    try {
+      const annot = await import("../views/annotation-store");
+      annot.deserializeAll((doc.annotations as any) ?? null);
+    } catch { /* */ }
+    try {
+      const sheetsMod = await import("../sheets/sheets");
+      sheetsMod.loadSheetsFromProject(doc.sheets, doc.titleblocks);
+    } catch (e) { console.warn("[projects] sheet restore failed", e); }
+    // Documentation system: view templates + bindings, revisions + clouds
+    // back into their stores. A malformed section is repaired entry by
+    // entry (never throws); drops are logged, not silently swallowed.
+    try {
+      const docMod = await import("../documentation/documentation-persistence");
+      const restored = docMod.restoreDocumentation((doc as any).documentation ?? null);
+      if (restored.applied && restored.issues.length) {
+        console.warn("[projects] documentation restore issues:", restored.issues);
+      } else if (restored.applied) {
+        console.log(`[projects] restored documentation: ${restored.counts.templates} template(s), ${restored.counts.revisions} revision(s), ${restored.counts.clouds} cloud(s)`);
+      }
+    } catch (e) { console.warn("[projects] documentation restore failed", e); }
+    try {
+      const pdApi = (window as any).__obsPlanDims;
+      if (pdApi?.load) pdApi.load(doc.planDimensions ?? []);
+      else (window as any).__obsPendingPlanDims = doc.planDimensions ?? [];
+      const paApi = (window as any).__obsPlanAnno;
+      if (paApi?.load) paApi.load(doc.planAnnotations ?? null);
+      else (window as any).__obsPendingPlanAnno = doc.planAnnotations ?? null;
+      const prApi = (window as any).__obsPlanRegions;
+      if (prApi?.load) prApi.load((doc as any).planRegions2d ?? []);
+      else (window as any).__obsPendingPlanRegions = (doc as any).planRegions2d ?? [];
+    } catch { /* */ }
+
+    // If no saved offsets, apply the saved positioning mode instead.
+    const hasSavedOffsets = (doc.models ?? []).some(
+      (m) => m.position && (Math.abs(m.position[0]) > 1e-6 || Math.abs(m.position[1]) > 1e-6 || Math.abs(m.position[2]) > 1e-6),
+    );
+    if (!hasSavedOffsets && importer?.applyPositioningMode) {
+      const mode = (doc as any).positioningMode ?? "origin-to-origin";
+      try { await importer.applyPositioningMode(mode); } catch (e) { console.warn(e); }
+    }
+
+    computeSceneBounds();
+
+    const nativeTwins = Array.isArray((doc as any).nativeTwins)
+      ? (doc as any).nativeTwins
+      : ((doc as any).fragEdits ?? []);
+    if (Array.isArray(nativeTwins) && nativeTwins.length) {
+      loader?.set?.(`Restoring ${nativeTwins.length} native twin(s)…`, 0.9);
+      try { await (ctx.features as any).fragEdit?.deserializeNativeTwins?.(nativeTwins); } catch {
+        try { await (ctx.features as any).fragEdit?.deserialize?.(nativeTwins); } catch { /* */ }
+      }
+    }
+
+    try {
+      const clash = services.tryUse("clash");
+      clash?.deserializeStates?.((doc as any).clashStates ?? []);
+      // Only when the document carries scenarios: legacy projects keep their
+      // localStorage working copy instead of being wiped.
+      if ((doc as any).clashScenarios != null) {
+        clash?.restoreScenarios?.((doc as any).clashScenarios);
+      }
+    } catch { /* */ }
+
+    // Same legacy guard as scenarios: a document without the field (older
+    // project) keeps the working classification assignments it has.
+    try {
+      if ((doc as any).classificationAssignments != null) {
+        const cl = await import("../classification");
+        cl.restoreAssignments((doc as any).classificationAssignments);
+      }
+    } catch { /* classification optional */ }
+
+    loader?.set?.("Rebuilding panels…", 0.96);
+    setTimeout(() => { try { void refreshModelSelectionUI(); } catch { /* */ } }, 300);
+
+    loadNorth(doc.north);
+    resetCameraUpright();
+    const st = doc.appState;
+    if (st?.cam && st?.target) {
+      ctx.world.camera.controls.setLookAt(
+        st.cam[0], st.cam[1], st.cam[2],
+        st.target[0], st.target[1], st.target[2], true,
+      );
+      updateClipping();
+    } else fitAll();
+
+    setTimeout(() => {
+      try { (ctx.cam as any)?.recoverView?.(); } catch { /* */ }
+    }, 600);
+
+    if (missingModels.length) showMissingModelsBanner(missingModels);
+
+    recordLastProjectId(id); // so the next boot can auto-reopen
+    loader?.set?.("Done.", 1);
+    notify();
+    // User families travel with the project. This MUST run after
+    // notify() above: the family store's project-change hook clears the
+    // store and reloads from localStorage, which would wipe a restore
+    // done any earlier. Same legacy guard as classification: a document
+    // without the field (older project) keeps the working families it has.
+    try {
+      if ((doc as any).userFamilies != null) {
+        const fam = await import("../families/store");
+        const report = fam.familyStore.restoreUserFamilies((doc as any).userFamilies);
+        if (report.skipped.length) {
+          load.issues.push(
+            `Dropped ${report.skipped.length} invalid user famil${report.skipped.length === 1 ? "y" : "ies"} from the saved document: ` +
+            report.skipped.map((s) => `${s.id} (${s.reason})`).join(", "),
+          );
+        }
+      }
+    } catch { /* families optional */ }
+
+    // Missing families on instances are reported, never silently
+    // dropped: the elements stay in the document with their familyId
+    // intact, so re-importing the family restores them.
+    try {
+      const fam = await import("../families/store");
+      const { findMissingFamilies } = await import("../families/project-families");
+      const missing = findMissingFamilies(doc.elements ?? [], (fid) => fam.familyStore.get(fid) != null);
+      if (missing.length) {
+        const byFamily = new Map<string, number>();
+        for (const m of missing) byFamily.set(m.familyId, (byFamily.get(m.familyId) ?? 0) + 1);
+        load.issues.push(
+          `${missing.length} element(s) reference ${byFamily.size} missing famil${byFamily.size === 1 ? "y" : "ies"}: ` +
+          [...byFamily.entries()].map(([fid, n]) => `${fid} (${n} element${n === 1 ? "" : "s"})`).join(", ") +
+          ". The elements were kept; re-import the family to restore them.",
+        );
+      }
+    } catch { /* families optional */ }
+    // Surface every repair made while loading — never a silent fix.
+    if (load.issues.length || load.migrations.length) {
+      const detail = [...load.migrations, ...load.issues].join(" ");
+      console.warn("[projects] project loaded with repairs:", detail);
+      toast("warn", `Project repaired on load: ${detail}`);
+    }
+  } catch (err) {
+    console.error("[projects] openProject failed", err);
+    uiAlert(`Could not open project: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    transitioning = false;
+    resumeHistory();
+    setTimeout(() => loader?.finish?.(), 180);
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Banners
+   ═════════════════════════════════════════════════════════════════════════ */
+function showMissingModelsBanner(models: string[]) {
+  const id = "obs-missing-models-banner";
+  document.getElementById(id)?.remove();
+  const banner = document.createElement("div");
+  banner.id = id;
+  banner.style.cssText =
+    "position:fixed;right:16px;bottom:52px;z-index:9000;max-width:420px;" +
+    "background:var(--bg-floating,#1c1e28);color:var(--text-primary,#e8eaf0);" +
+    "border:1px solid var(--warning,#f59e0b);border-inline-start:3px solid var(--warning,#f59e0b);" +
+    "border-radius:6px;padding:12px 14px;font:12px/1.5 system-ui,sans-serif;" +
+    "box-shadow:0 12px 32px rgba(0,0,0,.45)";
+  banner.innerHTML =
+    `<div style="font-weight:700;margin-bottom:6px;color:var(--warning,#f59e0b)">⚠ ${models.length} linked model(s) not loaded</div>` +
+    `<div style="font-size:11px;opacity:.85;margin-bottom:8px;max-height:140px;overflow:auto">` +
+      models.map((m) => `<div style="font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">· ${esc(m)}</div>`).join("") +
+    `</div>`;
+  const close = document.createElement("button");
+  close.textContent = "Dismiss";
+  close.style.cssText = "padding:4px 12px;background:var(--bg-hover,#232633);color:inherit;" +
+    "border:1px solid var(--border-default,#2a2e3a);border-radius:4px;cursor:pointer;font-size:11px";
+  close.onclick = () => banner.remove();
+  banner.appendChild(close);
+  document.body.appendChild(banner);
+  setTimeout(() => { if (banner.isConnected) banner.remove(); }, 20_000);
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Delete
+   ═════════════════════════════════════════════════════════════════════════ */
+export async function deleteProjectById(id: string) {
+  if (readLastProjectIdSafe() === id) clearLastProjectId(); // never auto-reopen a deleted project
+  // The store deletes the project document and all model blobs atomically.
+  await store.deleteProjectRecord(id);
+  if (current?.id === id) { current = null; notify(); }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Import persistence hook
+   ═════════════════════════════════════════════════════════════════════════ */
+export function onModelImported(modelId: string, name: string, bytes: Uint8Array | null) {
+  if (!current) {
+    detachedModels++;
+    notify();
+    return;
+  }
+  if (!bytes || !bytes.byteLength) {
+    const meta = current.models.find((m) => m.id === modelId);
+    if (meta) meta.name = name;
+    else current.models.push({ id: modelId, name, bytes: 0 });
+    markDirty();
+    return;
+  }
+  // Capture the owning project before starting asynchronous storage work.
+  // The store updates its persisted document and blob in one transaction, and
+  // refuses to recreate the project if it was deleted while the import ran.
+  const project = current;
+  const projectId = project.id;
+  const blob = new Blob([bytes as unknown as BlobPart]);
+  const meta = project.models.find((m) => m.id === modelId);
+  if (meta) {
+    meta.name = name;
+    meta.bytes = blob.size;
+    (meta as any).missing = false;
+  } else {
+    project.models.push({ id: modelId, name, bytes: blob.size });
+  }
+  markDirty();
+
+  void store.putImportedModel(projectId, modelId, name, blob)
+    .then((saved) => {
+      if (!saved) {
+        console.warn(`[projects] skipped model payload for deleted project "${projectId}"`);
+      }
+    })
+    .catch((e) => console.error(`[projects] blob save FAILED for "${name}"`, e));
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Setup
+   ═════════════════════════════════════════════════════════════════════════ */
+export function setupProjects() {
+  if (!workPlaneListenerInstalled) {
+    window.addEventListener("obs:work-plane-changed", () => {
+      if (!restoringWorkPlanes) markDirty();
+    });
+    workPlaneListenerInstalled = true;
+  }
+  ctx.features.projects = {
+    getCurrentProject, isDirty, createProject, openProject,
+    deleteProjectById, saveProject, onModelImported, markDirty,
+    listProjectRecoverySnapshots, restoreProjectRecoverySnapshot,
+    getSaveState, isTransitioning,
+  };
+  onIssuesChanged(() => markDirty());
+  onCostChanged(() => markDirty());
+  window.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      void saveProject();
+    }
+  });
+  // NOTE: the autosave interval intentionally lives in ./persistence.ts
+  // (setupProjectPersistence), which adds an in-flight guard, a transition
+  // guard and unload safety. All time-based writes stay behind one owner.
+}

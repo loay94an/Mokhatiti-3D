@@ -1,0 +1,8721 @@
+// openbim-fix:v3:applied -- do not re-apply the earlier fix scripts
+/**
+ * Authoring v6 — hosted doors & windows + AccuDraw + property palette sync
+ * + auto-fittings at chain bends.
+ *
+ * New in this revision:
+ *   - chainStartDir tracks the direction of the last completed segment;
+ *     when the next segment changes direction, a fitting is spawned at
+ *     the bend for MEP types (duct, pipe, cable-tray, conduit).
+ *   - buildFitting() constructs the elbow geometry — rectangular profiles
+ *     use a lofted quad strip, circular profiles use TubeGeometry.
+ *   - selectAllAuthored() is exported so select-all.ts can select both
+ *     fragment and authored elements in one call.
+ *   - Property palette state is published via onAuthoringChange.
+ */
+import { onNavDrag } from "./navigation";
+import { hoverPreselectCycle, emitTabCycleStatus } from "../modules/selection/selection-cycle";
+import { resolveVertical, inferBase, levelChangeUpdates } from "../modules/native-bim/level-constraints";
+import { endpointForLength, rotateTransformAboutPivot, normalizeDeg, twinElevationShift } from "../modules/native-twin/twin-dimensions";
+import { escapeHtml } from "../core/html-escape";
+import { fittingArmLength } from "../modules/mep/fitting-outline";
+import { mitreEndFaces, type JoinPeer } from "../modules/geometry/linear-join";
+import { collectDeleteCascade } from "../modules/hosts/cascade";
+import { detectVerticalStacks, stackChains, validateStacks, type StackWall } from "../modules/wall-join/vertical-join";
+import {
+  cutSlabHoles as voCutSlabHoles,
+  openingFootprint as voOpeningFootprint,
+  openingZSpan as voOpeningZSpan,
+  auditVerticalOpenings as voAuditVerticalOpenings,
+  type OpeningLike as VerticalOpeningLike,
+} from "../modules/vertical-openings/vertical-openings";
+import { clampBendRadius, defaultBendRadius, elbowGeometry, turnAngle, arcPoints as elbowArcPoints } from "../modules/mep/elbow-geometry";
+import { applyResolvedParams } from "../modules/families/placement";
+import * as THREE from "three";
+import { ctx } from "../core/context";
+import { register, type AuthoringService } from "../core/services";
+import { getSelectionPrefs } from "../core/selection-prefs";
+import { selection } from "./selection";
+import { PreviousSelectionStore } from "./selection-semantics";
+import { inputRouter, type Gesture, type Mods } from "../core/input-router";
+import { notify } from "../core/notify";
+import { checkEditAllowed } from "../modules/collaboration/edit-guard";
+import { t as i18nT } from "../core/i18n";
+import { isReviewMode } from "../modules/review/review-state";
+import { setMeasureEnabled } from "./measure";
+import { setSectionOn } from "./section";
+import { markDirty } from "../modules/projects/projects";
+import { history } from "./history";
+import { snapping } from "./snapping";
+import { isSnapFreshForEvent, SnapGeneration } from "./snap-freshness";
+import { gizmo } from "./gizmo";
+import { accuDraw } from "./accudraw";
+import { expandConnected, isMepElement, connectedSelection, LINEAR_MEP, type MepLike } from "../modules/mep/connectivity";
+import { isViewOnly } from "../modules/collaboration/share-session";
+import { planMepStretch, planMepMove } from "../modules/mep/stretch";
+import { planLinearFollow, FOLLOW_LINEAR, magnetSameTypeEnd, joinedEnds } from "../modules/native-bim/linear-follow";
+import { generateWallSweep, generateRevealCutter } from "../modules/wall-sweeps/geometry";
+import {
+  gateSolid, recordQuarantinedSolid, clearQuarantinedSolid,
+  threeGeometryToIndexedMesh, summarizeGateDiagnostics,
+} from "../modules/solid-kernel/validation-gate";
+import { recordBooleanCutFailure } from "../modules/solid-kernel/boolean-postcondition";
+import { subtractThreeMesh } from "../modules/solid-kernel/three-boolean";
+import type { WallSweepPlacement } from "../modules/wall-sweeps/types";
+import { isValidBoundary } from "../modules/views/boundary-edit";
+import { pointFootprintHandles, resizePointFootprint, type FootprintGrip } from "../modules/views/grip-geometry";
+import {
+  hostGeometryFromElement, hostGeometryEquals, detachFamilyFromHost,
+  type FamilyHostGeometry,
+} from "../modules/families/family-hosting";
+import { rehostElementAfterHostChange } from "../modules/families/placement";
+import { endElevationFromSlope, slopePercent, slopedRun } from "../modules/mep/slope";
+import { makeAxisLock, projectOnAxis } from "./grip-axis-lock";
+import type { AxisLock } from "./grip-axis-lock";
+import {
+  applyEngineGrip,
+  gripCentre,
+  planGrips,
+  type EngineGripKind,
+  type GripParams,
+} from "../modules/grips/grips-engine";
+import type {
+  AuthoredElement,
+  DoorPanelType,
+  ElementType,
+  GridDatum,
+  LevelDatum,
+  Vec2,
+  WindowPanelType,
+} from "../modules/projects/types";
+import { validateNativeModel } from "../modules/native-bim/model-validation";
+import { deriveLinearParamsFromPositions } from "../modules/native-twin/linear-params";
+import { heightResizeTransform, footprintCenterXZ } from "../modules/native-twin/vertical-resize";
+import { deformPlanDimensions, planAxesFromBaseline, lengthRatioFromParams } from "../modules/native-twin/mesh-plan-deform";
+import {
+  classifyTwinCapabilities,
+  elementTypeFromIfcEntity,
+  shouldPreferParametricSolid,
+  LINEAR_ELEMENT_TYPES,
+} from "../modules/native-twin/capabilities";
+import { derivePlanAabbPolygon } from "../modules/native-twin/plan-polygon";
+import { buildSourceArchive, markNativeDimensionModified, type SourceArchive } from "../modules/native-twin/source-archive";
+import {
+  applyJustificationToSegment,
+  coreThicknessFromLayers,
+  justificationShiftMeters,
+  resolveWallJustification,
+  type WallLocationLine as JustificationLine,
+} from "../modules/justification";
+import {
+  calculateWallEndpoint,
+  getWallLocationLine as toWallColumnLine,
+  type WallLocationLine as WallColumnLine,
+} from "../modules/snapping/wall-column";
+import {
+  evaluateSmartPerpSnap,
+  rectColumnFaces,
+  smartSnapRadiusWorld,
+  type SmartPerpSnapResult,
+} from "../modules/snapping/smart-perp-snap";
+import { snapFeedback } from "./snap-feedback";
+import { computeTracking, type TrackAnchor, type TrackHit } from "../modules/snapping/reference-tracking";
+import { deriveRunConnectors, syncStoredConnections } from "../modules/mep/stored-connectors";
+import { deriveFamilyInstanceConnectors } from "../modules/mep/family-connectors";
+import { lengthKeepRight, thicknessKeepFace, openingWidthKeepRight, heightKeepBase } from "../modules/native-bim/dimension-edit";
+import { registerTempDimProvider, type TempDimSpec, setupEditableTempDims } from "./temp-dimensions-edit";
+import { applyPlanTempDimEdit } from "./plan-temp-dimensions";
+import { setupOptionsBar } from "./options-bar";
+import { promptLine, confirmDialog } from "./form-modal";
+import { scheduleAutoSolve } from "./constraint-solver";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Types
+// ═══════════════════════════════════════════════════════════════════════════
+type Tool =
+  | "select" | "move" | "copy" | "rotate" | "mirror" | "array" | "offset"
+  | "wall" | "slab" | "column" | "beam" | "brace" | "truss" | "footing" | "strip" | "mline"
+  | "duct" | "pipe" | "cable-tray" | "conduit" | "equipment"
+  | "door" | "window" | "curtain-wall"
+  | "vertical-opening"
+  | "grid" | "level"
+  | "terrain"
+  | "ramp";
+
+interface GripSpec {
+  elementId: string;
+  kind: "start" | "end" | "vertex" | "edge-midpoint" | "point" | "point-footprint" | "hosted-offset"
+    | EngineGripKind;
+  vertexIndex?: number;
+  footprintGrip?: FootprintGrip;
+  /** Polygon edge index for engine "edge" grips. */
+  edgeIndex?: number;
+  position: THREE.Vector3;
+  mesh: THREE.Mesh;
+}
+
+interface WallOpening {
+  offset: number;
+  width: number;
+  height: number;
+  sill: number;
+  /** Hosted door/window element that owns this opening (for failure toasts). */
+  hostId?: string;
+  kind?: "door" | "window";
+}
+
+type PendingOp =
+  | { kind: "none" }
+  | { kind: "move-copy"; mode: "move" | "copy"; id: string | null; base: THREE.Vector3 | null; /** elements that were already selected when the tool started */ ids?: string[] }
+  | { kind: "rotate"; ids: string[]; center: THREE.Vector3 | null; ref: THREE.Vector3 | null }
+  | { kind: "mirror"; ids: string[]; axisA: THREE.Vector3 | null; axisB: THREE.Vector3 | null }
+  | { kind: "array"; ids: string[]; mode: "linear" | "radial"; base: THREE.Vector3 | null; count?: number; spacing?: number }
+  | { kind: "offset"; id: string | null; base: THREE.Vector3 | null; side: 1 | -1 | null };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════════════
+let activeTool: Tool | null = null;
+let level = 0;
+let activeLevelId: string | null = null;
+let activeFamilyId: string | null = null;
+let activeFamilyTypeId: string | null = null;
+
+const selectedIds = new Set<string>();
+/** Authored ids before the last selection change (Revit "Select Previous"). */
+const previousAuthoredStore = new PreviousSelectionStore<string>();
+/** True while Select Previous is applying, so the restore is not re-noted as a new change. */
+let restoringPreviousAuthored = false;
+/** Currently selected datum (grid line or level), if any. Mutually exclusive with element selection. */
+let selectedDatum: { kind: "grid" | "level"; id: string } | null = null;
+const elements: AuthoredElement[] = [];
+let grids: GridDatum[] = [];
+let levels: LevelDatum[] = [];
+let gridIdx = 0;
+let levelIdx = 0;
+const counters: Record<string, number> = {};
+
+const group = new THREE.Group();
+const datumGroup = new THREE.Group();
+const previewGroup = new THREE.Group();
+let tempDimEl: HTMLDivElement | null = null;
+
+const gripGroup = new THREE.Group();
+
+let chainStart: THREE.Vector3 | null = null;
+let chainStartDir: number | null = null;   // ← direction of last completed segment
+/** Corner history for reference-line tracking (close rectangle / perpendicular guides). */
+let chainCorners: THREE.Vector3[] = [];
+let refSnapActive: THREE.Vector3 | null = null;
+/** Reference lines on/off (remembered). */
+const REF_LINES_KEY = "obs-ref-lines";
+let refLinesOn = (() => { try { return localStorage.getItem(REF_LINES_KEY) !== "0"; } catch { return true; } })();
+export function getReferenceTracking() { return refLinesOn; }
+export function setReferenceTracking(v: boolean) {
+  refLinesOn = !!v; refSnapActive = null;
+  try { localStorage.setItem(REF_LINES_KEY, v ? "1" : "0"); } catch { /* */ }
+  try { clearGuides(); } catch { /* */ }
+}
+const REF_SNAP_TOL = 0.35;
+/** Extra reference lines from walls drawn earlier (axis / in-line / square to a wall); zoom-aware capture. */
+let extTrack: TrackHit | null = null;
+const EXT_TOOLS = new Set(["wall", "beam", "strip", "mline", "duct", "pipe", "cable-tray", "conduit"]);
+function extTrackTolerance(at: THREE.Vector3): number {
+  try {
+    const cam: any = ctx.world.camera.three;
+    const hPx = Math.max(1, ctx.rightHost?.clientHeight || 800);
+    const wpp = cam.isOrthographicCamera
+      ? Math.abs((cam.top - cam.bottom) / (cam.zoom || 1)) / hPx
+      : (2 * Math.max(0.01, cam.position.distanceTo(at)) * Math.tan(THREE.MathUtils.degToRad(cam.fov ?? 50) / 2)) / hPx;
+    return Math.min(0.6, Math.max(0.03, wpp * 12));
+  } catch { return 0.15; }
+}
+function extTrackAnchors(tool: string, base: THREE.Vector3): TrackAnchor[] {
+  const out: TrackAnchor[] = [];
+  const byKey = new Map<string, TrackAnchor>();
+  const add = (x: number, z: number, dir: number | null) => {
+    const k = `${Math.round(x * 1000)}|${Math.round(z * 1000)}`;
+    let a = byKey.get(k);
+    if (!a) { a = { x, z, dirs: [] }; byKey.set(k, a); out.push(a); }
+    if (dir != null && Number.isFinite(dir)) a.dirs!.push(dir);
+  };
+  const levelSensitive = tool === "wall" || tool === "strip";
+  for (const el of elements) {
+    if (el.type !== tool || !el.params.start || !el.params.end) continue;
+    if (levelSensitive && Math.abs((el.params.elevation ?? 0) - level) > 0.3) continue;
+    const [ax, az] = el.params.start, [bx, bz] = el.params.end;
+    if (Math.hypot(bx - ax, bz - az) < 0.05) continue;
+    const d = Math.atan2(bz - az, bx - ax);
+    add(ax, az, d); add(bx, bz, d);
+  }
+  add(base.x, base.z, chainStartDir);
+  return out;
+} // metres — attract cursor to axis intersections
+
+let poly: THREE.Vector3[] = [];
+let pendingOp: PendingOp = { kind: "none" };
+
+let preview: THREE.Object3D | null = null;
+let polyLine: THREE.Line | null = null;
+let polyStartMarker: THREE.Mesh | null = null;
+
+let gripDrag: {
+  /** Pre-drag params of every MEP part when an MEP run end is dragged (fittings follow live). */
+  mepBase?: Map<string, any> | null;
+  /** Wall/beam/strip neighbours joined at the dragged end: they stay joined (their touching end follows). */
+  follow?: Array<{ id: string; key: "start" | "end"; before: any }> | null;
+  grip: GripSpec;
+  snapshot: AuthoredElement["params"];
+  original: THREE.Vector3;
+  smartSnap?: SmartPerpSnapResult | null;
+  /** Stretch axis (fixed opposite endpoint → gripped endpoint), captured at drag start.
+   *  Used by the Shift lock: perpendicular direction locked, length-only edit. */
+  axis: AxisLock | null;
+  /** True while Shift is held during this move — drives smart-snap bypass. */
+  shiftLock: boolean;
+  /** Engine grips: pointer Y at drag start (px) for vertical height/elevation drags. */
+  startPointerY?: number;
+  /** Engine grips: baseline scalar captured at drag start (height, elevation or polygon seed radius). */
+  startScalar?: number;
+  /** Engine grips: baseline angle (centroid → pointer) captured at rotate drag start. */
+  startAngle?: number;
+  /** Engine grips: last explicit warning surfaced — re-shown once per drag, not spammed. */
+  lastWarning?: string | null;
+  /** True when this drag runs through the Universal 3D Grips engine (numeric entry active). */
+  engine?: boolean;
+  /** Latest pointer world position during this drag — numeric Enter precision source. */
+  lastPointerWorld?: THREE.Vector3;
+} | null = null;
+
+let lastSnapValid = false;
+let lastSnapResult: import("./snapping").SnapResult | null = null;
+/** Client position the cached snap was computed for. A snap is only
+ *  usable for a click at (nearly) the same pointer position — see
+ *  `currentSnapForEvent`. Without this, a click landing in the same frame
+ *  as its preceding pointermove commits the PREVIOUS hover's snap (the
+ *  async snap race: two instant clicks co-locate both instances). */
+let lastSnapEvent: { x: number; y: number } | null = null;
+/** Generation guard for in-flight snap queries: only the newest hover's
+ *  query may write the cache back, so an older query resolving late can
+ *  never overwrite a newer result. */
+const snapGeneration = new SnapGeneration();
+/** Last hover event — used by refreshPreview() to redraw the ghost after
+ *  a parameter change in the modeling panel (Design spec §2.3). */
+let lastHoverEvent: MouseEvent | null = null;
+
+let hoveredWall: { wallId: string; offset: number; point: THREE.Vector3 } | null = null;
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Palette state — defaults per element type + current palette target.
+   ═════════════════════════════════════════════════════════════════════════ */
+type PaletteTarget =
+  | { mode: "defaults"; type: ElementType }
+  | { mode: "edit"; elementId: string; type: ElementType }
+  /** Multi-select edit (e.g. change wall type on many walls at once). */
+  | { mode: "edit-multi"; elementIds: string[]; type: ElementType }
+  | null;
+
+interface TypeDefaults {
+  params: Record<string, any>;
+  properties: Record<string, any>;
+  name?: string;
+  color?: string;
+}
+
+const typeDefaults = new Map<string, TypeDefaults>();
+let paletteTarget: PaletteTarget = null;
+const authoringListeners = new Set<() => void>();
+
+function notifyAuthoringChange(): void {
+  for (const cb of authoringListeners) {
+    try { cb(); } catch { /* */ }
+  }
+}
+
+export function onAuthoringChange(cb: () => void): () => void {
+  authoringListeners.add(cb);
+  return () => authoringListeners.delete(cb);
+}
+
+// History-mediated mutations (move/copy via history.exec, undo/redo,
+// transactions, and every history.push site) reach the authoring
+// listeners through the history mutation bus, so the open plan's live
+// sync — and every other onAuthoringChange subscriber — refreshes on its
+// own. The bus defers to a microtask, so the notification lands after
+// the caller's synchronous mutation completes. Call sites that already
+// notify explicitly (create, delete, …) now notify twice; every
+// subscriber coalesces or re-renders cheaply, so the duplicate is benign.
+history.onMutation(() => notifyAuthoringChange());
+
+/**
+ * Central-worksharing edit guard (see src/modules/collaboration/edit-guard.ts).
+ * While joined to a central room, elements borrowed by another user (or in a
+ * workset owned by another user) refuse edits/deletes/transforms with a
+ * reason naming the holder. The helpers below are the single place the
+ * authoring path consults the guard, so the palette, modify bar, parametric
+ * tools, keyboard nudge and align all refuse the same way.
+ */
+function guardRefusals(ids: string[]): Array<{ id: string; name: string; reason: string }> {
+  const out: Array<{ id: string; name: string; reason: string }> = [];
+  for (const id of ids) {
+    const g = checkEditAllowed(id);
+    if (!g.allowed) {
+      const el = elements.find((e) => e.id === id);
+      out.push({ id, name: el?.name || id, reason: (g as { reason: string }).reason });
+    }
+  }
+  return out;
+}
+
+function toastGuardRefusals(action: string, refused: Array<{ name: string; reason: string }>): void {
+  if (!refused.length) return;
+  const first = refused[0];
+  const msg =
+    `Cannot ${action}: ${first.name} — ${first.reason}` +
+    (refused.length > 1 ? ` (+${refused.length - 1} more)` : "");
+  try {
+    window.dispatchEvent(new CustomEvent("obs-toast", { detail: { message: msg, kind: "error" } }));
+  } catch { /* toast is cosmetic */ }
+}
+
+export function getTypeDefaults(type: string): TypeDefaults {
+  let d = typeDefaults.get(type);
+  if (!d) {
+    const defaults = DEFAULTS[type] ?? { height: 1, thickness: 0.2 };
+    d = {
+      params: { ...defaults },
+      properties: {},
+      color: COLORS[type] ?? "#cccccc",
+    };
+    // Architectural default: compound exterior wall (finish | core | finish)
+    // Format consumed by parseWallLayers / buildCompoundWall.
+    if (type === "wall") {
+      d.params.thickness = d.params.thickness ?? 0.255;
+      d.properties.layers =
+        "Exterior Finish 0.025|#c4b59a; Structure Core 0.20|#a8a29e; Interior Finish 0.03|#e7e5e4";
+      d.name = d.name || "Basic Wall: Compound Exterior";
+    }
+    if (type === "curtain-wall") {
+      d.params.thickness = 0.12;
+      d.name = d.name || "Curtain Wall: System Panel";
+      d.properties.system = "mullion-panel";
+    }
+    typeDefaults.set(type, d);
+  }
+  return d;
+}
+
+export function setTypeDefault(
+  type: string,
+  target: "params" | "properties" | "root",
+  key: string,
+  value: any,
+): void {
+  const d = getTypeDefaults(type);
+  if (target === "params") d.params[key] = value;
+  else if (target === "properties") d.properties[key] = value;
+  else if (key === "name") d.name = value;
+  else if (key === "color") d.color = value;
+  typeDefaults.set(type, d);
+  notifyAuthoringChange();
+}
+
+export function getPaletteTarget(): PaletteTarget {
+  return paletteTarget;
+}
+
+export function setPaletteTarget(t: PaletteTarget): void {
+  paletteTarget = t;
+  notifyAuthoringChange();
+}
+
+export function markAuthoringDirty(): void {
+  markDirty();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Defaults & colors
+// ═══════════════════════════════════════════════════════════════════════════
+const DEFAULTS: Record<string, { height: number; thickness: number; width?: number; depth?: number; rotation?: number }> = {
+  wall: { height: 3.0, thickness: 0.255 },
+  slab: { height: 0.2, thickness: 0.2 },
+  roof: { height: 0.25, thickness: 0.25 },
+  ceiling: { height: 0.12, thickness: 0.12 },
+  terrain: { height: 0.05, thickness: 0.05 },
+  column: { height: 3.0, thickness: 0.3 },
+  beam: { height: 0.5, thickness: 0.25 },
+  brace: { height: 1.5, thickness: 0.15 },
+  truss: { height: 1.2, thickness: 0.1 },
+  footing: { height: 0.4, thickness: 1.2 },
+  strip: { height: 0.4, thickness: 0.6 },
+  mline: { height: 0.02, thickness: 0.02 },
+  duct: { height: 0.4, thickness: 0.6 },
+  pipe: { height: 0.1, thickness: 0.1 },
+  "cable-tray": { height: 0.1, thickness: 0.3 },
+  conduit: { height: 0.05, thickness: 0.05 },
+  equipment: { height: 1.2, thickness: 0.8 },
+  door: { height: 2.1, thickness: 0.2, width: 0.9 },
+  window: { height: 1.4, thickness: 0.2, width: 1.2 },
+  fitting: { height: 0.4, thickness: 0.6 },
+  // Discipline presets (map to base geometry via TOOL_ALIASES)
+  pile: { height: 8.0, thickness: 0.4 },
+  "air-terminal": { height: 0.15, thickness: 0.4 },
+  "duct-accessory": { height: 0.35, thickness: 0.5 },
+  "plumbing-fixture": { height: 0.85, thickness: 0.5 },
+  sprinkler: { height: 0.12, thickness: 0.12 },
+  "fire-pump": { height: 1.0, thickness: 0.9 },
+  panel: { height: 1.8, thickness: 0.5 },
+  switch: { height: 0.1, thickness: 0.1 },
+  outlet: { height: 0.1, thickness: 0.1 },
+  "junction-box": { height: 0.12, thickness: 0.12 },
+  "lighting-fixture": { height: 0.15, thickness: 0.6 },
+  "emergency-light": { height: 0.12, thickness: 0.25 },
+  transformer: { height: 1.5, thickness: 1.2 },
+  generator: { height: 1.8, thickness: 2.0 },
+  opening: { height: 2.1, thickness: 0.9, width: 0.9 },
+  shaft: { height: 3.0, thickness: 1.2 },
+  "vertical-opening": { height: 3.0, thickness: 1.0, width: 1.0, depth: 1.0, rotation: 0 },
+  stairs: { height: 3.0, thickness: 0.2, width: 1.2 },
+  railing: { height: 1.1, thickness: 0.08, width: 1.0 },
+  ramp: { height: 1.5, thickness: 0.2, width: 1.5 },
+  "curtain-wall": { height: 3.0, thickness: 0.12 },
+  "duct-insulation": { height: 0.05, thickness: 0.7 },
+  "pipe-insulation": { height: 0.025, thickness: 0.15 },
+
+  // ── Professional openBIM family catalog (point/host/linear presets) ──
+  tank: { height: 2.2, thickness: 1.4 },
+  fan: { height: 0.7, thickness: 0.65 },
+  pump: { height: 0.8, thickness: 0.65 },
+  "air-handler": { height: 1.8, thickness: 1.2 },
+  chiller: { height: 1.7, thickness: 1.6 },
+  boiler: { height: 1.8, thickness: 1.3 },
+  "cooling-tower": { height: 2.2, thickness: 1.5 },
+  "heat-exchanger": { height: 1.1, thickness: 0.8 },
+  valve: { height: 0.25, thickness: 0.2 },
+  damper: { height: 0.3, thickness: 0.5 },
+  diffuser: { height: 0.12, thickness: 0.35 },
+  grille: { height: 0.15, thickness: 0.45 },
+  filter: { height: 0.25, thickness: 0.45 },
+  silencer: { height: 0.4, thickness: 0.5 },
+  "fan-coil": { height: 0.5, thickness: 0.8 },
+  vav: { height: 0.45, thickness: 0.45 },
+  "exhaust-fan": { height: 0.35, thickness: 0.35 },
+  toilet: { height: 0.8, thickness: 0.55 },
+  washbasin: { height: 0.5, thickness: 0.55 },
+  sink: { height: 0.25, thickness: 0.55 },
+  shower: { height: 2.1, thickness: 0.1 },
+  "floor-drain": { height: 0.08, thickness: 0.12 },
+  "water-heater": { height: 1.0, thickness: 0.5 },
+  "sanitary-stack": { height: 3.0, thickness: 0.15 },
+  "fire-hydrant": { height: 0.8, thickness: 0.3 },
+  "fire-extinguisher": { height: 0.7, thickness: 0.18 },
+  "hose-reel": { height: 0.7, thickness: 0.5 },
+  "alarm-device": { height: 0.1, thickness: 0.12 },
+  "smoke-detector": { height: 0.08, thickness: 0.12 },
+  "heat-detector": { height: 0.08, thickness: 0.12 },
+  camera: { height: 0.15, thickness: 0.12 },
+  "access-point": { height: 0.06, thickness: 0.18 },
+  "data-outlet": { height: 0.1, thickness: 0.1 },
+  "telephone-outlet": { height: 0.1, thickness: 0.1 },
+  speaker: { height: 0.08, thickness: 0.18 },
+  luminaire: { height: 0.1, thickness: 0.6 },
+  "exit-sign": { height: 0.12, thickness: 0.35 },
+  battery: { height: 0.25, thickness: 0.18 },
+  busbar: { height: 0.12, thickness: 0.18 },
+  ups: { height: 1.2, thickness: 0.7 },
+  switchgear: { height: 2.2, thickness: 1.0 },
+  "distribution-board": { height: 1.8, thickness: 0.55 },
+  "fire-alarm-panel": { height: 1.0, thickness: 0.25 },
+  "access-control": { height: 0.1, thickness: 0.15 },
+  "cctv-rack": { height: 2.0, thickness: 0.65 },
+  rack: { height: 2.0, thickness: 0.6 },
+  "telecom-rack": { height: 2.0, thickness: 0.6 },
+  "communication-panel": { height: 1.5, thickness: 0.45 },
+  "structural-connection": { height: 0.2, thickness: 0.25 },
+  bearing: { height: 0.25, thickness: 0.35 },
+  "rebar-host": { height: 0.15, thickness: 0.15 },
+  "anchor-bolt": { height: 0.3, thickness: 0.06 },
+  bollard: { height: 1.0, thickness: 0.15 },
+  "landscape-component": { height: 0.8, thickness: 0.6 },
+  furniture: { height: 0.75, thickness: 0.7 },
+  "generic-model": { height: 1.0, thickness: 0.5 },
+};
+
+/** Ribbon tool name → internal draw tool. */
+export const TOOL_ALIASES: Record<string, Tool> = {
+  roof: "slab",
+  ceiling: "slab",
+  floor: "slab",
+  mat: "slab",
+  stairs: "equipment",
+  railing: "equipment",
+  // Ramp is a first-class authored element now — no equipment alias. The
+  // mesh comes from the ramp-builder feature (real sloped slab + rails).
+  "curtain-wall": "curtain-wall" as any,
+  pad: "footing",
+  pile: "footing",
+  opening: "door",
+  shaft: "vertical-opening",
+  "vertical-opening": "vertical-opening",
+  "ref-plane": "level",
+  "duct-fitting": "duct",
+  "flex-duct": "duct",
+  "air-terminal": "equipment",
+  "duct-accessory": "equipment",
+  "pipe-fitting": "pipe",
+  "pipe-accessory": "pipe",
+  "plumbing-fixture": "equipment",
+  sprinkler: "equipment",
+  "sprinkler-main": "pipe",
+  "fire-pump": "equipment",
+  "cable-tray-fitting": "cable-tray",
+  "conduit-fitting": "conduit",
+  wire: "conduit",
+  panel: "equipment",
+  switch: "equipment",
+  outlet: "equipment",
+  "junction-box": "equipment",
+  "lighting-fixture": "equipment",
+  "emergency-light": "equipment",
+  "lighting-switch": "equipment",
+  transformer: "equipment",
+  generator: "equipment",
+
+  // ── Extended family aliases ──────────────────────────────────────────
+  tank: "equipment", fan: "equipment", pump: "equipment",
+  "air-handler": "equipment", chiller: "equipment", boiler: "equipment",
+  "cooling-tower": "equipment", "heat-exchanger": "equipment", valve: "equipment",
+  damper: "equipment", diffuser: "equipment", grille: "equipment", filter: "equipment",
+  silencer: "equipment", "fan-coil": "equipment", vav: "equipment", "exhaust-fan": "equipment",
+  toilet: "equipment", washbasin: "equipment", sink: "equipment", shower: "equipment",
+  "floor-drain": "equipment", "water-heater": "equipment", "sanitary-stack": "pipe",
+  "fire-hydrant": "equipment", "fire-extinguisher": "equipment", "hose-reel": "equipment",
+  "alarm-device": "equipment", "smoke-detector": "equipment", "heat-detector": "equipment",
+  camera: "equipment", "access-point": "equipment", "data-outlet": "equipment",
+  "telephone-outlet": "equipment", speaker: "equipment", luminaire: "equipment",
+  "exit-sign": "equipment", battery: "equipment", busbar: "cable-tray", ups: "equipment",
+  switchgear: "equipment", "distribution-board": "equipment", "fire-alarm-panel": "equipment",
+  "access-control": "equipment", "cctv-rack": "equipment", rack: "equipment",
+  "telecom-rack": "equipment", "communication-panel": "equipment",
+  "structural-connection": "equipment", bearing: "equipment", "rebar-host": "equipment",
+  "anchor-bolt": "equipment", bollard: "equipment", "landscape-component": "equipment",
+  furniture: "equipment", "generic-model": "equipment",
+  "duct-insulation": "equipment", "pipe-insulation": "equipment",
+};
+
+/** Active ribbon preset (for naming / sizing equipment variants). */
+let activePreset: string | null = null;
+export function getActivePreset() { return activePreset; }
+
+/**
+ * Last command for Space-bar repeat (BIM behaviour).
+ * Stores the tool/preset string the user last activated (not select/null).
+ */
+let lastCommand: string | null = null;
+export function getLastCommand() { return lastCommand; }
+export function setLastCommand(cmd: string | null) { lastCommand = cmd; }
+
+const COLORS: Record<string, string> = {
+  wall: "#cbd5e1", slab: "#94a3b8", column: "#64748b",
+  beam: "#94a3b8", brace: "#a3b3c2", truss: "#8ea3b8",
+  footing: "#78849a", strip: "#8792a3", mline: "#facc15",
+  duct: "#38bdf8", pipe: "#22c55e", "cable-tray": "#f59e0b",
+  conduit: "#a3e635", equipment: "#c084fc",
+  door: "#92400e", window: "#0369a1",
+  fitting: "#38bdf8",
+  "vertical-opening": "#ef4444",
+};
+
+const DOOR_COLOR_PANEL = "#fde68a";
+const WINDOW_COLOR_GLASS = "#bae6fd";
+
+const GRIP_SIZE = 0.15;
+const GRIP_COLOR = 0xfacc15;
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Draw tools set — controls palette visibility + fitting generation.
+   ═════════════════════════════════════════════════════════════════════════ */
+const DRAW_TOOLS = new Set<Tool>([
+  "wall", "slab", "column", "beam", "brace", "truss",
+  "footing", "strip", "mline",
+  "duct", "pipe", "cable-tray", "conduit", "equipment",
+  "door", "window", "curtain-wall", "terrain",
+  "vertical-opening",
+  "ramp",
+]);
+
+/** Element types whose chains get an auto-fitting at every bend. */
+const FITTED_TYPES: Set<ElementType> = new Set([
+  "duct", "pipe", "cable-tray", "conduit",
+]);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Utilities
+// ═══════════════════════════════════════════════════════════════════════════
+const uid = () =>
+  (crypto as any).randomUUID?.() ??
+  `el-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+const snap = (v: number, step = 0.01) => Math.round(v / step) * step;
+const cap = (s: string) => s[0].toUpperCase() + s.slice(1);
+
+function nextName(type: string) {
+  counters[type] = (counters[type] ?? 0) + 1;
+  return `${cap(type)} ${String(counters[type]).padStart(3, "0")}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+
+/* ── Wall placement options (BIM Modify | Place Wall) ───────────────── */
+export type WallLocationLine =
+  | "wall-centerline"
+  | "core-centerline"
+  | "finish-exterior"
+  | "finish-interior"
+  | "core-exterior"
+  | "core-interior";
+
+export type WallJoinStatus = "allow" | "disallow" | "chamfer" | "extended" | "butt";
+
+let wallLocationLine: WallLocationLine = "wall-centerline";
+let wallChain = true;
+let wallOffset = 0; // m additional offset
+let wallJoinStatus: WallJoinStatus = "allow";
+let wallRadius = 0; // for future arc walls
+/** Last linear segment from plan (for auto MEP fittings on chain). */
+let lastPlanLinear: {
+  type: string;
+  end: [number, number];
+  dir: number;
+  thickness: number;
+  height: number;
+  elevation: number;
+  endElevation?: number;
+  id: string;
+} | null = null;
+/** Slope (%) applied to newly drawn pipes/ducts/trays/conduits; 0 = flat. */
+let drawSlopePct = 0;
+export function setDrawSlope(pct: number) { drawSlopePct = Number.isFinite(pct) ? pct : 0; }
+export function getDrawSlope() { return drawSlopePct; }
+export function clearLastPlanLinear() { lastPlanLinear = null; }
+
+
+export function getWallLocationLine() { return wallLocationLine; }
+export function setWallLocationLine(v: WallLocationLine) { wallLocationLine = v; }
+export function getWallChain() { return wallChain; }
+export function setWallChain(v: boolean) { wallChain = v; }
+
+/** G7: line style for the next mline the user draws in 3D (Detail Line vs
+ *  Insulation). Set by the ribbon before starting the mline tool; consumed
+ *  once, when the run is committed, so a later plain detail line is not
+ *  mis-styled. The plan renderer draws "insulation" runs as batting. */
+let nextMlineLineStyle: "detail" | "insulation" | null = null;
+export function setNextMlineLineStyle(style: "detail" | "insulation" | null): void {
+  nextMlineLineStyle = style;
+}
+export function getWallOffset() { return wallOffset; }
+export function setWallOffset(v: number) { wallOffset = v; }
+export function getWallJoinStatus() { return wallJoinStatus; }
+export function setWallJoinStatus(v: WallJoinStatus) { wallJoinStatus = v; }
+export function getWallRadius() { return wallRadius; }
+export function setWallRadius(v: number) { wallRadius = v; }
+
+/* ── Beam / MEP justification state (Design spec §3) ─────────────── */
+/** Horizontal justification across the profile width. */
+export type HJustification = "center" | "outer" | "inner";
+/** Vertical justification of a beam relative to the draw elevation. */
+export type ZJustification = "bottom" | "center" | "top";
+let beamJustification: HJustification = "center";
+let beamZJustification: ZJustification = "bottom";
+let mepJustification: HJustification = "center";
+export function getBeamJustification() { return beamJustification; }
+export function setBeamJustification(v: HJustification) { beamJustification = v; }
+export function getBeamZJustification() { return beamZJustification; }
+export function setBeamZJustification(v: ZJustification) { beamZJustification = v; }
+export function getMepJustification() { return mepJustification; }
+export function setMepJustification(v: HJustification) { mepJustification = v; }
+
+/**
+ * Reset a tool's type defaults (and tool-specific placement state) to the
+ * built-in factory values. Used by the modeling panel's Reset action.
+ */
+export function resetTypeDefaults(type: string): void {
+  const defaults = DEFAULTS[type] ?? { height: 1, thickness: 0.2 };
+  typeDefaults.set(type, {
+    params: { ...defaults },
+    properties: {},
+    color: COLORS[type] ?? "#cccccc",
+  });
+  if (type === "wall" || type === "curtain-wall") {
+    wallLocationLine = "wall-centerline";
+    wallOffset = 0;
+    wallChain = true;
+    wallJoinStatus = "allow";
+  }
+  if (type === "beam" || type === "strip") {
+    beamJustification = "center";
+    beamZJustification = "bottom";
+  }
+  if (type === "duct" || type === "pipe" || type === "cable-tray" || type === "conduit") {
+    mepJustification = "center";
+    drawSlopePct = 0;
+  }
+  notifyAuthoringChange();
+}
+
+/** Effective draw-time parameters (type defaults win over factory). */
+function effectiveDrawParams(type: ElementType): {
+  height: number; thickness: number; width?: number; elevation: number; layers?: string;
+} {
+  const presetKey = activePreset && DEFAULTS[activePreset] ? activePreset : type;
+  const baseDefaults = DEFAULTS[presetKey] ?? DEFAULTS[type] ?? { height: 1, thickness: 0.2 };
+  const userDefaults = getTypeDefaults(type);
+  const pick = (k: "height" | "thickness" | "width", fallback: number | undefined): number | undefined => {
+    const v = userDefaults.params[k] ?? (baseDefaults as any)[k] ?? fallback;
+    return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+  };
+  const elevationRaw = userDefaults.params.elevation;
+  return {
+    height: pick("height", baseDefaults.height) ?? 1,
+    thickness: pick("thickness", baseDefaults.thickness) ?? 0.2,
+    width: pick("width", (baseDefaults as any).width),
+    elevation:
+      typeof elevationRaw === "number" && Number.isFinite(elevationRaw) ? elevationRaw : level,
+    layers: typeof userDefaults.properties?.layers === "string" ? userDefaults.properties.layers as string : undefined,
+  };
+}
+
+/**
+ * Design spec §3.2 — justification affects the ACTUAL construction:
+ * resolve the per-tool justification against the reference segment and
+ * return the placed start/end (+ elevation / endElevation adjustments).
+ * The reference path itself is never moved (switching modes re-solves).
+ */
+function justifyLinearSegment(
+  tool: ElementType,
+  startPt: THREE.Vector3,
+  endPt: THREE.Vector3,
+  dp: ReturnType<typeof effectiveDrawParams>,
+): {
+  start: [number, number]; end: [number, number];
+  elevation?: number; endElevation?: number;
+} {
+  const s: [number, number] = [startPt.x, startPt.z];
+  const e: [number, number] = [endPt.x, endPt.z];
+  if (tool === "wall" || tool === "curtain-wall") {
+    const core = coreThicknessFromLayers(dp.layers, dp.thickness);
+    const r = resolveWallJustification({
+      start: s, end: e,
+      locationLine: wallLocationLine as JustificationLine,
+      thickness: dp.thickness,
+      coreThickness: core,
+      extraOffset: wallOffset,
+    });
+    return { start: r.start, end: r.end, elevation: dp.elevation };
+  }
+  if (tool === "beam" || tool === "strip") {
+    const r = applyJustificationToSegment({
+      start: s, end: e,
+      shift: justificationShiftMeters(beamJustification, dp.thickness),
+    });
+    const zShift =
+      beamZJustification === "center" ? -dp.height / 2 :
+      beamZJustification === "top" ? -dp.height : 0;
+    return { start: r.start, end: r.end, elevation: dp.elevation + zShift };
+  }
+  if (tool === "duct" || tool === "pipe" || tool === "cable-tray" || tool === "conduit") {
+    const r = applyJustificationToSegment({
+      start: s, end: e,
+      shift: justificationShiftMeters(mepJustification, dp.thickness),
+    });
+    // Reuse the plan-path slope state so chained 3D runs accumulate
+    // elevation exactly like plan-drawn runs (Design spec §2.2 MEP).
+    const sloped = slopedElevations(tool, s[0], s[1], e[0], e[1]);
+    return {
+      start: r.start, end: r.end,
+      elevation: sloped.elevation,
+      endElevation: drawSlopePct !== 0 ? sloped.endElevation : undefined,
+    };
+  }
+  return { start: s, end: e, elevation: dp.elevation };
+}
+
+/** Shift start/end so the drawn line is the selected location line. */
+export function applyWallLocationOffset(
+  x1: number, z1: number, x2: number, z2: number, thickness: number,
+): { start: [number, number]; end: [number, number] } {
+  const layers = getTypeDefaults("wall").properties?.layers as string | undefined;
+  const core = coreThicknessFromLayers(layers, thickness);
+  const r = resolveWallJustification({
+    start: [x1, z1], end: [x2, z2],
+    locationLine: wallLocationLine as JustificationLine,
+    thickness,
+    coreThickness: core,
+    extraOffset: wallOffset,
+  });
+  return { start: r.start, end: r.end };
+}
+
+/**
+ * BIM Join Status at a corner.
+ * IMPORTANT: location-line endpoints must NOT shift for Allow/Disallow —
+ * that caused walls to jog. Only snap both ends to the shared corner.
+ * Extended/Chamfer may extend slightly for special cases.
+ */
+/**
+ * Pin two wall location-line ends to a shared corner (for chain drawing only).
+ * Does not skew walls — only moves the listed endpoints to the corner point.
+ */
+export function applyWallJoinAtCorner(
+  prev: { start: [number, number]; end: [number, number] },
+  next: { start: [number, number]; end: [number, number] },
+  _thickness: number,
+  _status: WallJoinStatus = wallJoinStatus,
+): void {
+  // Shared corner = exact meeting point of the two location lines
+  const cx = next.start[0];
+  const cz = next.start[1];
+  prev.end = [cx, cz];
+  next.start = [cx, cz];
+}
+
+/**
+ * Project point P onto segment AB. Returns { point, t, dist }.
+ */
+function projectOntoSegment(
+  px: number, pz: number,
+  ax: number, az: number,
+  bx: number, bz: number,
+): { x: number; z: number; t: number; dist: number } {
+  const dx = bx - ax, dz = bz - az;
+  const L2 = dx * dx + dz * dz || 1;
+  let t = ((px - ax) * dx + (pz - az) * dz) / L2;
+  t = Math.max(0, Math.min(1, t));
+  const x = ax + t * dx, z = az + t * dz;
+  return { x, z, t, dist: Math.hypot(px - x, pz - z) };
+}
+
+/**
+ * BIM-style join for a NEWLY placed wall only.
+ *
+ * CRITICAL RULE (matches BIM): existing walls are NEVER moved or rotated.
+ * Only the new wall's start/end may snap onto:
+ *   - an existing wall endpoint (corner / L-join)
+ *   - a point on an existing wall centerline (T-join)
+ *
+ * Centerline is used (location line). Thickness is visual only.
+ */
+export function autoJoinWallToNeighbors(wallId: string): void {
+  const wall = elements.find((e) => e.id === wallId);
+  if (!wall || (wall.type !== "wall" && wall.type !== "curtain-wall") || !wall.params.start || !wall.params.end) return;
+
+  const thick = wall.params.thickness ?? 0.2;
+  // Snap tolerance ≈ half thickness + small slack (BIM endpoint snap feel)
+  const endTol = Math.max(0.12, thick * 0.85);
+  const faceTol = Math.max(0.14, thick * 0.95);
+
+  let changed = false;
+  const trySnapEnd = (which: "start" | "end"): void => {
+    const pt = which === "start" ? wall.params.start! : wall.params.end!;
+    let best: { x: number; z: number; score: number } | null = null;
+
+    for (const other of elements) {
+      if (other.id === wallId || (other.type !== "wall" && other.type !== "curtain-wall")) continue;
+      if (!other.params.start || !other.params.end) continue;
+      // Skip if other is extremely short
+      const [ax, az] = other.params.start;
+      const [bx, bz] = other.params.end;
+      if (Math.hypot(bx - ax, bz - az) < 0.02) continue;
+
+      // Prefer endpoint snaps (clean L/corner)
+      for (const ep of [other.params.start!, other.params.end!] as [number, number][]) {
+        const d = Math.hypot(pt[0] - ep[0], pt[1] - ep[1]);
+        if (d <= endTol && (!best || d < best.score)) {
+          best = { x: ep[0], z: ep[1], score: d };
+        }
+      }
+      // Else T-join onto centerline (only if closer to face than any end)
+      const proj = projectOntoSegment(pt[0], pt[1], ax, az, bx, bz);
+      if (proj.t > 0.02 && proj.t < 0.98 && proj.dist <= faceTol) {
+        if (!best || proj.dist < best.score) {
+          best = { x: proj.x, z: proj.z, score: proj.dist };
+        }
+      }
+    }
+
+    if (!best) return;
+    // Only move THIS wall — never the neighbor
+    if (which === "start") wall.params.start = [best.x, best.z];
+    else wall.params.end = [best.x, best.z];
+    changed = true;
+  };
+
+  trySnapEnd("start");
+  trySnapEnd("end");
+
+  // Guard: do not collapse the wall to a point
+  const [sx, sz] = wall.params.start!;
+  const [ex, ez] = wall.params.end!;
+  if (Math.hypot(ex - sx, ez - sz) < 0.05) {
+    // Revert is not tracked here; skip if degenerate — caller should avoid
+    return;
+  }
+
+  if (changed) {
+    rebuild();
+    markDirty();
+    notifyAuthoringChange();
+  }
+}
+
+// Geometry helpers
+// ═══════════════════════════════════════════════════════════════════════════
+function memberMesh(a: THREE.Vector3, b: THREE.Vector3, w: number, h: number, mat: THREE.Material): THREE.Mesh {
+  const len = a.distanceTo(b);
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(len, h, w), mat);
+  mesh.position.copy(a).add(b).multiplyScalar(0.5);
+  const dir = new THREE.Vector3().subVectors(b, a).normalize();
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir);
+  return mesh;
+}
+
+const MEP_LINEAR_TYPES = new Set(['duct', 'pipe', 'cable-tray', 'conduit']);
+
+/** Start/end elevation for a run being drawn, honouring the draw slope and chain continuity. */
+function slopedElevations(type: string, sx: number, sz: number, ex: number, ez: number): { elevation: number; endElevation?: number } {
+  if (!MEP_LINEAR_TYPES.has(type) || Math.abs(drawSlopePct) < 1e-9) return { elevation: level };
+  let start = level;
+  const prev = lastPlanLinear;
+  if (prev && prev.type === type && prev.endElevation != null &&
+      Math.hypot(prev.end[0] - sx, prev.end[1] - sz) < 0.002) start = prev.endElevation;
+  return { elevation: start, endElevation: endElevationFromSlope(start, Math.hypot(ex - sx, ez - sz), drawSlopePct) };
+}
+
+function buildTruss(el: AuthoredElement): THREE.Group {
+  const g = new THREE.Group();
+  const [ax, az] = el.params.start!;
+  const [bx, bz] = el.params.end!;
+  const t = Math.max(el.params.thickness, 0.03);
+  const H = el.params.height;
+  const panels = Math.max(2, Number(el.properties?.panels ?? 4));
+  const A = new THREE.Vector3(ax, el.params.elevation, az);
+  const B = new THREE.Vector3(bx, el.params.elevation, bz);
+  const L = A.distanceTo(B);
+  if (L < 0.5) return g;
+  const mat = new THREE.MeshLambertMaterial({ color: new THREE.Color(el.color || COLORS.truss) });
+  const up = new THREE.Vector3(0, 1, 0);
+  const M = A.clone().add(B).multiplyScalar(0.5).add(up.clone().multiplyScalar(H));
+  g.add(memberMesh(A, B, t, t, mat));
+  g.add(memberMesh(A, M, t, t, mat));
+  g.add(memberMesh(M, B, t, t, mat));
+  const dir = B.clone().sub(A).normalize();
+  const topAt = (x: number) => {
+    const half = L / 2;
+    const base = A.clone().add(dir.clone().multiplyScalar(x));
+    const h = H * (1 - Math.abs(x - half) / half);
+    return base.add(up.clone().multiplyScalar(h));
+  };
+  const bottomAt = (x: number) => A.clone().add(dir.clone().multiplyScalar(x));
+  for (let i = 1; i < panels; i++) {
+    const x = (L * i) / panels;
+    const h = H * (1 - Math.abs(x - L / 2) / (L / 2));
+    if (h > 0.05) {
+      const p = bottomAt(x).add(up.clone().multiplyScalar(h / 2));
+      const post = new THREE.Mesh(new THREE.BoxGeometry(t, h, t), mat);
+      post.position.copy(p);
+      g.add(post);
+    }
+    if (i < panels - 1) {
+      const x2 = (L * (i + 1)) / panels;
+      const diag = i % 2 === 0
+        ? memberMesh(bottomAt(x), topAt(x2), t * 0.8, t * 0.8, mat)
+        : memberMesh(topAt(x), bottomAt(x2), t * 0.8, t * 0.8, mat);
+      g.add(diag);
+    }
+  }
+  return g;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Fittings — auto-generated elbows at chain bends
+   ═════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Insert a fitting at a chain bend.
+ * Copies the parent's cross-section and stores the incoming / outgoing
+ * direction angles so the geometry can be built as a proper swept elbow.
+ */
+export type FittingKind = "elbow" | "tee" | "cross" | "transition" | "cap" | "union" | "wye";
+
+function spawnFitting(
+  parentType: ElementType,
+  parentEl: AuthoredElement | null,
+  bendX: number,
+  bendZ: number,
+  angleIn: number,
+  angleOut: number,
+  kind: FittingKind = "elbow",
+  size?: { thickness?: number; height?: number; elevation?: number; bendRadius?: number },
+): AuthoredElement | null {
+  if (!FITTED_TYPES.has(parentType) && parentType !== "fitting") return null;
+
+  const p = parentEl?.params;
+  const thick = size?.thickness ?? p?.thickness ?? 0.3;
+  const height = size?.height ?? p?.height ?? thick;
+  const elev = size?.elevation ?? p?.elevation ?? level;
+  const fitting: AuthoredElement = {
+    id: uid(),
+    type: "fitting",
+    name: `${cap(parentType)} ${kind} ${String((counters.fitting ?? 0) + 1).padStart(3, "0")}`,
+    color: parentEl?.color || COLORS[parentType] || "#cccccc",
+    params: {
+      point: [bendX, bendZ],
+      height,
+      thickness: thick,
+      depth: p?.depth,
+      elevation: elev,
+      angleIn,
+      angleOut,
+      bendRadius: size?.bendRadius, 
+      parentType: parentType as any,
+      fittingKind: kind as any,
+    },
+    properties: {
+      ifcType: (() => {
+        const root = parentType === "pipe" ? "IfcPipeFitting" :
+          parentType === "cable-tray" ? "IfcCableCarrierFitting" :
+          parentType === "conduit" ? "IfcCableCarrierFitting" :
+          "IfcDuctFitting";
+        const suffix = kind === "elbow" ? "Elbow" : kind === "tee" ? "Tee" : kind === "cross" ? "Cross" :
+          kind === "transition" ? "Transition" : kind === "cap" ? "EndCap" : kind === "wye" ? "Junction" : "Union";
+        return `${root}/${suffix}`;
+      })(),
+    },
+  };
+  counters.fitting = (counters.fitting ?? 0) + 1;
+
+  history.exec({
+    label: `Create ${cap(parentType)} fitting`,
+    apply: () => {
+      if (!elements.includes(fitting)) elements.push(fitting);
+      rebuild();
+      markDirty();
+    },
+    revert: () => {
+      const i = elements.indexOf(fitting);
+      if (i >= 0) elements.splice(i, 1);
+      rebuild();
+      markDirty();
+    },
+  });
+  return fitting;
+}
+
+/**
+ * Build the swept elbow geometry.
+ * Rectangular profiles use a lofted quad strip; circular profiles use a
+ * Tube along a quadratic Bezier from the incoming to the outgoing tangent.
+ */
+function buildFitting(el: AuthoredElement): THREE.Object3D | null {
+  const p = el.params;
+  if (!p.point) return null;
+  const aIn = p.angleIn ?? 0;
+  const aOut = p.angleOut ?? Math.PI / 2;
+  const parentType = (p.parentType as string) || "duct";
+  const isRound = parentType === "pipe" || parentType === "conduit";
+  const kind = String((p as any).fittingKind ?? el.properties?.fittingKind ?? "elbow");
+  const cx = p.point[0];
+  const cz = p.point[1];
+  const yCenter = p.elevation + (isRound ? 0 : p.height / 2);
+  const mat = new THREE.MeshLambertMaterial({
+    color: new THREE.Color(el.color || COLORS[parentType] || "#38bdf8"),
+  });
+  const r = Math.max(Number(p.bendRadius ?? ((isRound ? p.thickness : Math.max(p.thickness, p.height)) / 2)), 0.04);
+
+  // ── BIM-style MEP fittings ──────────────────────────────────────────
+  // Tee / Cross / Wye: continuous body + branch arms matching duct/pipe profile
+  if (kind === "tee" || kind === "cross" || kind === "wye") {
+    const g = new THREE.Group();
+    const w = isRound ? r * 1.85 : Math.max(p.thickness, 0.08);
+    const h = isRound ? r * 1.85 : Math.max(p.height, 0.08);
+    // Center body (junction cube / sphere)
+    const body = new THREE.Mesh(
+      isRound
+        ? new THREE.SphereGeometry(r * 1.05, 20, 16)
+        : new THREE.BoxGeometry(w * 1.15, h * 1.15, w * 1.15),
+      mat.clone(),
+    );
+    body.position.set(cx, yCenter, cz);
+    body.userData.elementId = el.id;
+    g.add(body);
+
+    const armLen = fittingArmLength(p.thickness, p.height, Number(p.bendRadius), isRound);
+    const placeArm = (angle: number) => {
+      const ax = Math.cos(angle);
+      const az = Math.sin(angle);
+      let mesh: THREE.Mesh;
+      if (isRound) {
+        mesh = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.95, r * 0.95, armLen, 20), mat.clone());
+        // Cylinder default Y-up → align to horizontal direction (ax, 0, az)
+        mesh.quaternion.setFromUnitVectors(
+          new THREE.Vector3(0, 1, 0),
+          new THREE.Vector3(ax, 0, az).normalize(),
+        );
+      } else {
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(armLen, h, w), mat.clone());
+        mesh.rotation.y = -angle;
+      }
+      mesh.position.set(cx + ax * armLen * 0.45, yCenter, cz + az * armLen * 0.45);
+      mesh.userData.elementId = el.id;
+      g.add(mesh);
+    };
+
+    // Main run through + branch (BIM duct/pipe fitting orientation)
+    placeArm(aIn);
+    placeArm(aIn + Math.PI);
+    placeArm(aOut);
+    if (kind === "cross") {
+      placeArm(aOut + Math.PI);
+    } else if (kind === "wye") {
+      // 45° branch between main and branch
+      placeArm((aIn + aOut) / 2);
+    }
+    g.userData.elementId = el.id;
+    g.userData.baseColor = el.color || COLORS[parentType] || "#38bdf8";
+    return g;
+  }
+  if (kind === "cap") {
+    const mesh = new THREE.Mesh(
+      isRound
+        ? new THREE.SphereGeometry(r * 1.05, 20, 14)
+        : new THREE.BoxGeometry(Math.max(p.thickness, 0.08), Math.max(p.height, 0.08), r * 0.7),
+      mat,
+    );
+    mesh.position.set(cx, yCenter, cz);
+    mesh.userData.elementId = el.id;
+    return mesh;
+  }
+  if (kind === "transition" || kind === "union") {
+    const mesh = new THREE.Mesh(
+      isRound
+        ? new THREE.CylinderGeometry(r * 0.55, r * 1.15, r * 2.8, 20)
+        : new THREE.BoxGeometry(r * 2.8, p.height, p.thickness * 1.15),
+      mat,
+    );
+    mesh.position.set(cx, yCenter, cz);
+    mesh.rotation.y = -aIn;
+    if (isRound) {
+      mesh.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0),
+        new THREE.Vector3(Math.cos(aIn), 0, Math.sin(aIn)).normalize(),
+      );
+    }
+    mesh.userData.elementId = el.id;
+    return mesh;
+  }
+
+  // Elbow (default) — skip only if angles nearly equal (straight)
+  if (Math.abs(((aIn - aOut + Math.PI) % (2 * Math.PI)) - Math.PI) < 0.05) return null;
+
+  // True circular arc (same construction as the plan symbol and the duct trimming).
+  const widthForDefault = isRound ? p.thickness : Math.max(p.thickness, p.height);
+  const bendR = Number(p.bendRadius) > 0 ? Number(p.bendRadius) : defaultBendRadius(widthForDefault);
+  const eg = elbowGeometry([cx, cz], aIn, aOut, bendR);
+  if (!eg) return null;
+
+  // Smoother elbow (more segments = BIM-like curved fitting)
+  const N = isRound ? 20 : 18;
+  const pts: THREE.Vector3[] = elbowArcPoints(eg, N).map(([x, z]) => new THREE.Vector3(x, yCenter, z));
+
+  if (isRound) {
+    const curve = new THREE.CatmullRomCurve3(pts);
+    const geo = new THREE.TubeGeometry(curve, Math.max(N, 18), Math.max(p.thickness / 2, 0.02), 18, false);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.userData.elementId = el.id;
+    mesh.userData.baseColor = el.color || COLORS[parentType] || "#38bdf8";
+    return mesh;
+  }
+
+  // Rectangular: loft four corner rails along the sampled curve.
+  const up = new THREE.Vector3(0, 1, 0);
+  const halfW = p.thickness / 2;
+  const halfH = p.height / 2;
+  const rings: THREE.Vector3[][] = [];
+
+  for (let i = 0; i < pts.length; i++) {
+    const prev = pts[Math.max(0, i - 1)];
+    const next = pts[Math.min(pts.length - 1, i + 1)];
+    const dx = next.x - prev.x;
+    const dz = next.z - prev.z;
+    let tan = new THREE.Vector3(dx, 0, dz);
+    if (tan.lengthSq() < 1e-9) tan.set(1, 0, 0);
+    tan.normalize();
+
+    const right = new THREE.Vector3().crossVectors(up, tan);
+    if (right.lengthSq() < 1e-9) right.set(1, 0, 0);
+    right.normalize();
+
+    const c = pts[i];
+    rings.push([
+      c.clone().add(right.clone().multiplyScalar(halfW)).add(up.clone().multiplyScalar(-halfH)),
+      c.clone().add(right.clone().multiplyScalar(halfW)).add(up.clone().multiplyScalar(halfH)),
+      c.clone().add(right.clone().multiplyScalar(-halfW)).add(up.clone().multiplyScalar(halfH)),
+      c.clone().add(right.clone().multiplyScalar(-halfW)).add(up.clone().multiplyScalar(-halfH)),
+    ]);
+  }
+
+  const verts: number[] = [];
+  const indices: number[] = [];
+
+  for (let i = 0; i < rings.length - 1; i++) {
+    const a = rings[i];
+    const b = rings[i + 1];
+    for (let k = 0; k < 4; k++) {
+      const k2 = (k + 1) % 4;
+      const base = verts.length / 3;
+      verts.push(a[k].x, a[k].y, a[k].z);
+      verts.push(a[k2].x, a[k2].y, a[k2].z);
+      verts.push(b[k2].x, b[k2].y, b[k2].z);
+      verts.push(b[k].x, b[k].y, b[k].z);
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  }
+
+  for (const [ring, reverse] of [[rings[0], true], [rings[rings.length - 1], false]] as const) {
+    const base = verts.length / 3;
+    verts.push(ring[0].x, ring[0].y, ring[0].z);
+    verts.push(ring[1].x, ring[1].y, ring[1].z);
+    verts.push(ring[2].x, ring[2].y, ring[2].z);
+    verts.push(ring[3].x, ring[3].y, ring[3].z);
+    if (reverse) {
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    } else {
+      indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.userData.elementId = el.id;
+  mesh.userData.baseColor = el.color || COLORS[parentType] || "#38bdf8";
+  return mesh;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Hosted element helpers
+// ═══════════════════════════════════════════════════════════════════════════
+function getHostedForWall(wallId: string): AuthoredElement[] {
+  return elements.filter(
+    (e) => (e.type === "door" || e.type === "window") && e.hostId === wallId,
+  );
+}
+
+/** Compute the wall-clamped offset for a hosted door/window. Pure - no mutations. */
+function computeClampedOffset(el: AuthoredElement, wallLength: number): number {
+  const w = el.params.width ?? (el.type === "door" ? 0.9 : 1.2);
+  const half = w / 2;
+  const raw = el.params.offsetAlongHost ?? wallLength / 2;
+  if (wallLength <= w + 0.02) return wallLength / 2;
+  const clamped = Math.max(half, Math.min(wallLength - half, raw));
+  return Math.round(clamped * 1000) / 1000;
+}
+
+/**
+ * Arc metrics for a curved wall (chord length L, arc height arcH):
+ * radius, sweep angle and TRUE arc length. Hosted opening offsets on a
+ * curved wall are measured along the ARC (BIM authoring software semantics — matching
+ * hosting/index.ts curve-length parameterisation), never the chord.
+ */
+function wallArcMetrics(L: number, arcH: number): { R: number; theta: number; arcLen: number } | null {
+  const h = Math.abs(arcH);
+  if (!(h > 0.05) || !(L > 0.5)) return null;
+  const R = (h * h + (L / 2) * (L / 2)) / (2 * h);
+  const theta = 2 * Math.asin(Math.min(1, (L / 2) / R));
+  return { R, theta, arcLen: R * theta };
+}
+
+function openingsForWall(wallId: string): WallOpening[] {
+  const out: WallOpening[] = [];
+  const wall = elements.find((e) => e.id === wallId);
+  const wp = wall?.params;
+  let L = 0;
+  if (wp && wp.start && wp.end) {
+    const ax = wp.start[0], az = wp.start[1];
+    const bx = wp.end[0],   bz = wp.end[1];
+    L = Math.hypot(bx - ax, bz - az);
+  }
+  const H = Number(wp?.height ?? 3);
+  // Curved walls host openings along the ARC length, not the chord.
+  const arcM = wallArcMetrics(L, Number((wp as any)?.arcHeight ?? 0));
+  const hostLen = arcM ? arcM.arcLen : L;
+  for (const el of getHostedForWall(wallId)) {
+    const p = el.params;
+    const w = p.width ?? DEFAULTS[el.type]?.width ?? 0.9;
+    const h = p.height;
+    const sill = el.type === "window" ? (p.sillHeight ?? 0.9) : (p.sillHeight ?? 0);
+
+    const offset = computeClampedOffset(el, hostLen);
+
+    const u0 = Math.max(0, offset - w / 2);
+    const u1 = Math.min(hostLen, offset + w / 2);
+    const v0 = Math.max(0, sill);
+    const v1 = Math.min(H, sill + h);
+    const holeW = u1 - u0;
+    const holeH = v1 - v0;
+    const degenerate = holeW < 0.02 || holeH < 0.02;
+    const fullFace = hostLen > 0.05 && H > 0.05 && holeW >= hostLen * 0.9 && holeH >= H * 0.9;
+    if (degenerate || fullFace) continue;
+    out.push({ offset, width: w, height: h, sill, hostId: el.id, kind: el.type as "door" | "window" });
+  }
+  return out;
+}
+
+/* ── BIM-style wall join ─────────────────────────────────────────── */
+
+function computeWallEndFaces(
+  endX: number,
+  endZ: number,
+  dirX: number,
+  dirZ: number,
+  halfT: number,
+  selfId: string,
+  joinStatus: string,
+  allWalls: AuthoredElement[],
+): { left: [number, number]; right: [number, number]; joined: boolean } {
+  const nx = -dirZ, nz = dirX;
+  const plainLeft: [number, number] = [endX + nx * halfT, endZ + nz * halfT];
+  const plainRight: [number, number] = [endX - nx * halfT, endZ - nz * halfT];
+
+  if (joinStatus === "disallow" || joinStatus === "butt") {
+    return { left: plainLeft, right: plainRight, joined: false };
+  }
+
+  const lineHit = (
+    px: number, pz: number, dx: number, dz: number,
+    qx: number, qz: number, ex: number, ez: number,
+  ): [number, number] | null => {
+    const det = dx * ez - dz * ex;
+    if (Math.abs(det) < 1e-9) return null;
+    const t = ((qx - px) * ez - (qz - pz) * ex) / det;
+    return [px + t * dx, pz + t * dz];
+  };
+
+  {
+    const __self = allWalls.find((w) => w.id === selfId);
+    const __s = __self?.params.start, __e = __self?.params.end;
+    const __atStart = !!__s && !!__e &&
+      Math.hypot(endX - __s[0], endZ - __s[1]) <= Math.hypot(endX - __e[0], endZ - __e[1]);
+    const __peers: JoinPeer[] = [];
+    for (const w of allWalls) {
+      if (!w.params.start || !w.params.end) continue;
+      __peers.push({
+        id: w.id,
+        start: [w.params.start[0], w.params.start[1]],
+        end: [w.params.end[0], w.params.end[1]],
+        thickness: Number(w.params.thickness ?? 0.2),
+        joinStatus: String(w.properties?.joinStatus ?? "allow"),
+      });
+    }
+    const __m = mitreEndFaces([endX, endZ], [dirX, dirZ], halfT, __atStart, selfId, __peers);
+    if (__m) return __m;
+  }
+  // L-corner: neighbour's endpoint coincides with ours
+  const endpointTol = Math.max(0.20, halfT * 3.0);
+  let nbEnd: AuthoredElement | null = null;
+  let nbEndDist = endpointTol;
+  for (const o of allWalls) {
+    if (o.id === selfId) continue;
+    if (!o.params.start || !o.params.end) continue;
+    const s = String(o.properties?.joinStatus ?? "allow");
+    if (s === "disallow" || s === "butt") continue;
+    for (const ep of [o.params.start, o.params.end]) {
+      const d = Math.hypot(ep[0] - endX, ep[1] - endZ);
+      if (d < nbEndDist) { nbEndDist = d; nbEnd = o; }
+    }
+  }
+
+  if (nbEnd?.params.start && nbEnd.params.end) {
+    const [sx, sz] = nbEnd.params.start;
+    const [ex, ez] = nbEnd.params.end;
+    const ndx = ex - sx, ndz = ez - sz;
+    const nL = Math.hypot(ndx, ndz) || 1;
+    const nux = ndx / nL, nuz = ndz / nL;
+    const nnx = -nuz, nnz = nux;
+    const nt2 = Math.max(0.01, (nbEnd.params.thickness ?? 0.2) / 2);
+
+    const nl = lineHit(plainLeft[0],  plainLeft[1],  dirX, dirZ, sx + nnx * nt2, sz + nnz * nt2, nux, nuz);
+    const nr = lineHit(plainLeft[0],  plainLeft[1],  dirX, dirZ, sx - nnx * nt2, sz - nnz * nt2, nux, nuz);
+    const ml = lineHit(plainRight[0], plainRight[1], dirX, dirZ, sx + nnx * nt2, sz + nnz * nt2, nux, nuz);
+    const mr = lineHit(plainRight[0], plainRight[1], dirX, dirZ, sx - nnx * nt2, sz - nnz * nt2, nux, nuz);
+
+    const pickNear = (
+      cands: ([number, number] | null)[],
+      fallback: [number, number],
+    ): [number, number] => {
+      const c = cands.filter(Boolean) as [number, number][];
+      if (!c.length) return fallback;
+      c.sort((a, b) =>
+        Math.hypot(a[0] - endX, a[1] - endZ) - Math.hypot(b[0] - endX, b[1] - endZ));
+      const best = c[0];
+      const maxD = Math.max(halfT, nt2) * 4;
+      if (Math.hypot(best[0] - endX, best[1] - endZ) > maxD) return fallback;
+      return best;
+    };
+
+    return {
+      left: pickNear([nl, nr], plainLeft),
+      right: pickNear([ml, mr], plainRight),
+      joined: true,
+    };
+  }
+
+  // T-junction: our endpoint lands on another wall's centerline
+  for (const o of allWalls) {
+    if (o.id === selfId) continue;
+    if (!o.params.start || !o.params.end) continue;
+    const s = String(o.properties?.joinStatus ?? "allow");
+    if (s === "disallow" || s === "butt") continue;
+    const [ox1, oz1] = o.params.start;
+    const [ox2, oz2] = o.params.end;
+    const odx = ox2 - ox1, odz = oz2 - oz1;
+    const oL2 = odx * odx + odz * odz || 1;
+    const t = ((endX - ox1) * odx + (endZ - oz1) * odz) / oL2;
+    if (t <= 0.02 || t >= 0.98) continue;
+    const px = ox1 + t * odx;
+    const pz = oz1 + t * odz;
+    const distC = Math.hypot(endX - px, endZ - pz);
+    const oT2 = Math.max(0.01, (o.params.thickness ?? 0.2) / 2);
+    if (distC > oT2 + halfT) continue;
+
+    const oL = Math.hypot(odx, odz) || 1;
+    const oux = odx / oL, ouz = odz / oL;
+    const onx = -ouz, onz = oux;
+    const side = Math.sign((endX - px) * onx + (endZ - pz) * onz) || 1;
+    const faceX = px + onx * side * oT2;
+    const faceZ = pz + onz * side * oT2;
+
+    const hl = lineHit(plainLeft[0],  plainLeft[1],  dirX, dirZ, faceX, faceZ, oux, ouz);
+    const hr = lineHit(plainRight[0], plainRight[1], dirX, dirZ, faceX, faceZ, oux, ouz);
+
+    return { left: hl ?? plainLeft, right: hr ?? plainRight, joined: true };
+  }
+
+  return { left: plainLeft, right: plainRight, joined: false };
+}
+
+
+/**
+ * K4 — subtract one opening/cutter from a wall mesh under the unified
+ * Boolean post-condition (three-csg-ts, gated, with the general-kernel
+ * fallback — see `subtractThreeMesh`). On success the cut mesh is
+ * returned (and any stale FAILED-TO-CUT record for this opening is
+ * cleared). On total failure on BOTH engines the UNCUT mesh is
+ * returned, but it is never displayed as if the opening exists: the
+ * element is quarantined via K1's registry (record id
+ * `<elementId>:cut:<label>`, so K1's rebuild gate — which clears an
+ * element's record when its mesh validates clean again — cannot erase
+ * a cut failure, since the uncut wall IS a valid solid and the missing
+ * opening is the defect), the mesh is flagged
+ * (`userData.cutFailed` / `cutFailedOpenings`), and the user gets an
+ * error toast naming the opening. The toast fires once per element +
+ * opening: rebuilds re-attempt the cut and must not re-toast every
+ * time (`recordBooleanCutFailure` returns false when the record
+ * already exists).
+ */
+function subtractOpeningWithPostcondition(
+  mesh: THREE.Mesh,
+  cutter: THREE.Mesh,
+  label: string,
+  el: AuthoredElement,
+  material: THREE.Material,
+): THREE.Mesh {
+  const elementId = el.id;
+  const displayName = el.name ?? elementId;
+  const out = subtractThreeMesh(mesh, cutter, material, `wall:${elementId} ${label}`);
+  if (out.cut) {
+    // A cut that succeeds now clears a stale FAILED-TO-CUT record for
+    // this opening (e.g. the user fixed the hosted element).
+    clearQuarantinedSolid(`${elementId}:cut:${label}`);
+    return out.mesh;
+  }
+  const failure = out.failure!;
+  const isNew = recordBooleanCutFailure({
+    elementId,
+    label,
+    diagnostics: failure.diagnostics.map((d) => ({ code: d.code, message: d.message })),
+    volumeBefore: failure.volumeBefore,
+  });
+  mesh.userData.cutFailed = true;
+  const failed = new Set<string>(
+    Array.isArray(mesh.userData.cutFailedOpenings) ? (mesh.userData.cutFailedOpenings as string[]) : [],
+  );
+  failed.add(label);
+  mesh.userData.cutFailedOpenings = [...failed];
+  if (isNew) {
+    try {
+      window.dispatchEvent(new CustomEvent("obs-toast", {
+        detail: {
+          message: `${displayName}: the ${label} opening could not be cut — the wall is shown uncut (FAILED TO CUT). ${failure.reason}`,
+          kind: "error",
+        },
+      }));
+    } catch { /* toast is cosmetic */ }
+  }
+  return mesh;
+}
+
+/**
+ * Cut door/window openings through a wall mesh or compound Group (all layers).
+ * Preserves BIM authoring software-like behaviour: openings pierce every compound layer.
+ */
+function cutOpeningsInWallObject(
+  root: THREE.Object3D,
+  el: AuthoredElement,
+  openings: WallOpening[],
+): THREE.Object3D | null {
+  if (!openings.length) return root;
+  const p = el.params;
+  if (!p.start || !p.end) return root;
+  const [ax, az] = p.start;
+  const [bx, bz] = p.end;
+  const L = Math.hypot(bx - ax, bz - az);
+  if (L < 0.05) return root;
+  const T = Number(p.thickness) || 0.2;
+  const dirX = (bx - ax) / L;
+  const dirZ = (bz - az) / L;
+  const normalX = dirZ, normalZ = -dirX;
+
+  const meshes: THREE.Mesh[] = [];
+  root.traverse((o) => {
+    if ((o as THREE.Mesh).isMesh) meshes.push(o as THREE.Mesh);
+  });
+  if (!meshes.length) return root;
+
+  for (let mi = 0; mi < meshes.length; mi++) {
+    let mesh = meshes[mi];
+    const mat = mesh.material;
+    for (const op of openings) {
+      const holeGeo = new THREE.BoxGeometry(op.width, T + 0.35, op.height);
+      const holeMesh = new THREE.Mesh(holeGeo, new THREE.MeshLambertMaterial({ visible: false }));
+      const cx = ax + dirX * op.offset;
+      const cz = az + dirZ * op.offset;
+      const cy = (p.elevation ?? 0) + op.sill + op.height / 2;
+      holeMesh.position.set(cx, cy, cz);
+      // Orient hole: width along wall, thickness through wall, height up
+      const up = new THREE.Vector3(0, 1, 0);
+      const along = new THREE.Vector3(dirX, 0, dirZ);
+      const through = new THREE.Vector3(normalX, 0, normalZ);
+      const m = new THREE.Matrix4().makeBasis(along, up, through);
+      holeMesh.quaternion.setFromRotationMatrix(m);
+      holeMesh.updateMatrixWorld(true);
+      mesh.updateMatrixWorld(true);
+      // K4: three-csg-ts result is gated and falls back to the
+      // general kernel; on total failure the uncut mesh is returned
+      // AND flagged FAILED-TO-CUT (registry + toast), never displayed
+      // as if the opening exists.
+      const label = `${op.kind ?? "opening"} ${op.hostId ?? ""}`.trim();
+      const result = subtractOpeningWithPostcondition(mesh, holeMesh, label, el, mat as THREE.Material);
+      if (result !== mesh) {
+        if (mesh.parent) {
+          mesh.parent.add(result);
+          mesh.parent.remove(mesh);
+        }
+        mesh = result;
+        meshes[mi] = mesh;
+      }
+    }
+  }
+  root.userData.elementId = el.id;
+  return root;
+}
+
+function buildWallWithOpenings(
+  el: AuthoredElement,
+  openings: WallOpening[],
+): THREE.Object3D | null {
+  const p = el.params;
+  if (!p.start || !p.end) return null;
+  const [ax, az] = p.start;
+  const [bx, bz] = p.end;
+  const L = Math.hypot(bx - ax, bz - az);
+  if (L < 0.05) return null;
+  const H = p.height;
+  const T = p.thickness;
+
+  const dirX = (bx - ax) / L;
+  const dirZ = (bz - az) / L;
+  const halfT = T / 2;
+  const joinStatus = String(el.properties?.joinStatus ?? "allow");
+
+  const sameKind = elements.filter(
+    (e) => e.type === el.type && e.params.start && e.params.end,
+  );
+
+  const startFaces = computeWallEndFaces(ax, az, dirX, dirZ, halfT, el.id, joinStatus, sameKind);
+  const endFaces   = computeWallEndFaces(bx, bz, dirX, dirZ, halfT, el.id, joinStatus, sameKind);
+
+  const normalX = dirZ, normalZ = -dirX;
+  const posX = ax + normalX * (-T / 2);
+  const posZ = az + normalZ * (-T / 2);
+
+  const toLocal = (wx: number, wz: number): [number, number] => {
+    const dx = wx - posX;
+    const dz = wz - posZ;
+    return [dx * dirX + dz * dirZ, dx * normalX + dz * normalZ];
+  };
+
+  const sL = toLocal(startFaces.left[0],  startFaces.left[1]);
+  const sR = toLocal(startFaces.right[0], startFaces.right[1]);
+  const eL = toLocal(endFaces.left[0],    endFaces.left[1]);
+  const eR = toLocal(endFaces.right[0],   endFaces.right[1]);
+
+  const shape = new THREE.Shape();
+  const arcH = Number((p as any).arcHeight ?? 0);
+
+  if (Math.abs(arcH) > 0.05 && L > 0.5) {
+    // Curved wall (segmented arc)
+    const h = Math.abs(arcH);
+    const R = (h * h + (L / 2) * (L / 2)) / (2 * h);
+    const sign = Math.sign(arcH);
+    const theta = 2 * Math.asin((L / 2) / R);
+    const startAngle = -theta / 2;
+    const segments = Math.max(12, Math.ceil(theta * 10));
+    const cX = L / 2;
+    const cY = T / 2 - sign * R;
+
+    // Left face (start to end)
+    shape.moveTo(0, T);
+    for (let i = 1; i <= segments; i++) {
+      const a = startAngle + (i / segments) * theta;
+      const px = cX + (R + T / 2) * Math.sin(a);
+      const py = cY + sign * (R + T / 2) * Math.cos(a);
+      shape.lineTo(px, py);
+    }
+    shape.lineTo(L, T);
+    shape.lineTo(L, 0);
+
+    // Right face (end to start)
+    for (let i = segments; i >= 0; i--) {
+      const a = startAngle + (i / segments) * theta;
+      const px = cX + (R - T / 2) * Math.sin(a);
+      const py = cY + sign * (R - T / 2) * Math.cos(a);
+      shape.lineTo(px, py);
+    }
+    shape.lineTo(0, 0);
+    shape.closePath();
+  } else {
+    // Straight wall
+    shape.moveTo(sL[0], sL[1]);
+    shape.lineTo(eL[0], eL[1]);
+    shape.lineTo(eR[0], eR[1]);
+    shape.lineTo(sR[0], sR[1]);
+    shape.closePath();
+  }
+
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: H, bevelEnabled: false });
+  const mat = new THREE.MeshLambertMaterial({
+    color: new THREE.Color(el.color || COLORS[el.type] || COLORS.wall),
+  });
+  let mesh: THREE.Mesh = new THREE.Mesh(geo, mat);
+
+  const wallDirV = new THREE.Vector3(dirX, 0, dirZ);
+  const normalV  = new THREE.Vector3(normalX, 0, normalZ);
+  const upV      = new THREE.Vector3(0, 1, 0);
+  const basis    = new THREE.Matrix4().makeBasis(wallDirV, normalV, upV);
+  mesh.quaternion.setFromRotationMatrix(basis);
+  mesh.position.set(posX, p.elevation, posZ);
+  mesh.updateMatrixWorld(true);
+
+  if (openings.length) {
+    // CSG hole subtraction.
+    //
+    // The wall's local axes (after `mesh.quaternion` rotation) are:
+    //   local X  ->  wall direction (horizontal, along the wall length)
+    //   local Y  ->  wall normal    (horizontal, perpendicular to wall length)
+    //   local Z  ->  world up       (vertical)
+    //
+    // Therefore the hole box's three dimensions must be:
+    //   width  (along-wall)  -> opening width   (spans the wall length)
+    //   depth  (wall-normal) -> wall thickness  (cuts all the way through)
+    //   height (vertical)    -> opening height   (from sill to top)
+    //
+    // Previous code used `BoxGeometry(op.width, op.height, T+0.2)` which
+    // swapped the wall-normal and vertical axes — the box was taller than
+    // the wall and barely cut through its thickness, so doors/windows
+    // appeared in front of an uncut wall. This is the hosted-element
+    // recut regression: the opening was computed in the wrong plane.
+    for (const op of openings) {
+      const holeGeo = new THREE.BoxGeometry(op.width, T + 0.2, op.height);
+      const holeMat = new THREE.MeshLambertMaterial({ visible: false });
+      const holeMesh = new THREE.Mesh(holeGeo, holeMat);
+
+      // Centre of the opening, in WORLD coordinates:
+      //   cx, cz  : on the wall's centreline, at distance `op.offset` from start
+      //   cy      : elevation + sill + half opening height (vertical mid-point)
+      //
+      // STRAIGHT walls: the centreline is the chord — position = start + dir·offset.
+      // CURVED walls (arcHeight ≠ 0): openings are hosted along the TRUE ARC
+      // (openingsForWall clamps against arc length), so the hole must sit on
+      // the arc centreline at the matching parameter and yaw to the local
+      // tangent — otherwise the hole is cut at the chord point, off the wall.
+      const isArc = Math.abs(arcH) > 0.05 && L > 0.5;
+      let cy = p.elevation + op.sill + op.height / 2;
+      if (isArc) {
+        const m = wallArcMetrics(L, arcH)!;
+        const sign = Math.sign(arcH);
+        const s = Math.max(0, Math.min(m.arcLen, op.offset));
+        const a = -m.theta / 2 + (s / m.arcLen) * m.theta;
+        const cX = L / 2;
+        const cY = T / 2 - sign * m.R;
+        // Arc centreline in the wall's LOCAL shape frame (x along chord, y along normal)
+        const lx = cX + m.R * Math.sin(a);
+        const ly = cY + sign * m.R * Math.cos(a);
+        // Local tangent at a, then yaw within the mesh's local frame
+        const tx = Math.cos(a);
+        const ty = -sign * Math.sin(a);
+        const yaw = Math.atan2(ty, tx);
+        holeMesh.position.copy(mesh.localToWorld(new THREE.Vector3(lx, ly, cy - p.elevation)));
+        holeMesh.quaternion.copy(mesh.quaternion)
+          .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), yaw));
+      } else {
+        const cx = ax + dirX * op.offset;
+        const cz = az + dirZ * op.offset;
+        holeMesh.position.set(cx, cy, cz);
+        holeMesh.quaternion.copy(mesh.quaternion);
+      }
+      holeMesh.updateMatrixWorld(true);
+
+      // K4: three-csg-ts result is gated and falls back to the general
+      // kernel; on total failure the uncut mesh is kept AND flagged
+      // FAILED-TO-CUT (registry + toast), never displayed as if the
+      // opening exists.
+      mesh.updateMatrixWorld(true);
+      const label = `${op.kind ?? "opening"} ${op.hostId ?? ""}`.trim();
+      mesh = subtractOpeningWithPostcondition(mesh, holeMesh, label, el, mat);
+      mesh.updateMatrixWorld(true);
+    }
+  }
+
+  // Reveals (grooves) are cut into the wall like openings are. Straight walls only.
+  const reveals = ((p as any).sweeps ?? []) as WallSweepPlacement[];
+  if (Array.isArray(reveals) && reveals.length && !(Math.abs(arcH) > 0.05 && L > 0.5)) {
+    for (const sw of reveals) {
+      const cut = generateRevealCutter(p.start, p.end, T, p.elevation, sw);
+      if (!cut) continue;
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(cut.positions), 3));
+      const cutter = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ visible: false }));
+      cutter.updateMatrixWorld(true);
+      mesh.updateMatrixWorld(true);
+      // K4: the reveal cutter is position-only (no normals), so
+      // three-csg-ts ALWAYS threw on it and the reveal was never cut —
+      // the old `catch { console.warn }` swallowed that on every wall.
+      // The post-condition falls back to the general kernel, which
+      // needs positions only, so reveals now cut; a total failure is
+      // flagged FAILED-TO-CUT (registry + toast) instead.
+      const label = `reveal ${sw.profileId} at ${(sw.startOffset ?? 0).toFixed(2)} m`;
+      mesh = subtractOpeningWithPostcondition(mesh, cutter, label, el, mat);
+      mesh.updateMatrixWorld(true);
+    }
+  }
+
+  mesh.userData.elementId = el.id;
+  mesh.userData.baseColor = el.color || COLORS.wall;
+  // Accelerate this mesh with BVH for fast raycasting (selection, snapping).
+  try {
+    if ((window as any).__obsPerf?.accelerateMesh) {
+      (window as any).__obsPerf.accelerateMesh(mesh);
+    }
+  } catch { /* BVH not available yet — mesh still works, just slower raycast */ }
+  attachWallSweeps(mesh, el);
+  return mesh;
+}
+
+/** Baseboards / cornices / wainscots stored in `params.sweeps`, rendered as child meshes of the wall. */
+function attachWallSweeps(wallMesh: THREE.Mesh, el: AuthoredElement): void {
+  const list = ((el.params as any).sweeps ?? []) as WallSweepPlacement[];
+  if (!Array.isArray(list) || !list.length) return;
+  const p = el.params;
+  if (!p.start || !p.end) return;
+  wallMesh.updateMatrixWorld(true);
+  const inv = wallMesh.matrixWorld.clone().invert();
+  for (const sw of list) {
+    const geo = generateWallSweep(p.start, p.end, p.thickness, p.height, p.elevation, sw);
+    if (!geo || !geo.positions.length || geo.isReveal) continue; // reveals are cut into the wall, not drawn
+    const arr = new Float32Array(geo.positions);
+    const v = new THREE.Vector3();
+    for (let i = 0; i < arr.length; i += 3) {
+      v.set(arr[i], arr[i + 1], arr[i + 2]).applyMatrix4(inv);
+      arr[i] = v.x; arr[i + 1] = v.y; arr[i + 2] = v.z;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(arr, 3));
+    g.computeVertexNormals();
+    const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: new THREE.Color(geo.color), side: THREE.DoubleSide }));
+    m.userData.elementId = el.id;
+    m.userData.baseColor = geo.color;
+    m.userData.isWallSweep = true;
+    wallMesh.add(m);
+  }
+}
+function buildDoor(el: AuthoredElement, host: AuthoredElement): THREE.Group | null {
+  const p = el.params;
+  const w = p.width ?? DEFAULTS.door.width!;
+  const h = p.height;
+  const wallT = host.params.thickness;
+  const frameT = Math.max(0.04, Math.min(0.1, p.frameThickness ?? 0.06));
+  const panelType: DoorPanelType = p.doorPanel ?? "swing";
+
+  const g = new THREE.Group();
+  const frameMat = new THREE.MeshLambertMaterial({ color: new THREE.Color(el.color || COLORS.door) });
+  const panelMat = new THREE.MeshLambertMaterial({ color: new THREE.Color(DOOR_COLOR_PANEL), side: THREE.DoubleSide });
+
+  const panelT = Math.max(0.03, wallT * 0.28);
+  const frameDepth = wallT * 0.92;
+
+  const top = new THREE.Mesh(new THREE.BoxGeometry(w, frameT, frameDepth), frameMat);
+  top.position.set(0, h - frameT / 2, 0);
+  const bottom = new THREE.Mesh(new THREE.BoxGeometry(w, frameT, frameDepth), frameMat);
+  bottom.position.set(0, frameT / 2, 0);
+  const left = new THREE.Mesh(new THREE.BoxGeometry(frameT, h - 2 * frameT, frameDepth), frameMat);
+  left.position.set(-w / 2 + frameT / 2, h / 2, 0);
+  const right = new THREE.Mesh(new THREE.BoxGeometry(frameT, h - 2 * frameT, frameDepth), frameMat);
+  right.position.set(w / 2 - frameT / 2, h / 2, 0);
+  g.add(top, bottom, left, right);
+
+  const innerW = w - 2 * frameT;
+  const innerH = h - 2 * frameT;
+
+  if (panelType === "double") {
+    const half = innerW / 2;
+    const p1 = new THREE.Mesh(new THREE.BoxGeometry(half, innerH, panelT), panelMat);
+    p1.position.set(-half / 2, h / 2, 0);
+    const p2 = new THREE.Mesh(new THREE.BoxGeometry(half, innerH, panelT), panelMat);
+    p2.position.set(half / 2, h / 2, 0);
+    g.add(p1, p2);
+  } else if (panelType === "sliding") {
+    const half = innerW / 2;
+    const p1 = new THREE.Mesh(new THREE.BoxGeometry(half, innerH, panelT * 0.9), panelMat);
+    p1.position.set(-half / 2, h / 2, panelT * 0.4);
+    const p2 = new THREE.Mesh(new THREE.BoxGeometry(half, innerH, panelT * 0.9), panelMat);
+    p2.position.set(half / 2, h / 2, -panelT * 0.4);
+    g.add(p1, p2);
+  } else if (panelType === "folding") {
+    const q = innerW / 4;
+    for (let i = 0; i < 4; i++) {
+      const panel = new THREE.Mesh(new THREE.BoxGeometry(q * 0.95, innerH, panelT), panelMat);
+      const z = i % 2 === 0 ? panelT * 0.35 : -panelT * 0.35;
+      panel.position.set(-innerW / 2 + q / 2 + i * q, h / 2, z);
+      g.add(panel);
+    }
+  } else if (panelType === "pocket") {
+    const panel = new THREE.Mesh(new THREE.BoxGeometry(innerW, innerH, panelT), panelMat);
+    panel.position.set(-innerW / 4, h / 2, 0);
+    g.add(panel);
+  } else {
+    const panel = new THREE.Mesh(new THREE.BoxGeometry(innerW, innerH, panelT), panelMat);
+    panel.position.set(0, h / 2, 0);
+    g.add(panel);
+
+    const arcPts: THREE.Vector3[] = [];
+    const r = innerW;
+    const hingeX = -innerW / 2;
+    const hingeY = frameT;
+    const N = 24;
+    for (let i = 0; i <= N; i++) {
+      const a = (i / N) * (Math.PI / 2);
+      arcPts.push(new THREE.Vector3(hingeX + Math.sin(a) * r, hingeY, Math.cos(a) * r));
+    }
+    const arc = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(arcPts),
+      new THREE.LineBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0.6 }),
+    );
+    g.add(arc);
+
+    const leaf = new THREE.Mesh(new THREE.BoxGeometry(panelT, innerH, innerW), panelMat);
+    leaf.position.set(hingeX + panelT / 2, h / 2, hingeY + innerW / 2);
+    g.add(leaf);
+  }
+
+  const handle = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.015, 0.015, 0.1, 8),
+    new THREE.MeshBasicMaterial({ color: 0x1f2937 }),
+  );
+  handle.rotation.z = Math.PI / 2;
+  handle.position.set(w / 2 - frameT - 0.08, h / 2, panelT / 2 + 0.03);
+  g.add(handle);
+
+  return g;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Window geometry
+// ═══════════════════════════════════════════════════════════════════════════
+function buildWindow(el: AuthoredElement, host: AuthoredElement): THREE.Group | null {
+  const p = el.params;
+  const w = p.width ?? DEFAULTS.window.width!;
+  const h = p.height;
+  const wallT = host.params.thickness;
+  const frameT = Math.max(0.04, Math.min(0.1, p.frameThickness ?? 0.05));
+  const panelType: WindowPanelType = p.windowPanel ?? "casement";
+
+  const g = new THREE.Group();
+  const frameMat = new THREE.MeshLambertMaterial({ color: new THREE.Color(el.color || COLORS.window) });
+  const glassMat = new THREE.MeshPhongMaterial({
+    color: new THREE.Color(WINDOW_COLOR_GLASS),
+    transparent: true, opacity: 0.28, shininess: 90, side: THREE.DoubleSide,
+  });
+
+  const glassT = 0.015;
+  const frameDepth = wallT * 0.92;
+
+  const top = new THREE.Mesh(new THREE.BoxGeometry(w, frameT, frameDepth), frameMat);
+  top.position.set(0, h - frameT / 2, 0);
+  const bottom = new THREE.Mesh(new THREE.BoxGeometry(w, frameT, frameDepth), frameMat);
+  bottom.position.set(0, frameT / 2, 0);
+  const left = new THREE.Mesh(new THREE.BoxGeometry(frameT, h - 2 * frameT, frameDepth), frameMat);
+  left.position.set(-w / 2 + frameT / 2, h / 2, 0);
+  const right = new THREE.Mesh(new THREE.BoxGeometry(frameT, h - 2 * frameT, frameDepth), frameMat);
+  right.position.set(w / 2 - frameT / 2, h / 2, 0);
+  g.add(top, bottom, left, right);
+
+  const innerW = w - 2 * frameT;
+  const innerH = h - 2 * frameT;
+
+  if (panelType === "double") {
+    const mullion = new THREE.Mesh(new THREE.BoxGeometry(frameT * 0.8, innerH, frameDepth), frameMat);
+    mullion.position.set(0, h / 2, 0);
+    g.add(mullion);
+    const gw = (innerW - frameT * 0.8) / 2;
+    const gL = new THREE.Mesh(new THREE.BoxGeometry(gw, innerH, glassT), glassMat);
+    gL.position.set(-gw / 2 - frameT * 0.4, h / 2, 0);
+    const gR = new THREE.Mesh(new THREE.BoxGeometry(gw, innerH, glassT), glassMat);
+    gR.position.set(gw / 2 + frameT * 0.4, h / 2, 0);
+    g.add(gL, gR);
+  } else if (panelType === "sliding") {
+    const half = innerW / 2;
+    const gL = new THREE.Mesh(new THREE.BoxGeometry(half * 0.98, innerH, glassT), glassMat);
+    gL.position.set(-half / 2, h / 2, glassT * 2);
+    const gR = new THREE.Mesh(new THREE.BoxGeometry(half * 0.98, innerH, glassT), glassMat);
+    gR.position.set(half / 2, h / 2, -glassT * 2);
+    g.add(gL, gR);
+  } else {
+    const glass = new THREE.Mesh(new THREE.BoxGeometry(innerW, innerH, glassT), glassMat);
+    glass.position.set(0, h / 2, 0);
+    g.add(glass);
+  }
+
+  if (p.mullion) {
+    const transom = new THREE.Mesh(new THREE.BoxGeometry(innerW, frameT * 0.6, frameDepth), frameMat);
+    transom.position.set(0, h * 0.65, 0);
+    g.add(transom);
+  }
+
+  const sill = new THREE.Mesh(new THREE.BoxGeometry(w + 0.06, 0.04, wallT * 1.15), frameMat);
+  sill.position.set(0, -0.02, 0);
+  g.add(sill);
+
+  return g;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Professional BIM family mesh factory
+// ═══════════════════════════════════════════════════════════════════════════
+function buildBimFamilyMesh(el: AuthoredElement): THREE.Object3D | null {
+  const p = el.params;
+  const family = String(el.properties?.family ?? el.properties?.category ?? "").toLowerCase();
+  if (!family || !p.point) return null;
+
+  const color = new THREE.Color(el.color || COLORS.equipment);
+  const mat = new THREE.MeshLambertMaterial({ color });
+  const w = Math.max(0.05, p.thickness);
+  const d = Math.max(0.05, p.depth ?? p.thickness);
+  const h = Math.max(0.05, p.height);
+  const group = new THREE.Group();
+
+  const addBox = (sx: number, sy: number, sz: number, y = sy / 2, material = mat) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), material);
+    m.position.set(0, y, 0);
+    group.add(m);
+  };
+  const addCylinder = (r: number, hh: number, y = hh / 2) => {
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, hh, 32), mat);
+    m.position.y = y;
+    group.add(m);
+  };
+
+  if (["tank", "chiller", "boiler", "cooling-tower", "heat-exchanger", "water-heater"].includes(family)) {
+    const r = Math.max(w, d) * 0.5;
+    addCylinder(r, h);
+    if (family === "cooling-tower") {
+      const cone = new THREE.Mesh(new THREE.ConeGeometry(r * 0.72, Math.max(0.15, h * 0.25), 32), mat);
+      cone.position.y = h * 0.88;
+      group.add(cone);
+    }
+  } else if (["fan", "pump", "exhaust-fan", "fan-coil"].includes(family)) {
+    addCylinder(Math.min(w, d) * 0.5, Math.max(0.18, h * 0.55), h * 0.28);
+    addBox(w, Math.max(0.08, h * 0.28), d, h * 0.72);
+    if (["fan", "exhaust-fan"].includes(family)) {
+      const bladeMat = new THREE.MeshBasicMaterial({ color: 0xe5e7eb });
+      for (let i = 0; i < 4; i++) {
+        const blade = new THREE.Mesh(new THREE.BoxGeometry(w * 0.75, 0.025, Math.max(0.03, d * 0.16)), bladeMat);
+        blade.position.y = h * 0.18;
+        blade.rotation.y = (Math.PI / 2) * i;
+        group.add(blade);
+      }
+    }
+  } else if (["diffuser", "grille", "luminaire", "exit-sign", "speaker", "access-point", "smoke-detector", "heat-detector"].includes(family)) {
+    const face = new THREE.MeshLambertMaterial({ color: family === "luminaire" ? 0xf8fafc : color });
+    addBox(w, Math.min(h, 0.12), d, Math.min(h, 0.12) / 2, face);
+    const inset = new THREE.Mesh(new THREE.BoxGeometry(Math.max(0.03, w * 0.72), 0.02, Math.max(0.03, d * 0.72)), new THREE.MeshBasicMaterial({ color: 0x111827 }));
+    inset.position.y = Math.min(h, 0.12) + 0.012;
+    group.add(inset);
+  } else if (["vav", "filter", "damper", "silencer", "valve", "heat-exchanger", "duct-accessory"].includes(family)) {
+    addBox(w, h, d);
+    const marker = new THREE.Mesh(new THREE.BoxGeometry(Math.max(0.02, w * 0.72), Math.max(0.02, h * 0.08), Math.max(0.02, d * 0.72)), new THREE.MeshBasicMaterial({ color: 0xe2e8f0 }));
+    marker.position.y = h * 0.5;
+    group.add(marker);
+  } else if (["toilet", "washbasin", "sink", "shower"].includes(family)) {
+    if (family === "toilet") {
+      addBox(w * 0.8, h * 0.25, d * 0.9, h * 0.125);
+      addCylinder(Math.min(w, d) * 0.42, h * 0.58, h * 0.55);
+    } else if (family === "shower") {
+      addBox(w, 0.08, d, 0.04);
+      addCylinder(Math.min(w, d) * 0.06, h * 0.78, h * 0.4);
+    } else {
+      addBox(w, Math.min(0.18, h), d, Math.min(0.18, h) / 2);
+      const bowl = new THREE.Mesh(new THREE.CylinderGeometry(Math.min(w, d) * 0.42, Math.min(w, d) * 0.35, Math.min(0.08, h), 32), new THREE.MeshLambertMaterial({ color: 0xf8fafc }));
+      bowl.position.y = Math.min(0.18, h);
+      group.add(bowl);
+    }
+  } else if (["fire-extinguisher", "fire-hydrant", "hose-reel", "battery", "anchor-bolt", "bearing", "bollard"].includes(family)) {
+    addCylinder(Math.min(w, d) * 0.48, h);
+    if (["fire-extinguisher", "bollard"].includes(family)) {
+      const cap = new THREE.Mesh(new THREE.CylinderGeometry(Math.min(w, d) * 0.3, Math.min(w, d) * 0.3, Math.min(0.08, h * 0.08), 24), mat);
+      cap.position.y = h + Math.min(0.04, h * 0.04);
+      group.add(cap);
+    }
+  } else if (["panel", "switchgear", "distribution-board", "fire-alarm-panel", "ups", "communication-panel", "structural-connection"].includes(family)) {
+    addBox(w, h, d);
+    const front = new THREE.Mesh(new THREE.BoxGeometry(Math.max(0.03, w * 0.75), Math.max(0.03, h * 0.7), Math.max(0.015, d * 0.08)), new THREE.MeshLambertMaterial({ color: 0x334155 }));
+    front.position.set(0, h * 0.52, d * 0.46);
+    group.add(front);
+    const indicator = new THREE.Mesh(new THREE.SphereGeometry(Math.min(w, d) * 0.06, 12, 8), new THREE.MeshBasicMaterial({ color: 0x22c55e }));
+    indicator.position.set(w * 0.22, h * 0.72, d * 0.52);
+    group.add(indicator);
+  } else if (["rack", "cctv-rack", "telecom-rack", "furniture"].includes(family)) {
+    addBox(w, h, d);
+    for (let i = 1; i < 5; i++) {
+      const shelf = new THREE.Mesh(new THREE.BoxGeometry(w * 0.82, 0.025, d * 0.08), new THREE.MeshBasicMaterial({ color: 0x94a3b8 }));
+      shelf.position.set(0, (h / 5) * i, d * 0.47);
+      group.add(shelf);
+    }
+  } else if (["camera"].includes(family)) {
+    addCylinder(Math.min(w, d) * 0.4, Math.max(0.12, h * 0.55), h * 0.3);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(Math.min(w, d) * 0.38, 20, 14), mat);
+    head.position.y = h * 0.75;
+    group.add(head);
+  } else if (["landscape-component", "furniture", "generic-model"].includes(family)) {
+    addBox(w, h, d);
+  } else {
+    return null;
+  }
+
+  group.position.set(p.point[0], p.elevation, p.point[1]);
+  group.traverse((m: any) => {
+    if (m.isMesh) {
+      m.userData.elementId = el.id;
+      m.userData.baseColor = el.color || COLORS.equipment;
+    }
+  });
+  return group;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// General mesh factory
+// ═══════════════════════════════════════════════════════════════════════════
+function createMesh(el: AuthoredElement): THREE.Object3D | null {
+  const m = createMeshBase(el);
+  const rot = Number((el.params as any)?.rotation) || 0;
+  if (m && Math.abs(rot) > 1e-9) {
+    try {
+      m.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(m);
+      if (!box.isEmpty()) {
+        const c = box.getCenter(new THREE.Vector3());
+        const r = rotateTransformAboutPivot(
+          [m.position.x, m.position.y, m.position.z],
+          [m.quaternion.x, m.quaternion.y, m.quaternion.z, m.quaternion.w],
+          [c.x, c.z],
+          rot,
+        );
+        m.position.set(...r.position);
+        m.quaternion.set(...r.quaternion);
+      }
+    } catch { /* keep unrotated */ }
+  }
+  return m;
+}
+
+/**
+ * vertical-openings: compute the THREE.Path holes a slab-like element
+ * receives from every vertical opening whose footprint overlaps it in plan
+ * and whose Z span reaches it. Holes are mapped into the slab shape space
+ * (x, -z) used by the ExtrudeGeometry builders below.
+ */
+function verticalOpeningHolePaths(slabEl: AuthoredElement): THREE.Path[] {
+  const poly = slabEl.params.polygon;
+  if (!poly || poly.length < 3) return [];
+  const base = Number(slabEl.params.elevation ?? 0);
+  const zs: [number, number] = [base, base + Number(slabEl.params.height ?? slabEl.params.thickness ?? 0.2)];
+  const openings = elements
+    .filter((e) => e.type === "vertical-opening" && e.params.point)
+    .map((e) => ({ id: e.id, fp: voOpeningFootprint(e as unknown as VerticalOpeningLike) }))
+    .filter((o) => {
+      const [oz0, oz1] = voOpeningZSpan((elements.find((e) => e.id === o.id) ?? { params: {} }) as unknown as VerticalOpeningLike);
+      return oz1 > zs[0] && oz0 < zs[1];
+    });
+  if (!openings.length) return [];
+  const { holes } = voCutSlabHoles(poly as Array<[number, number]>, openings);
+  return holes.map((ring) => {
+    const path = new THREE.Path();
+    ring.forEach(([x, z], i) => (i === 0 ? path.moveTo(x, -z) : path.lineTo(x, -z)));
+    path.closePath();
+    return path;
+  });
+}
+
+function createMeshBase(el: AuthoredElement): THREE.Object3D | null {
+  const p = el.params;
+
+  // Exact native reconstruction path for IFC/FRAG Native Twins. The authored
+  // project stores non-indexed triangle positions, so the object is rendered
+  // by the same authored scene graph as normal BIM objects.
+  // Parametric-linear Native Twins with a valid baseline regenerate via the
+  // standard wall/beam builders so Height/Thickness edits change real solids.
+  const editMode = String((el.properties as any)?.editMode ?? "");
+  const hasLinearBaseline = !!(el.params.start && el.params.end);
+  const hasPoint = !!(el.params.point);
+  const hasPolygon = !!(el.params.polygon && el.params.polygon.length >= 3);
+  const forceParametricSolid = !!(el.properties as any)?.forceParametricSolid;
+  const preferParametricSolid = shouldPreferParametricSolid(
+    el.type,
+    editMode,
+    hasLinearBaseline,
+    hasPoint,
+    hasPolygon,
+    forceParametricSolid,
+  );
+
+  // Exact source geometry is the default for Digital Twins — preserves orientation,
+  // openings, and profile. Parametric box rebuild only when explicitly forced.
+  if (
+    el.nativeGeometry?.positions &&
+    el.nativeGeometry.positions.length >= 9 &&
+    !preferParametricSolid
+  ) {
+    ensureNativeBaseDimensions(el);
+    const props = el.properties as any;
+    const baseH = Number(props.nativeBaseHeight) || 0;
+    const baseT = Number(props.nativeBaseThickness) || 0;
+    const baseLen = Number(props.nativeBaseLength) || 0;
+    const h = Number(el.params.height) || baseH;
+    const t = Number(el.params.thickness) || baseT;
+
+    // Orientation-preserving plan deform (length + thickness) on a copy of source verts.
+    let positions: ArrayLike<number> = el.nativeGeometry.positions;
+    if (el.transform && el.params.start && el.params.end && (baseT > 1e-8 || baseLen > 1e-8)) {
+      const axes = planAxesFromBaseline(el.params.start as [number, number], el.params.end as [number, number]);
+      if (axes) {
+        const tr = baseT > 1e-8 ? t / baseT : 1;
+        const lr = baseLen > 1e-8
+          ? lengthRatioFromParams(el.params.start as [number, number], el.params.end as [number, number], baseLen)
+          : 1;
+        if (Math.abs(tr - 1) > 1e-9 || Math.abs(lr - 1) > 1e-9) {
+          positions = deformPlanDimensions(
+            el.nativeGeometry.positions,
+            axes,
+            el.transform.position,
+            lr,
+            tr,
+          );
+        }
+      }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions as ArrayLike<number>, 3));
+    try { geo.computeVertexNormals(); } catch { /* */ }
+    try { geo.computeBoundingBox(); geo.computeBoundingSphere(); } catch { /* */ }
+    const mat = new THREE.MeshLambertMaterial({ color: new THREE.Color(el.color || COLORS[el.type] || "#a7b0be") });
+    if (el.type === "slab" || el.type === "wall" || el.type === "roof") mat.side = THREE.DoubleSide;
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.userData.elementId = el.id;
+    mesh.userData.baseColor = el.color || COLORS[el.type] || "#a7b0be";
+    mesh.userData.nativeTwin = true;
+    mesh.userData.ifc = el.ifc;
+    mesh.userData.sourceModelId = el.ifc?.sourceModelId;
+    mesh.userData.sourceLocalId = el.ifc?.sourceLocalId;
+    mesh.userData.sourceGlobalId = el.ifc?.sourceGlobalId || el.ifc?.globalId;
+    if (el.transform) {
+      mesh.position.set(...el.transform.position);
+      mesh.quaternion.set(...el.transform.quaternion);
+      const sx0 = el.transform.scale[0];
+      const sy0 = el.transform.scale[1];
+      const sz0 = el.transform.scale[2];
+      // Height only via vertical resize — plan size handled by vertex deform above.
+      const rs = baseH > 1e-8
+        ? heightResizeTransform({
+            positions: el.nativeGeometry.positions,
+            position: el.transform.position,
+            quaternion: el.transform.quaternion,
+            scale: [sx0, sy0, sz0],
+            baseHeight: baseH,
+            newHeight: h,
+          })
+        : null;
+      mesh.scale.set(sx0, rs ? rs.scale[1] : sy0, sz0);
+      if (rs) mesh.position.set(rs.position[0], rs.position[1], rs.position[2]);
+      else mesh.position.set(...el.transform.position);
+      // Level-constraint / elevation edits move the whole twin vertically.
+      mesh.position.y += twinElevationShift(el.params.elevation, props.nativeBaseElevation);
+    }
+    return mesh;
+  }
+
+  if (el.type === "fitting") return buildFitting(el);
+
+  if (el.type === "wall" && p.start && p.end) {
+    const openings = openingsForWall(el.id);
+    // Compound (multi-layer) walls: build layered solids, then cut host openings
+    // so doors/windows still punch every layer (BIM authoring software compound behavior).
+    const __layerStr = (el.properties as any)?.layers as string | undefined;
+    if (__layerStr) {
+      try {
+        const __w = window as any;
+        const __builder = __w.__obsMeshBuilders?.["wall"];
+        if (typeof __builder === "function") {
+          const __mesh = __builder(el);
+          if (__mesh) {
+            return cutOpeningsInWallObject(__mesh, el, openings) ?? __mesh;
+          }
+        }
+      } catch (__err) {
+        console.warn("[authoring] compound wall builder failed", __err);
+      }
+    }
+    return buildWallWithOpenings(el, openings);
+  }
+
+  // Curtain wall system — mullions + panels (not a solid wall slab)
+  if (el.type === "curtain-wall" && p.start && p.end) {
+    try {
+      const cw = (ctx.features as any).curtainWall;
+      if (cw && typeof cw.buildFromElement === "function") {
+        const g = cw.buildFromElement(el);
+        if (g) return g;
+      }
+    } catch (err) {
+      console.warn("[authoring] curtain-wall builder failed", err);
+    }
+    // Fallback: thin solid with openings so the element is never invisible
+    return buildWallWithOpenings(el, openingsForWall(el.id));
+  }
+
+  // miter-beam-v1
+  if (el.type === "beam" && p.start && p.end) {
+    // Beams reuse the same mitered-linear builder as walls (with no
+    // openings). Two beams meeting at an L-corner miter cleanly in both
+    // 2D plan and 3D, matching BIM's structural framing behaviour.
+    return buildWallWithOpenings(el, []);
+  }
+
+  if (el.type === "door") {
+    const host = el.hostId ? elements.find((e) => e.id === el.hostId) : null;
+    if (!host || !host.params.start || !host.params.end) return null;
+    const g = buildDoor(el, host);
+    if (!g) return null;
+    placeHostedElement(g, el, host);
+    return g;
+  }
+
+  if (el.type === "window") {
+    const host = el.hostId ? elements.find((e) => e.id === el.hostId) : null;
+    if (!host || !host.params.start || !host.params.end) return null;
+    const g = buildWindow(el, host);
+    if (!g) return null;
+    placeHostedElement(g, el, host);
+    return g;
+  }
+
+  const color = new THREE.Color(el.color || COLORS[el.type] || "#cccccc");
+  if (el.type === "truss" && p.start && p.end) {
+    const g = buildTruss(el);
+    g.traverse((m: any) => {
+      if (m.isMesh) {
+        m.userData.elementId = el.id;
+        m.userData.baseColor = el.color || COLORS.truss;
+      }
+    });
+    return g;
+  }
+
+  const mat = new THREE.MeshLambertMaterial({ color });
+  if (el.type === "slab" || el.type === "roof" || el.type === "ceiling") mat.side = THREE.DoubleSide;
+  let mesh: THREE.Mesh | null = null;
+
+  if (p.start && p.end) {
+    const [ax, az] = p.start;
+    const [bx, bz] = p.end;
+    const len = Math.hypot(bx - ax, bz - az);
+    if (
+      len < 0.05 &&
+      ["wall", "duct", "pipe", "cable-tray", "conduit", "beam", "strip", "mline"].includes(el.type)
+    ) return null;
+
+    if (el.type === "mline" && len >= 0.02) {
+      mesh = new THREE.Mesh(new THREE.BoxGeometry(len, 0.02, 0.02), new THREE.MeshBasicMaterial({ color }));
+      mesh.position.set((ax + bx) / 2, p.elevation + 0.01, (az + bz) / 2);
+      mesh.rotation.y = Math.atan2(-(bz - az), bx - ax);
+    } else if (
+      ["wall", "duct", "pipe", "cable-tray", "conduit", "strip", "beam"].includes(el.type) &&
+      len >= 0.05
+    ) {
+      const sloped = p.endElevation != null && MEP_LINEAR_TYPES.has(el.type) &&
+        Math.abs(p.endElevation - p.elevation) > 1e-6;
+      if (sloped) {
+        const run = slopedRun(p.elevation, p.endElevation, len);
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(run.length, p.height, p.thickness), mat);
+        mesh.position.set((ax + bx) / 2, run.midElevation + p.height / 2, (az + bz) / 2);
+        mesh.rotation.order = "YZX";
+        mesh.rotation.set(0, Math.atan2(-(bz - az), bx - ax), run.pitch);
+      } else {
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(len, p.height, p.thickness), mat);
+        mesh.position.set((ax + bx) / 2, p.elevation + p.height / 2, (az + bz) / 2);
+        mesh.rotation.y = Math.atan2(-(bz - az), bx - ax);
+      }
+    }
+  }
+
+  if (!mesh && el.type === "brace" && p.start && p.end) {
+    const a = new THREE.Vector3(p.start[0], p.elevation, p.start[1]);
+    const b = new THREE.Vector3(p.end[0], p.elevation + p.height, p.end[1]);
+    if (a.distanceTo(b) < 0.05) return null;
+    mesh = memberMesh(a, b, p.thickness, p.thickness, mat);
+  }
+
+  if (!mesh && el.type === "terrain" && p.polygon && p.polygon.length >= 3) {
+    const shape = new THREE.Shape();
+    p.polygon.forEach(([x, z], i) => (i === 0 ? shape.moveTo(x, -z) : shape.lineTo(x, -z)));
+    shape.closePath();
+    const thickness = p.thickness ?? 1.0;
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: thickness, bevelEnabled: false });
+    mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: 0x8b5a2b }));
+    mesh.rotation.x = -Math.PI / 2;
+    const slopeDeg = Number(el.properties?.slope ?? 0);
+    const dirDeg = Number(el.properties?.slopeDirection ?? 0);
+    if (slopeDeg > 0) {
+      const slopeRad = THREE.MathUtils.degToRad(slopeDeg);
+      const dirRad = THREE.MathUtils.degToRad(dirDeg);
+      const axis = new THREE.Vector3(Math.cos(dirRad), 0, Math.sin(dirRad));
+      const q = new THREE.Quaternion().setFromAxisAngle(axis, slopeRad);
+      mesh.applyQuaternion(q);
+    }
+    mesh.position.y = p.elevation;
+  }
+
+  // Polygon slabs, roofs and ceilings share one builder: a flat extrusion
+  // of the footprint by params.height at params.elevation. Roofs used to
+  // fall through this branch (the old guard was slab-only), so a
+  // type-"roof" element existed in the store but rendered nothing — the
+  // mass-to-elements conversion's roof was invisible. The ribbon Roof
+  // tool never showed this because it draws type-"slab" elements.
+  if (!mesh && (el.type === "slab" || el.type === "roof" || el.type === "ceiling") && p.polygon && p.polygon.length >= 3) {
+    // Sloped floor: properties.slope (%) + properties.slopeDirection (deg,
+    // 0 = +X) drive the sloped-floor engine (modules/floors). The lowest
+    // edge stays at params.elevation — the slope-arrow tail convention.
+    const slopePct = Number(el.properties?.slope ?? 0);
+    const slopeDirDeg = Number(el.properties?.slopeDirection ?? 0);
+    const slopedApi = (ctx.features as any)?.slopedFloors as Record<string, any> | undefined;
+    const slopedGeo = slopePct > 0.01 && slopedApi?.buildSlopedFloorMesh
+      ? slopedApi.buildSlopedFloorMesh({
+          polygon: p.polygon as Array<[number, number]>,
+          thickness: p.height ?? 0.2,
+          slopePct,
+          directionDeg: slopeDirDeg,
+          baseElevation: p.elevation ?? 0,
+        })
+      : null;
+    if (slopedGeo) {
+      // Geometry is built in world XZ with baked Y elevations — no rotation.
+      mesh = new THREE.Mesh(slopedGeo, mat);
+      mesh.position.y = 0;
+      const holes = verticalOpeningHolePaths(el);
+      if (holes.length) {
+        console.warn(
+          `[authoring] ${el.type} ${el.id} is sloped with ${holes.length} vertical opening(s): ` +
+          "hole punching on sloped slabs is not supported yet — openings are drawn flat. " +
+          "Set slope back to 0 or move the openings to a flat slab.",
+        );
+      }
+    } else {
+      if (slopePct > 0.01) {
+        console.warn(`[authoring] sloped-floor geometry rejected for ${el.type} ${el.id} (slope ${slopePct}% out of range or degenerate polygon) — rendering flat.`);
+      }
+      const shape = new THREE.Shape();
+      p.polygon.forEach(([x, z], i) => (i === 0 ? shape.moveTo(x, -z) : shape.lineTo(x, -z)));
+      shape.closePath();
+      // vertical-openings: shaft/vertical/skylight openings punch real holes
+      // through slabs (and roofs/ceilings via the same builder below)
+      for (const path of verticalOpeningHolePaths(el)) shape.holes.push(path);
+      const geo = new THREE.ExtrudeGeometry(shape, { depth: p.height, bevelEnabled: false });
+      mesh = new THREE.Mesh(geo, mat);
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.y = p.elevation;
+    }
+  }
+
+  if (!mesh && el.type === "vertical-opening" && p.point) {
+    // the opening itself renders as a red wireframe cage spanning its cut
+    const w = p.width ?? 1, d = p.depth ?? p.width ?? 1, h = p.height ?? 3;
+    const cage = new THREE.BoxGeometry(w, h, d);
+    const cageMesh = new THREE.LineSegments(
+      new THREE.EdgesGeometry(cage),
+      new THREE.LineBasicMaterial({ color: 0xef4444 }),
+    );
+    cageMesh.position.set(p.point[0], p.elevation + h / 2, p.point[1]);
+    mesh = cageMesh as unknown as THREE.Mesh;
+  }
+
+  if (!mesh && el.type === "equipment" && p.point) {
+    mesh = buildBimFamilyMesh(el) as THREE.Mesh | null;
+    if (!mesh) {
+      const d = p.depth ?? p.thickness;
+      mesh = new THREE.Mesh(new THREE.BoxGeometry(p.thickness, p.height, d), mat);
+      mesh.position.set(p.point[0], p.elevation + p.height / 2, p.point[1]);
+    }
+  }
+
+  if (!mesh && el.type === "column" && p.point) {
+    const d = p.depth ?? p.thickness;
+    mesh = new THREE.Mesh(new THREE.BoxGeometry(p.thickness, p.height, d), mat);
+    mesh.position.set(p.point[0], p.elevation + p.height / 2, p.point[1]);
+  }
+
+  if (!mesh && el.type === "footing" && p.point) {
+    const d = p.depth ?? p.thickness;
+    mesh = new THREE.Mesh(new THREE.BoxGeometry(p.thickness, p.height, d), mat);
+    mesh.position.set(p.point[0], p.elevation - p.height / 2, p.point[1]);
+  }
+
+  if (!mesh) {
+    try {
+      const __featureBuilders = (ctx.features as any)?.meshBuilders;
+      const __legacyBuilders = (window as any).__obsMeshBuilders;
+      const __builder = __featureBuilders?.[el.type] ?? __legacyBuilders?.[el.type];
+      if (typeof __builder === "function") {
+        const __custom = __builder(el);
+        if (__custom) {
+          __custom.traverse((m: any) => {
+            if (m.isMesh) {
+              m.userData.elementId = el.id;
+              m.userData.baseColor = el.color || COLORS[el.type] || "#cccccc";
+            }
+          });
+          return __custom;
+        }
+      }
+    } catch (err) {
+      console.warn("[authoring] custom mesh builder failed for " + el.type, err);
+    }
+    return null;
+  }
+  mesh.userData.elementId = el.id;
+  mesh.userData.baseColor = "#" + color.getHexString();
+  return mesh;
+}
+
+function placeHostedElement(g: THREE.Group, el: AuthoredElement, host: AuthoredElement): void {
+  const [ax, az] = host.params.start!;
+  const [bx, bz] = host.params.end!;
+  const dx = bx - ax;
+  const dz = bz - az;
+  const L = Math.hypot(dx, dz);
+  if (L < 0.01) return;
+
+  const dir = new THREE.Vector3(dx / L, 0, dz / L);
+  const up = new THREE.Vector3(0, 1, 0);
+  const normal = new THREE.Vector3().crossVectors(up, dir).normalize();
+
+  const offset = computeClampedOffset(el, L);
+  const sill = el.params.sillHeight ?? 0;
+
+  const pos = new THREE.Vector3(
+    ax + dir.x * offset,
+    host.params.elevation + sill,
+    az + dir.z * offset,
+  );
+
+  const basis = new THREE.Matrix4().makeBasis(dir, up, normal);
+  const quat = new THREE.Quaternion().setFromRotationMatrix(basis);
+
+  g.position.copy(pos);
+  g.quaternion.copy(quat);
+
+  g.traverse((m: any) => {
+    if (m.isMesh) {
+      m.userData.elementId = el.id;
+      m.userData.baseColor = el.color || COLORS[el.type];
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Rebuild
+// ═══════════════════════════════════════════════════════════════════════════
+function disposeObj(obj: THREE.Object3D) {
+  obj.traverse((m: any) => {
+    m.geometry?.dispose?.();
+    if (Array.isArray(m.material)) m.material.forEach((x: any) => x.dispose?.());
+    else m.material?.dispose?.();
+  });
+}
+
+/** Write derived hosted-element params once per rebuild. The only place
+ *  offsetAlongHost, x, z, hostAngle, rotation, angle are mutated. */
+function syncHostedPositions(): void {
+  for (const el of elements) {
+    if ((el.type !== "door" && el.type !== "window") || !el.hostId) continue;
+    const host = elements.find((e) => e.id === el.hostId);
+    if (!host?.params.start || !host?.params.end) continue;
+    const [ax, az] = host.params.start;
+    const [bx, bz] = host.params.end;
+    const dx = bx - ax, dz = bz - az;
+    const L = Math.hypot(dx, dz);
+    if (L < 1e-6) continue;
+    const offset = computeClampedOffset(el, L);
+    const t01 = offset / L;
+    const cx = ax + dx * t01;
+    const cz = az + dz * t01;
+    const hostAngle = Math.atan2(dz, dx);
+    el.params.offsetAlongHost = offset;
+    if ("x" in el.params)         (el.params as any).x         = Math.round(cx * 1000) / 1000;
+    if ("z" in el.params)         (el.params as any).z         = Math.round(cz * 1000) / 1000;
+    if ("hostAngle" in el.params) (el.params as any).hostAngle = Math.round(hostAngle * 10000) / 10000;
+    if ("rotation" in el.params)  (el.params as any).rotation  = Math.round(hostAngle * 10000) / 10000;
+    if ("angle" in el.params)     (el.params as any).angle     = Math.round(hostAngle * 10000) / 10000;
+  }
+  syncHostedFamilyPositions();
+}
+
+/**
+ * Generic family hosting (Slice 9 + ribbon follow-up): re-derive the
+ * placement of every hosted family instance from its host's CURRENT
+ * geometry, once per rebuild — the same "only place hosted params are
+ * mutated" rule as the door/window sync above. A host whose geometry did
+ * not change is skipped; a changed host bumps the tracked version and
+ * rehosts (moved / invalid); a deleted host detaches the element, which
+ * survives freestanding at its last placement.
+ *
+ * Last-seen host geometry is tracked per host id. On first sight the
+ * snapshot takes the attachment's own host version — as far as this
+ * session knows, the geometry is the one the attachment was computed
+ * against — so loading a project does not spuriously re-derive or
+ * re-version anything.
+ */
+const lastSeenFamilyHostGeometry = new Map<string, FamilyHostGeometry>();
+
+function syncHostedFamilyPositions(): void {
+  // Group hosted elements by host first: a changed host must rehost ALL
+  // of its dependents, not just the first one the loop reaches. Snapshots
+  // are keyed by host id + host kind — one wall element can be both a
+  // wall host and a face host, with different geometries.
+  const byHost = new Map<string, AuthoredElement[]>();
+  for (const el of elements) {
+    if (!el.hostAttachment) continue;
+    const list = byHost.get(el.hostAttachment.hostId) ?? [];
+    list.push(el);
+    byHost.set(el.hostAttachment.hostId, list);
+  }
+  for (const [hostId, hosted] of byHost) {
+    const host = elements.find((e) => e.id === hostId);
+    if (!host) {
+      const prev = lastSeenFamilyHostGeometry.get(`${hostId}:wall`)
+        ?? lastSeenFamilyHostGeometry.get(`${hostId}:face`);
+      for (const el of hosted) {
+        if (prev) rehostElementAfterHostChange(el, prev, null);
+        else detachFamilyFromHost(el);
+      }
+      lastSeenFamilyHostGeometry.delete(`${hostId}:wall`);
+      lastSeenFamilyHostGeometry.delete(`${hostId}:face`);
+      continue;
+    }
+    for (const kind of ["wall", "face"] as const) {
+      const kindHosted = hosted.filter((el) => el.hostAttachment?.hostKind === kind);
+      if (!kindHosted.length) continue;
+      const next = hostGeometryFromElement(host, kind);
+      if (!next) continue; // host element no longer offers this host kind
+      const key = `${host.id}:${kind}`;
+      const prev = lastSeenFamilyHostGeometry.get(key);
+      if (!prev) {
+        lastSeenFamilyHostGeometry.set(key, { ...next, version: kindHosted[0].hostAttachment!.hostVersion });
+        continue;
+      }
+      if (hostGeometryEquals(prev, next)) continue;
+      const versioned: FamilyHostGeometry = { ...next, version: prev.version + 1 };
+      for (const el of kindHosted) rehostElementAfterHostChange(el, prev, versioned);
+      lastSeenFamilyHostGeometry.set(key, versioned);
+    }
+  }
+}
+
+const TWIN_PLACEMENT_KEYS = new Set(["height", "elevation", "rotation", "length", "baseLevelId", "baseOffset", "topLevelId", "topOffset"]);
+
+/** Keep the gizmo twin on the authored mesh's real placement. (Do NOT derive it from
+ *  elevation + height/2: that assumes the mesh origin is its vertical centre.) */
+function syncTwinGizmoPosition(elementId: string): void {
+  try {
+    const fe: any = (ctx.features as any)?.fragEdit;
+    const twins = fe?.list?.() as any[] | undefined;
+    if (!twins?.length) return;
+    const obj = group.children.find((c: any) => c.userData?.elementId === elementId && c.userData?.nativeTwin) as THREE.Object3D | undefined;
+    if (!obj) return;
+    for (const t of twins) {
+      if (t.nativeElementId === elementId && Array.isArray(t.position)) t.position = [obj.position.x, obj.position.y, obj.position.z];
+    }
+  } catch { /* optional */ }
+}
+
+/** After a level elevation change: re-resolve every level-constrained element, then rebuild. */
+function applyLevelConstraints(): void {
+  try {
+    const { updates, failures } = levelChangeUpdates(elements as any, levels);
+    for (const u of updates) {
+      const el = elements.find((e) => e.id === u.id);
+      if (el) { el.params.elevation = u.elevation; el.params.height = u.height; }
+    }
+    if (updates.length) { rebuild(); for (const u of updates) syncTwinGizmoPosition(u.id); }
+    if (failures.length) {
+      window.dispatchEvent(new CustomEvent("obs-toast", {
+        detail: { message: `${failures.length} constrained element(s) could not follow the level change: ${failures[0].reason}`, kind: "warning" },
+      }));
+    }
+  } catch { /* constraints are best-effort; never block a level edit */ }
+}
+
+/** Persist clamped offsetAlongHost so stretch/shorten of a host never leaves openings off the wall. */
+
+/**
+ * After placing a wall, magnetically share joinStatus with nearby ends and
+ * force a geometry rebuild so L / T miters appear immediately (BIM authoring software-like).
+ */
+function autoJoinNewWall(el: AuthoredElement): void {
+  if (!el.params.start || !el.params.end) return;
+  if (String(el.properties?.joinStatus ?? "allow") === "disallow") return;
+  const ends = [el.params.start, el.params.end];
+  const tol = Math.max(0.25, (Number(el.params.thickness) || 0.2) * 2);
+  let touched = false;
+  for (const o of elements) {
+    if (o.id === el.id) continue;
+    if (o.type !== "wall" && o.type !== "curtain-wall") continue;
+    if (!o.params.start || !o.params.end) continue;
+    if (String(o.properties?.joinStatus ?? "allow") === "disallow") continue;
+    for (const ep of ends) {
+      for (const op of [o.params.start, o.params.end]) {
+        if (Math.hypot(ep[0] - op[0], ep[1] - op[1]) <= tol) {
+          el.properties = { ...(el.properties ?? {}), joinStatus: "allow" };
+          o.properties = { ...(o.properties ?? {}), joinStatus: "allow" };
+          touched = true;
+        }
+      }
+      // T-join: new end lands on other centerline
+      const [ox1, oz1] = o.params.start;
+      const [ox2, oz2] = o.params.end;
+      const odx = ox2 - ox1, odz = oz2 - oz1;
+      const oL2 = odx * odx + odz * odz || 1;
+      const tpar = ((ep[0] - ox1) * odx + (ep[1] - oz1) * odz) / oL2;
+      if (tpar > 0.02 && tpar < 0.98) {
+        const px = ox1 + tpar * odx, pz = oz1 + tpar * odz;
+        const dist = Math.hypot(ep[0] - px, ep[1] - pz);
+        const maxD = (Number(o.params.thickness) || 0.2) / 2 + (Number(el.params.thickness) || 0.2) / 2 + 0.05;
+        if (dist <= maxD) {
+          el.properties = { ...(el.properties ?? {}), joinStatus: "allow" };
+          o.properties = { ...(o.properties ?? {}), joinStatus: "allow" };
+          touched = true;
+        }
+      }
+    }
+  }
+  if (touched) rebuild();
+}
+
+function normalizeHostedOffsets(): void {
+  for (const el of elements) {
+    if ((el.type !== "door" && el.type !== "window") || !el.hostId) continue;
+    const host = elements.find((h) => h.id === el.hostId);
+    if (!host?.params.start || !host.params.end) continue;
+    const [ax, az] = host.params.start;
+    const [bx, bz] = host.params.end;
+    const chord = Math.hypot(bx - ax, bz - az);
+    const arcM = wallArcMetrics(chord, Number((host.params as any).arcHeight ?? 0));
+    const hostLen = arcM ? arcM.arcLen : chord;
+    const next = computeClampedOffset(el, hostLen);
+    if (Math.abs((el.params.offsetAlongHost ?? next) - next) > 1e-4) {
+      el.params.offsetAlongHost = next;
+    }
+  }
+}
+
+function rebuild() {
+  normalizeHostedOffsets();
+  while (group.children.length) {
+    const ch = group.children[0];
+    group.remove(ch);
+    disposeObj(ch);
+  }
+  for (const el of elements) {
+    if (el.type !== "wall") continue;
+    const m = createMesh(el);
+    if (m) group.add(m);
+  }
+  for (const el of elements) {
+    if (el.type === "wall") continue;
+    const m = createMesh(el);
+    if (m) group.add(m);
+  }
+  // K1: record-only gate over the meshes rebuild() just built. This is
+  // what catches mesh states the pre-commit probe cannot see — a wall
+  // re-cut when a hosted door/window is placed, a host edit, an undo.
+  // Quarantine is the disposition here (the elements are already
+  // committed; refusal belongs to the pre-commit probe in createElement
+  // and the twin admission gate). A mesh that validates clean again
+  // clears its record. Never breaks the rebuild: any gate failure is
+  // logged and the scene stands as built.
+  gateRebuiltElementMeshes();
+  syncHostedPositions();
+  applySelection();
+  refreshGrips();
+  // hosted-place-sync: reconcile hosted door/window mesh transforms to the
+  // clamped offsetAlongHost (same source as the wall hole) so a freshly placed
+  // opening cannot float off its host. No-op if the module is not loaded.
+  (window as any).__obsSyncHostedPlacement?.();
+  syncMepLifecycleFromAuthoredElements();
+}
+
+/** K1 record-only gate over the meshes rebuild() just built (see rebuild()). */
+function gateRebuiltElementMeshes(): void {
+  try {
+    const seen = new Set<string>();
+    for (const child of group.children) {
+      try {
+        child.updateMatrixWorld(true);
+      } catch { /* world matrices stay as built; local-frame validation still applies */ }
+      const meshes: THREE.Mesh[] = [];
+      child.traverse((o) => { if ((o as THREE.Mesh).isMesh) meshes.push(o as THREE.Mesh); });
+      const elementId = ((child as THREE.Object3D).userData?.elementId as string | undefined)
+        ?? meshes.map((m) => (m.userData?.elementId as string | undefined)).find(Boolean);
+      if (!elementId || seen.has(elementId)) continue;
+      seen.add(elementId);
+      let worst: "ok" | "quarantined" | "refused" = "ok";
+      for (const m of meshes) {
+        const geo = m.geometry as THREE.BufferGeometry | undefined;
+        const posAttr = geo?.getAttribute?.("position") as THREE.BufferAttribute | undefined;
+        if (!posAttr) continue;
+        const idxAttr = (geo?.getIndex?.() as THREE.BufferAttribute | null)?.array as ArrayLike<number> | null;
+        const indexed = threeGeometryToIndexedMesh(
+          posAttr.array as ArrayLike<number>,
+          idxAttr ?? null,
+          (m.matrixWorld?.elements as unknown as ArrayLike<number> | undefined),
+        );
+        const verdict = gateSolid(indexed, `${elementId}`, { source: "authoring-rebuild", id: elementId });
+        if (verdict.verdict === "refused") {
+          // Refused verdicts are not auto-recorded by gateSolid (the
+          // element is already committed, so the record keeps it flagged
+          // in diagnostics instead of dropping the evidence).
+          worst = "refused";
+          recordQuarantinedSolid({
+            id: elementId,
+            owner: elementId,
+            source: "authoring-rebuild",
+            disposition: "quarantined",
+            admitted: true,
+            diagnostics: verdict.errors.map((d) => ({ code: d.code, message: d.message })),
+            volume: verdict.volume,
+          });
+        } else if (verdict.verdict === "quarantined" && worst === "ok") {
+          worst = "quarantined";
+        }
+      }
+      // A mesh that validates clean again clears its quarantine record.
+      if (worst === "ok") clearQuarantinedSolid(elementId);
+    }
+  } catch (err) {
+    console.warn("[authoring] validation-gate rebuild pass failed", err);
+  }
+}
+
+/** Synchronize native MEP geometry after the common authoring rebuild path. */
+let lastMepAuthoringIds = new Set<string>();
+function syncMepLifecycleFromAuthoredElements(): void {
+  const lifecycle = (ctx.features as any).mep?.lifecycle ?? (window as any).__obsMep?.lifecycle;
+  if (!lifecycle || typeof lifecycle.onElementChanged !== "function") return;
+  const linearMepTypes = ["duct", "pipe", "cable-tray", "conduit"];
+  const mepElements = elements.filter(el => linearMepTypes.includes(el.type));
+  const familyService = (ctx.features as any).family;
+  const familyConnectorInstances = elements.flatMap(el => {
+    if (!el.familyId || linearMepTypes.includes(el.type) || typeof familyService?.get !== "function") return [];
+    try {
+      const family = familyService.get(el.familyId);
+      return Array.isArray(family?.connectorDefs) && family.connectorDefs.length
+        ? [{ element: el, definitions: family.connectorDefs }]
+        : [];
+    } catch (e) {
+      console.warn("[mep] family connector lookup failed", el.id, e);
+      return [];
+    }
+  });
+  const currentIds = new Set([
+    ...mepElements.map(el => el.id),
+    ...familyConnectorInstances.map(item => item.element.id),
+  ]);
+  for (const oldId of lastMepAuthoringIds) {
+    if (!currentIds.has(oldId)) {
+      try { lifecycle.onElementChanged(oldId, []); } catch (e) { console.warn("[mep] deleted element reconciliation failed", oldId, e); }
+    }
+  }
+  for (const el of mepElements) {
+    // Stored run ports (start/end) come from the pure derivation in
+    // stored-connectors.ts — one source of truth with adoption and the
+    // system tree. Null = degenerate run: skip the lifecycle call
+    // entirely, so an empty port list cannot drop its existing edges.
+    const connectors = deriveRunConnectors(el as unknown as MepLike);
+    if (!connectors) continue;
+    try { lifecycle.onElementChanged(el.id, connectors); }
+    catch (e) { console.warn("[mep] authored geometry reconciliation failed", el.id, e); }
+  }
+  for (const item of familyConnectorInstances) {
+    const { element: el, definitions } = item;
+    // Use the actual rendered root: createMesh() has already applied the
+    // instance translation, rotation pivot and quaternion at this point.
+    const instanceObject = group.children.find(child => child.userData?.elementId === el.id);
+    if (!instanceObject) {
+      // Do not clear valid connections because a renderable instance is not
+      // available during this rebuild (for example, while a family is loading).
+      console.warn("[mep] family connector sync skipped: rendered instance not found", el.id);
+      continue;
+    }
+    try {
+      const connectors = deriveFamilyInstanceConnectors(el.id, definitions, instanceObject);
+      lifecycle.onElementChanged(el.id, connectors);
+    } catch (e) {
+      console.warn("[mep] family connector reconciliation failed", el.id, e);
+    }
+  }
+  // Stored connector semantics: adopt port-to-port edges for runs whose
+  // ends coincide, once, idempotently. Runs keep their stored edges
+  // across edits (the lifecycle revalidates them); a run end on another
+  // run's body gets no edge and is reported as an unadopted contact
+  // instead of silently counting as connected. Guarded: adoption must
+  // never break the authoring rebuild.
+  try {
+    const mepLike = elements.filter(el =>
+      linearMepTypes.includes(el.type) || el.type === "fitting" || el.type === "equipment") as unknown as MepLike[];
+    const sync = syncStoredConnections(mepLike, lifecycle);
+    for (const u of sync.unadopted) {
+      if (u.reason === "incompatible-ports") console.warn("[mep] unadopted contact: " + u.detail);
+    }
+    for (const f of sync.failed) {
+      console.warn("[mep] stored connection rejected: " + f.quad.sourceElementId + ":" + f.quad.sourceConnector + " ↔ " + f.quad.targetElementId + ":" + f.quad.targetConnector + " — " + f.error);
+    }
+  } catch (e) {
+    console.warn("[mep] stored-connection adoption failed", e);
+  }
+  lastMepAuthoringIds = currentIds;
+}
+
+function applySelection() {
+  for (const child of group.children) {
+    child.traverse((m: any) => {
+      if (!m.isMesh) return;
+      const mat = m.material as THREE.MeshLambertMaterial;
+      if (!mat?.color) return;
+      const id = m.userData.elementId;
+      mat.color.set(id && selectedIds.has(id) ? "#2563eb" : m.userData.baseColor ?? "#cccccc");
+    });
+  }
+  refreshEditor();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Grips
+// ═══════════════════════════════════════════════════════════════════════════
+function clearGrips() {
+  while (gripGroup.children.length) {
+    const ch = gripGroup.children[0];
+    gripGroup.remove(ch);
+    disposeObj(ch);
+  }
+}
+
+function gripMaterial(): THREE.MeshBasicMaterial {
+  return new THREE.MeshBasicMaterial({ color: GRIP_COLOR, depthTest: false, transparent: true, opacity: 0.95 });
+}
+
+function buildGripsFor(el: AuthoredElement): GripSpec[] {
+  const grips: GripSpec[] = [];
+  const p = el.params;
+
+  const addGrip = (kind: GripSpec["kind"], pos: THREE.Vector3, vertexIndex?: number, footprintGrip?: FootprintGrip, edgeIndex?: number) => {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(GRIP_SIZE, 12, 10), gripMaterial());
+    mesh.position.copy(pos);
+    mesh.renderOrder = 900;
+    mesh.userData.gripElementId = el.id;
+    mesh.userData.gripKind = kind;
+    if (vertexIndex !== undefined) mesh.userData.gripVertexIndex = vertexIndex;
+    if (footprintGrip) mesh.userData.gripFootprint = footprintGrip;
+    if (edgeIndex !== undefined) mesh.userData.gripEdgeIndex = edgeIndex;
+    gripGroup.add(mesh);
+    grips.push({ elementId: el.id, kind, vertexIndex, footprintGrip, edgeIndex, position: pos.clone(), mesh });
+  };
+
+  /** Engine grips use distinct shapes + colors so each handle is recognisable. */
+  const addEngineGrip = (g: { kind: EngineGripKind; position: [number, number]; edgeIndex?: number }, groundY: number) => {
+    let geo: THREE.BufferGeometry;
+    let color: number = GRIP_COLOR;
+    switch (g.kind) {
+      case "move":
+        geo = new THREE.OctahedronGeometry(GRIP_SIZE * 1.25, 0);
+        color = 0x22d3ee; // cyan diamond — whole-object move
+        break;
+      case "rotate":
+        geo = new THREE.TorusGeometry(GRIP_SIZE * 1.3, GRIP_SIZE * 0.4, 8, 18);
+        color = 0xf59e0b; // amber ring — plan rotation
+        break;
+      case "scale":
+        geo = new THREE.OctahedronGeometry(GRIP_SIZE * 1.1, 0);
+        color = 0xec4899; // pink diamond — uniform scale
+        break;
+      case "height":
+        geo = new THREE.ConeGeometry(GRIP_SIZE * 0.9, GRIP_SIZE * 1.8, 10);
+        color = 0x34d399; // green cone — extrusion height
+        break;
+      case "elevation":
+        geo = new THREE.CylinderGeometry(GRIP_SIZE * 0.7, GRIP_SIZE * 0.7, GRIP_SIZE * 1.6, 10);
+        color = 0xfb923c; // orange cylinder — base elevation
+        break;
+      case "edge":
+        geo = new THREE.BoxGeometry(GRIP_SIZE * 1.4, GRIP_SIZE * 1.4, GRIP_SIZE * 1.4);
+        color = 0xa78bfa; // violet box — whole-edge move
+        break;
+      default:
+        geo = new THREE.SphereGeometry(GRIP_SIZE, 12, 10);
+    }
+    const mat = new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.95 });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(g.position[0], groundY, g.position[1]);
+    mesh.renderOrder = 900;
+    mesh.userData.gripElementId = el.id;
+    mesh.userData.gripKind = g.kind;
+    if (g.edgeIndex !== undefined) {
+      mesh.userData.gripEdgeIndex = g.edgeIndex;
+      grips.push({ elementId: el.id, kind: g.kind, edgeIndex: g.edgeIndex, position: mesh.position.clone(), mesh });
+    } else {
+      grips.push({ elementId: el.id, kind: g.kind, position: mesh.position.clone(), mesh });
+    }
+    gripGroup.add(mesh);
+  };
+
+  if (p.start && p.end) {
+    addGrip("start", new THREE.Vector3(p.start[0], p.elevation, p.start[1]));
+    addGrip("end", new THREE.Vector3(p.end[0], p.endElevation ?? p.elevation, p.end[1]));
+  } else if (p.point) {
+    addGrip("point", new THREE.Vector3(p.point[0], p.elevation, p.point[1]));
+    // Point-authored solids use thickness as their X footprint dimension
+    // (columns, footings and equipment); vertical openings use width.
+    // Keep grips bound to the exact parameters consumed by createMeshBase.
+    const widthKey = el.type === "vertical-opening" ? "width" : "thickness";
+    const width = Number(p[widthKey] ?? p.thickness ?? p.width ?? 0.3);
+    const depth = Number(p.depth ?? p.thickness ?? width);
+    const footprint = pointFootprintHandles({ point: [p.point[0], p.point[1]], width, depth });
+    for (const h of footprint) addGrip("point-footprint", new THREE.Vector3(h.point[0], p.elevation, h.point[1]), undefined, h.grip);
+  } else if (p.polygon) {
+    const polygon = p.polygon;
+    polygon.forEach((v, i) => {
+      const next = polygon[(i + 1) % polygon.length];
+      addGrip("vertex", new THREE.Vector3(v[0], p.elevation, v[1]), i);
+      // Mid-edge grips let users pull a new boundary point out of an edge.
+      addGrip("edge-midpoint", new THREE.Vector3((v[0] + next[0]) / 2, p.elevation, (v[1] + next[1]) / 2), i);
+    });
+  }
+
+  if ((el.type === "door" || el.type === "window") && el.hostId) {
+    const host = elements.find((e) => e.id === el.hostId);
+    if (host?.params.start && host?.params.end) {
+      const [ax, az] = host.params.start;
+      const [bx, bz] = host.params.end;
+      const dx = bx - ax, dz = bz - az;
+      const L = Math.hypot(dx, dz);
+      if (L > 0.01) {
+        const off = p.offsetAlongHost ?? L / 2;
+        const sill = p.sillHeight ?? 0;
+        const pos = new THREE.Vector3(
+          ax + (dx / L) * off,
+          host.params.elevation + sill + p.height / 2,
+          az + (dz / L) * off,
+        );
+        addGrip("hosted-offset", pos);
+      }
+    }
+  }
+
+  // Universal 3D Grips engine — move / rotate / scale / height / elevation /
+  // edge grips for every category whose parameters carry editable geometry.
+  // Door/window keep the hosted-offset grip only (host-driven placement).
+  if (el.type !== "door" && el.type !== "window") {
+    const engineParams: GripParams = {
+      start: p.start as [number, number] | undefined,
+      end: p.end as [number, number] | undefined,
+      polygon: p.polygon as [number, number][] | undefined,
+      point: p.point as [number, number] | undefined,
+      height: p.height,
+      elevation: p.elevation,
+    };
+    try {
+      for (const g of planGrips(engineParams)) {
+        const y = g.kind === "height" && Number(p.height) > 0
+          ? p.elevation + Number(p.height)
+          : p.elevation;
+        addEngineGrip(g, y + 0.02);
+      }
+    } catch (err) {
+      console.warn("[authoring] grip planning failed", el.id, err);
+    }
+  }
+  return grips;
+}
+
+function refreshGrips() {
+  clearGrips();
+  if (activeTool !== "select") return;
+  // Wall-handles module owns the visual for wall-like types when it is active.
+  // openbim-fix: authoring.ts -- require the wall-handles overlay to be live
+  const handlesActive = (window as any).__obsWallHandlesActive === true
+    && !!document.getElementById("obs-wall-handles")?.isConnected;
+  const skip = handlesActive
+    ? new Set(["wall", "beam", "duct", "pipe", "cable-tray", "conduit", "strip", "mline"])
+    : null;
+  for (const el of elements) {
+    if (!selectedIds.has(el.id)) continue;
+    if (skip && skip.has(el.type)) continue;
+    buildGripsFor(el);
+  }
+}
+
+function gripAt(e: MouseEvent): GripSpec | null {
+  if (!gripGroup.children.length) return null;
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(ndcOf(e), ctx.world.camera.three);
+  const hits = ray.intersectObjects(gripGroup.children, false);
+  if (!hits.length) return null;
+  const mesh = hits[0].object as THREE.Mesh;
+  const id = mesh.userData.gripElementId as string;
+  const kind = mesh.userData.gripKind as GripSpec["kind"];
+  const vi = mesh.userData.gripVertexIndex as number | undefined;
+  const footprintGrip = mesh.userData.gripFootprint as FootprintGrip | undefined;
+  const edgeIndex = mesh.userData.gripEdgeIndex as number | undefined;
+  return { elementId: id, kind, vertexIndex: vi, footprintGrip, edgeIndex, position: mesh.position.clone(), mesh };
+}
+
+function startGripDrag(g: GripSpec, worldPt: THREE.Vector3, pointerY?: number) {
+  const el = elements.find((e) => e.id === g.elementId);
+  if (!el) return;
+  const engineKind = g.kind === "move" || g.kind === "rotate" || g.kind === "height"
+    || g.kind === "elevation" || g.kind === "edge" || g.kind === "scale";
+  // Capture the stretch axis (fixed opposite endpoint → gripped endpoint) so
+  // Shift can lock the drag to the element's length for the whole gesture.
+  let axis: AxisLock | null = null;
+  if (g.kind === "start" || g.kind === "end") {
+    const p = el.params;
+    const fixedArr = g.kind === "start" ? p.end : p.start;
+    const curArr = g.kind === "start" ? p.start : p.end;
+    if (fixedArr && curArr) {
+      axis = makeAxisLock({ x: fixedArr[0], z: fixedArr[1] }, { x: curArr[0], z: curArr[1] });
+    }
+  }
+  const mepBase = (g.kind === "start" || g.kind === "end") && LINEAR_MEP.has(el.type) ? snapshotMepParams(el) : null;
+  let follow: Array<{ id: string; key: "start" | "end"; before: any }> | null = null;
+  if ((g.kind === "start" || g.kind === "end") && FOLLOW_LINEAR.has(el.type)) {
+    const js = joinedEnds(elements as any, el as any, g.kind);
+    if (js.length) follow = js.map((j) => ({ ...j, before: JSON.parse(JSON.stringify(elements.find((q) => q.id === j.id)!.params)) }));
+  }
+  // The snap result left over from hovering is the grip's own position; using it would pin the drag in place.
+  lastSnapValid = false; lastSnapResult = null; lastSnapEvent = null;
+  // Engine drags: capture vertical + angular baselines for height/elevation/rotate/scale.
+  let startScalar: number | undefined;
+  let startAngle: number | undefined;
+  if (engineKind) {
+    const c = gripCentre(el.params as GripParams);
+    if (g.kind === "height") startScalar = Number(el.params.height) || 0;
+    else if (g.kind === "elevation") startScalar = Number(el.params.elevation) || 0;
+    else if (g.kind === "rotate" && c) {
+      startScalar = Math.hypot(worldPt.x - c[0], worldPt.z - c[1]);
+      startAngle = Math.atan2(worldPt.z - c[1], worldPt.x - c[0]);
+    } else if (g.kind === "scale" && c) {
+      startScalar = Math.hypot(worldPt.x - c[0], worldPt.z - c[1]);
+    }
+  }
+  gripDrag = {
+    mepBase,
+    follow,
+    grip: g,
+    snapshot: JSON.parse(JSON.stringify(el.params)),
+    original: worldPt.clone(),
+    axis,
+    shiftLock: false,
+    startPointerY: pointerY,
+    startScalar,
+    startAngle,
+    lastWarning: null,
+    engine: engineKind,
+  };
+  // AccuDraw numeric entry works during grip drags too: typing a distance
+  // while dragging constrains the dragged point precisely (groundPoint →
+  // accuDraw.constrain), matching the drawing-tool behavior.
+  try { accuDraw.begin(worldPt.clone()); } catch { /* */ }
+}
+
+/** World units per screen pixel at a world position — vertical grip drag scaling. */
+function worldPerPixelAt(worldPos: THREE.Vector3): number {
+  try {
+    const cam = ctx.world.camera.three;
+    const host = ctx.rightHost;
+    const h = host.clientHeight || 800;
+    if ((cam as any).isOrthographicCamera) {
+      return Math.abs(((cam.top as number) - (cam.bottom as number)) / ((cam as any).zoom || 1)) / h;
+    }
+    const fovY = THREE.MathUtils.degToRad((cam as any).fov ?? 60);
+    const dist = Math.max(0.1, cam.position.distanceTo(worldPos));
+    return (2 * dist * Math.tan(fovY / 2)) / h;
+  } catch { return 0.01; }
+}
+
+/** Merge engine result geometry keys back into live element params. */
+function mergeEngineResult(p: AuthoredElement["params"], r: { params: GripParams }): void {
+  if (r.params.start) p.start = r.params.start;
+  if (r.params.end) p.end = r.params.end;
+  if (r.params.point) p.point = r.params.point;
+  if (r.params.polygon) p.polygon = r.params.polygon as Vec2[];
+  if (r.params.height !== undefined) p.height = r.params.height;
+  if (r.params.elevation !== undefined) p.elevation = r.params.elevation;
+}
+
+function updateGripDrag(worldPt: THREE.Vector3, shiftKey = false, pointerY?: number) {
+  if (!gripDrag) return;
+  const el = elements.find((e) => e.id === gripDrag!.grip.elementId);
+  if (!el) return;
+  const p = el.params;
+  let x = snap(worldPt.x);
+  let z = snap(worldPt.z);
+  const { kind, vertexIndex, footprintGrip, edgeIndex } = gripDrag.grip;
+  gripDrag.lastPointerWorld = worldPt.clone();
+  if (pointerY !== undefined) {
+    if (gripDrag.startPointerY === undefined) gripDrag.startPointerY = pointerY;
+  }
+
+  // ⇧ axis lock — the endpoint may only slide along the element's own length
+  // axis (perpendicular direction locked), so the element stretches/shrinks
+  // in place instead of drifting sideways.
+  let axisLocked = false;
+  if (gripDrag.axis && shiftKey && (kind === "start" || kind === "end")) {
+    const proj = projectOnAxis(gripDrag.axis, { x: worldPt.x, z: worldPt.z });
+    const t = snap(proj.t);
+    x = gripDrag.axis.ox + gripDrag.axis.dx * t;
+    z = gripDrag.axis.oz + gripDrag.axis.dz * t;
+    axisLocked = true;
+    gripDrag.smartSnap = null;
+    try { snapFeedback.hide(); } catch { /* */ }
+  }
+  gripDrag.shiftLock = axisLocked;
+
+  // ── Universal 3D Grips engine kinds (move/rotate/height/elevation/edge/scale) ──
+  // Edits flow through the pure engine, which validates input and rejects
+  // degenerate results with explicit warnings instead of silent loss.
+  // Every frame re-applies the TOTAL edit to the PRE-DRAG snapshot
+  // (idempotent, reversible mid-drag) — never to the already-edited params,
+  // which would compound rotate/scale/move per pointer event.
+  if (gripDrag.engine) {
+    const engineOpts: import("../modules/grips/grips-engine").ApplyGripOpts = { target: [x, z] };
+    if (kind === "height" && gripDrag.startPointerY !== undefined && pointerY !== undefined) {
+      // Vertical drag: pointer up → taller (screen-Y delta × world-per-pixel).
+      const wpp = worldPerPixelAt(gripDrag.original);
+      engineOpts.height = (gripDrag.startScalar ?? 0) + (gripDrag.startPointerY - pointerY) * wpp;
+    } else if (kind === "elevation" && gripDrag.startPointerY !== undefined && pointerY !== undefined) {
+      const wpp = worldPerPixelAt(gripDrag.original);
+      engineOpts.elevation = (gripDrag.startScalar ?? 0) + (gripDrag.startPointerY - pointerY) * wpp;
+    } else if (kind === "rotate" && gripDrag.startAngle !== undefined) {
+      const c = gripCentre(gripDrag.snapshot as GripParams);
+      if (c) engineOpts.angleRad = Math.atan2(worldPt.z - c[1], worldPt.x - c[0]) - gripDrag.startAngle;
+    }
+    if (kind === "edge") engineOpts.edgeIndex = edgeIndex;
+    let result: import("../modules/grips/grips-engine").GripEditResult | null = null;
+    try {
+      result = applyEngineGrip(kind as EngineGripKind, gripDrag.snapshot as GripParams, engineOpts);
+    } catch (err) {
+      console.warn("[authoring] engine grip failed", kind, err);
+      result = null;
+    }
+    if (result) {
+      mergeEngineResult(p, result);
+      if (result.warnings.length && result.warnings[0] !== gripDrag.lastWarning) {
+        gripDrag.lastWarning = result.warnings[0];
+        notify("warn", result.warnings.join(" "));
+      }
+    }
+    // Fall through to the shared rebuild below (parametric regeneration).
+  } else if (kind === "hosted-offset" && el.hostId) {
+    const host = elements.find((e) => e.id === el.hostId);
+    if (host?.params.start && host?.params.end) {
+      const [ax, az] = host.params.start;
+      const [bx, bz] = host.params.end;
+      const dx = bx - ax, dz = bz - az;
+      const L = Math.hypot(dx, dz);
+      if (L > 0.01) {
+        const t = ((worldPt.x - ax) * dx + (worldPt.z - az) * dz) / (L * L);
+        const half = (p.width ?? 0.9) / 2;
+        const clamped = Math.max(half, Math.min(L - half, t * L));
+        p.offsetAlongHost = snap(clamped, 0.05);
+      }
+    }
+  } else if ((kind === "start" || kind === "end") && (p.start || p.end) && el.type === "wall" && !axisLocked) {
+    // Smart Snap & Perpendicular Link — magnetize wall endpoint to column face
+    // (skipped while Shift axis-locks the drag to the element's own length).
+    let sx = x, sz = z;
+    gripDrag.smartSnap = null;
+    try {
+      const fixedArr = kind === "end" ? p.start : p.end;
+      if (fixedArr) {
+        const fixed = { x: fixedArr[0], z: fixedArr[1] };
+        const free = { x, z };
+        const faces = [];
+        for (const other of elements) {
+          if ((other.type !== "column" && other.type !== "footing") || !other.params.point) continue;
+          const [cx, cz] = other.params.point as [number, number];
+          const t = (other.params.thickness as number) ?? 0.3;
+          const d = (other.params.depth as number) ?? t;
+          faces.push(...rectColumnFaces(other.id, { x: cx, z: cz }, t, d));
+        }
+        if (faces.length) {
+          const cam: any = ctx.world?.camera?.three;
+          const host = ctx.rightHost;
+          const at = new THREE.Vector3(x, (p.elevation as number) ?? 0, z);
+          let radius = 0.15;
+          if (cam && host) {
+            const isOrtho = !!cam.isOrthographicCamera;
+            const dist = cam.position.distanceTo(at);
+            const fovY = THREE.MathUtils.degToRad(cam.fov ?? 60);
+            const orthoH = isOrtho
+              ? Math.abs((cam.top - cam.bottom) / (cam.zoom || 1))
+              : 10;
+            radius = smartSnapRadiusWorld({
+              isOrtho,
+              distance: dist,
+              fovY,
+              orthoHeight: orthoH,
+              viewportHeightPx: host.clientHeight || 800,
+            });
+          }
+          const hit = evaluateSmartPerpSnap(fixed, free, faces, radius);
+          if (hit) {
+            sx = hit.attach.x;
+            sz = hit.attach.z;
+            gripDrag.smartSnap = hit;
+            snapFeedback.show(hit, fixed, (p.elevation as number) ?? 0);
+          } else {
+            snapFeedback.hide();
+          }
+        } else {
+          snapFeedback.hide();
+        }
+      }
+    } catch {
+      try { snapFeedback.hide(); } catch { /* */ }
+    }
+    if (kind === "start" && p.start) p.start = [sx, sz];
+    else if (kind === "end" && p.end) p.end = [sx, sz];
+  } else if (kind === "start" && p.start) p.start = [x, z];
+  else if (kind === "end" && p.end) p.end = [x, z];
+  else if (kind === "point" && p.point) p.point = [x, z];
+  else if (kind === "point-footprint" && p.point && footprintGrip) {
+    const base = gripDrag.snapshot;
+    const widthKey = el.type === "vertical-opening" ? "width" : "thickness";
+    const baseWidth = Number(base[widthKey] ?? base.thickness ?? base.width ?? 0.3);
+    const resized = resizePointFootprint({
+      point: [Number(base.point?.[0] ?? p.point[0]), Number(base.point?.[1] ?? p.point[1])],
+      width: baseWidth,
+      depth: Number(base.depth ?? base.thickness ?? baseWidth),
+    }, footprintGrip, [x, z]);
+    if (resized) {
+      p.point = resized.point;
+      p[widthKey] = resized.width;
+      p.depth = resized.depth;
+    }
+  } else if ((kind === "vertex" || kind === "edge-midpoint") && p.polygon && vertexIndex !== undefined) {
+    const basePolygon = (gripDrag.snapshot as any).polygon as [number, number][] | undefined;
+    const source = basePolygon ?? p.polygon;
+    const candidate = source.map((v: [number, number]) => [...v] as [number, number]);
+    if (kind === "vertex") candidate[vertexIndex] = [x, z];
+    else candidate.splice(vertexIndex + 1, 0, [x, z]);
+    // Invalid edits retain the last valid geometry; midpoint drags insert a
+    // real vertex only once the proposed boundary is valid.
+    if (isValidBoundary(candidate)) p.polygon = candidate;
+    else p.polygon = source.map((v: [number, number]) => [...v] as [number, number]);
+  }
+
+  // Magnetic join: a dragged end of a wall/beam/strip/duct/pipe/tray/conduit locks onto a nearby free end of
+  // another element of the same type (never one of its own joined neighbours).
+  if ((kind === "start" || kind === "end") && (p as any)[kind]) {
+    const mg = magnetSameTypeEnd(elements as any, el.type, (p as any)[kind], 0.3, [el.id, ...(gripDrag.follow ?? []).map((f) => f.id)]);
+    if (mg) (p as any)[kind] = mg;
+  }
+  // Joined neighbours keep their touching end on the dragged end.
+  if (gripDrag.follow && (kind === "start" || kind === "end") && (p as any)[kind]) {
+    for (const f of gripDrag.follow) {
+      const o = elements.find((q) => q.id === f.id);
+      if (o) (o.params as any)[f.key] = [...(p as any)[kind]] as [number, number];
+    }
+  }
+
+  // MEP run end dragged: connected fittings follow live and neighbouring runs stretch with them.
+  // Re-planned from the pre-drag state each frame, so it is idempotent and reversible mid-drag.
+  if (gripDrag.mepBase && (kind === "start" || kind === "end")) {
+    for (const [id, params] of gripDrag.mepBase) {
+      const o = elements.find((q) => q.id === id);
+      if (o && o !== el) o.params = JSON.parse(JSON.stringify(params));
+    }
+    el.params = gripDrag.snapshot;
+    const ups = planMepStretch(elements as any, el.id, { start: p.start, end: p.end });
+    el.params = p;
+    for (const u of ups) { const o = elements.find((q) => q.id === u.id); if (o && o !== el) Object.assign(o.params, u.patch); }
+  }
+
+  while (group.children.length) {
+    const ch = group.children[0];
+    group.remove(ch);
+    disposeObj(ch);
+  }
+  for (const e2 of elements) {
+    if (e2.type !== "wall") continue;
+    const m = createMesh(e2);
+    if (m) group.add(m);
+  }
+  for (const e2 of elements) {
+    if (e2.type === "wall") continue;
+    const m = createMesh(e2);
+    if (m) group.add(m);
+  }
+  applySelection();
+}
+
+function endGripDrag() {
+  if (!gripDrag) return;
+  try { accuDraw.end(); } catch { /* */ }
+  const el = elements.find((e) => e.id === gripDrag!.grip.elementId);
+  const before = gripDrag.snapshot;
+  const after = el ? JSON.parse(JSON.stringify(el.params)) : null;
+  const smart = gripDrag.smartSnap ?? null;
+  const mepBase = gripDrag.mepBase ?? null;
+  const followed = gripDrag.follow ?? null;
+  const which = gripDrag.grip.kind === "start" || gripDrag.grip.kind === "end"
+    ? gripDrag.grip.kind
+    : null;
+  gripDrag = null;
+  try { snapFeedback.hide(); } catch { /* */ }
+  if (!el || !after) return;
+  if (JSON.stringify(before) === JSON.stringify(after)) return;
+
+  // IFC metadata sync: mark the source archive's dimension fields as
+  // native-modified for every param key the grip edit changed (same policy
+  // as palette edits via applyElementParamChange).
+  if (el.sourceArchive) {
+    try {
+      for (const k of Object.keys(after)) {
+        if (JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k])) {
+          markNativeDimensionModified(el.sourceArchive, k);
+        }
+      }
+    } catch (err) {
+      console.warn("[authoring] grip source-archive sync failed", el.id, err);
+    }
+  }
+
+  if (mepBase) {
+    mepBase.set(el.id, before); // pre-drag state of the dragged run itself
+    pushMepParamsHistory(`Move grip · ${el.name}`, mepBase, snapshotMepParams(el));
+    notifyAuthoringChange(); // lets the elbow healer re-trim the runs to the moved fittings
+  } else {
+    const fAfter = (followed ?? []).map((f) => ({ id: f.id, before: f.before, after: JSON.parse(JSON.stringify(elements.find((q) => q.id === f.id)?.params ?? f.before)) }));
+    const setF = (k: "before" | "after") => { for (const f of fAfter) { const o = elements.find((q) => q.id === f.id); if (o) o.params = JSON.parse(JSON.stringify(f[k])); } };
+    history.push({
+      label: `Move grip · ${el.name}`,
+      apply: () => { el.params = JSON.parse(JSON.stringify(after)); setF("after"); rebuild(); markDirty(); },
+      revert: () => { el.params = JSON.parse(JSON.stringify(before)); setF("before"); rebuild(); markDirty(); },
+    });
+  }
+  markDirty();
+  // Properties panel + dependent UIs stay in sync with the grip edit.
+  notifyAuthoringChange();
+
+  // Persist wall–column link when the grip ended on a smart face/corner snap.
+  if (smart && which && el.type === "wall" && el.params.start && el.params.end) {
+    try {
+      const fakeSnap: import("./snapping").SnapResult = {
+        point: new THREE.Vector3(smart.attach.x, (el.params.elevation as number) ?? 0, smart.attach.z),
+        type: smart.mode === "face" ? "face" : "corner",
+        screenDist: 0,
+        elementId: smart.columnId,
+        refKind: smart.mode === "face" ? "face" : "corner",
+      };
+      void recordSnapRelationships(el, fakeSnap);
+    } catch (err) {
+      console.warn("[authoring] smart-perp link commit failed", err);
+    }
+  }
+}
+
+/** Abort an in-flight grip drag: restore the pre-drag params exactly (Esc). */
+function cancelGripDrag(): void {
+  if (!gripDrag) return;
+  const el = elements.find((e) => e.id === gripDrag!.grip.elementId);
+  const snapshot = gripDrag.snapshot;
+  gripDrag = null;
+  try { accuDraw.end(); } catch { /* */ }
+  try { snapFeedback.hide(); } catch { /* */ }
+  if (!el) return;
+  el.params = JSON.parse(JSON.stringify(snapshot));
+  rebuild();
+  applySelection();
+  refreshGrips();
+}
+
+/**
+ * Commit a typed numeric value during a grip drag (Enter key).
+ * height/elevation → exact metres; rotate → exact degrees; scale → exact
+ * factor — all applied to the PRE-DRAG snapshot so the typed value is the
+ * total edit. Planar grips → exact distance along the drag direction via
+ * AccuDraw's constrain (typed buffer wins over the raw pointer).
+ */
+function commitGripNumeric(typed: string): void {
+  if (!gripDrag) return;
+  const kind = gripDrag.grip.kind;
+  const v = parseFloat(typed);
+  if (!Number.isFinite(v)) return;
+  if (kind === "height" || kind === "elevation" || kind === "rotate" || kind === "scale") {
+    const el = elements.find((e) => e.id === gripDrag!.grip.elementId);
+    if (!el) return;
+    const opts: import("../modules/grips/grips-engine").ApplyGripOpts =
+      kind === "height" ? { height: v }
+      : kind === "elevation" ? { elevation: v }
+      : kind === "rotate" ? { angleRad: THREE.MathUtils.degToRad(v) }
+      : { scaleFactor: v };
+    try {
+      const result = applyEngineGrip(kind, gripDrag.snapshot as GripParams, opts);
+      if (result) {
+        mergeEngineResult(el.params, result);
+        if (result.warnings.length) notify("warn", result.warnings.join(" "));
+      }
+    } catch (err) {
+      console.warn("[authoring] numeric grip commit failed", kind, err);
+    }
+    endGripDrag();
+    return;
+  }
+  const last = gripDrag.lastPointerWorld ?? gripDrag.original;
+  const precise = accuDraw.constrain(last.clone());
+  accuDraw.consumeTypedDistance();
+  updateGripDrag(precise, false);
+  endGripDrag();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Picking / ground — AccuDraw-aware
+// ═══════════════════════════════════════════════════════════════════════════
+function ndcOf(e: MouseEvent): THREE.Vector2 {
+  const rect = ctx.rightHost.getBoundingClientRect();
+  return new THREE.Vector2(
+    ((e.clientX - rect.left) / rect.width) * 2 - 1,
+    -((e.clientY - rect.top) / rect.height) * 2 + 1,
+  );
+}
+
+/** True when the object and all its ancestors are visible (rays ignore `visible`). */
+function visibleChain(o: THREE.Object3D | null): boolean {
+  for (let x: THREE.Object3D | null = o; x; x = x.parent) if (!x.visible) return false;
+  return true;
+}
+
+function elementAt(e: MouseEvent): string | null {
+  try {
+    if (!ctx.world?.camera?.three || !group.children.length) return null;
+    const ray = new THREE.Raycaster();
+    ray.params.Line = { threshold: 0.15 };
+    ray.params.Points = { threshold: 0.2 };
+    ray.setFromCamera(ndcOf(e), ctx.world.camera.three);
+    // Edit-tab "Select Pinned" OFF → pinned elements are skipped for every
+    // authored pick (selection, host picking,Modify tools) — BIM semantics.
+    const allowPinned = getSelectionPrefs().pinned;
+    // Prefer authored group; include nested meshes
+    const hits = ray.intersectObjects(group.children, true);
+    for (const h of hits) {
+      if (!visibleChain(h.object)) continue;
+      let o: THREE.Object3D | null = h.object;
+      while (o) {
+        if (o.userData?.elementId) {
+          const id = String(o.userData.elementId);
+          const authoredElement = elements.find((x) => String(x.id) === id);
+          if (authoredElement && !selection.matchesAuthoredCategoryFilter(authoredElement.type, authoredElement.properties as any)) {
+            o = o.parent;
+            continue;
+          }
+          if (!allowPinned) {
+            const el = elements.find((x) => String((x as any).id) === id) as any;
+            if (el?.properties?.pinned) {
+              o = o.parent;
+              continue;
+            }
+          }
+          return id;
+        }
+        o = o.parent;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function wallAtPoint(e: MouseEvent): { wallId: string; offset: number; point: THREE.Vector3 } | null {
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(ndcOf(e), ctx.world.camera.three);
+  const hits = ray.intersectObjects(group.children, true);
+  for (const h of hits) {
+    if (!visibleChain(h.object)) continue;
+    let o: THREE.Object3D | null = h.object;
+    let elId: string | null = null;
+    while (o && !elId) { elId = o.userData?.elementId ?? null; o = o.parent; }
+    if (!elId) continue;
+    const el = elements.find((e) => e.id === elId);
+    if (!el || el.type !== "wall" || !el.params.start || !el.params.end) continue;
+    const [ax, az] = el.params.start;
+    const [bx, bz] = el.params.end;
+    const dx = bx - ax, dz = bz - az;
+    const L = Math.hypot(dx, dz);
+    if (L < 0.05) continue;
+    const t = ((h.point.x - ax) * dx + (h.point.z - az) * dz) / (L * L);
+    const offset = Math.max(0, Math.min(L, t * L));
+    return { wallId: el.id, offset, point: h.point.clone() };
+  }
+  return null;
+}
+
+
+/** Linear tools that use chain + reference-line guidance. */
+const LINEAR_CHAIN_TOOLS = new Set([
+  "wall", "curtain-wall", "beam", "strip", "mline",
+  "duct", "pipe", "cable-tray", "conduit",
+  "brace", "truss", "grid",
+]);
+
+function clearRefGuides(): void {
+  // Guides live in guideGroup (updateAlignmentGuides); keep API for tool reset.
+  try { clearGuides(); } catch { /* guideGroup may not exist yet */ }
+  refSnapActive = null;
+}
+
+/**
+ * Axis-aligned reference snap from prior chain corners.
+ * Helps close the 4th segment perpendicular to the first (all linear tools).
+ */
+function applyReferenceTracking(
+  p: THREE.Vector3,
+  base: THREE.Vector3 | null,
+): THREE.Vector3 {
+  extTrack = null;
+  if (!refLinesOn) { refSnapActive = null; return p; }
+  try {
+    const origins: THREE.Vector3[] = [];
+    const seen = new Set<string>();
+    const pushO = (v: THREE.Vector3 | null | undefined) => {
+      if (!v) return;
+      const k = `${v.x.toFixed(3)},${v.z.toFixed(3)}`;
+      if (seen.has(k)) return;
+      seen.add(k);
+      origins.push(v);
+    };
+    for (const c of chainCorners) pushO(c);
+    pushO(base);
+    if (!origins.length) {
+      refSnapActive = null;
+      return p;
+    }
+
+    const candidates: THREE.Vector3[] = [];
+    for (let i = 0; i < origins.length; i++) {
+      for (let j = 0; j < origins.length; j++) {
+        if (i === j) continue;
+        const a = origins[i], b = origins[j];
+        candidates.push(new THREE.Vector3(a.x, 0, b.z));
+        candidates.push(new THREE.Vector3(b.x, 0, a.z));
+      }
+    }
+    if (base && chainCorners.length) {
+      const o0 = chainCorners[0];
+      candidates.push(new THREE.Vector3(o0.x, 0, base.z));
+      candidates.push(new THREE.Vector3(base.x, 0, o0.z));
+      candidates.push(new THREE.Vector3(o0.x, 0, p.z));
+      candidates.push(new THREE.Vector3(p.x, 0, o0.z));
+    }
+
+    let best = p;
+    let bestD = REF_SNAP_TOL;
+    for (const c of candidates) {
+      if (!Number.isFinite(c.x) || !Number.isFinite(c.z)) continue;
+      const d = Math.hypot(c.x - p.x, c.z - p.z);
+      if (d < bestD) {
+        bestD = d;
+        best = c;
+      }
+    }
+    if (bestD < REF_SNAP_TOL) {
+      refSnapActive = best.clone();
+      return best.clone();
+    }
+    // Nothing from the chain corners: try lines from walls drawn earlier and squares to them.
+    if (base && activeTool && EXT_TOOLS.has(String(activeTool))) {
+      const hit = computeTracking([p.x, p.z], extTrackAnchors(String(activeTool), base), extTrackTolerance(p));
+      if (hit) {
+        extTrack = hit;
+        refSnapActive = new THREE.Vector3(hit.point[0], 0, hit.point[1]);
+        return refSnapActive.clone();
+      }
+    }
+    refSnapActive = null;
+    return p;
+  } catch {
+    refSnapActive = null;
+    return p;
+  }
+}
+
+/**
+ * Hold Shift while modeling → lock to perpendicular / ortho mode.
+ * - With a previous segment direction: nearest of parallel or perpendicular to it.
+ * - Otherwise (first segment): lock to nearest world X or Z axis from the base point.
+ * Uses e.shiftKey (reliable) rather than only AccuDraw's key-state flag.
+ */
+function applyShiftPerpendicular(
+  p: THREE.Vector3,
+  e: MouseEvent,
+  base: THREE.Vector3 | null,
+  prevDir: number | null,
+): THREE.Vector3 {
+  if (!e.shiftKey || !base) return p;
+  const dx = p.x - base.x;
+  const dz = p.z - base.z;
+  const len = Math.hypot(dx, dz);
+  if (len < 1e-6) return p;
+
+  if (prevDir != null && Number.isFinite(prevDir)) {
+    const ux = Math.cos(prevDir);
+    const uz = Math.sin(prevDir);
+    const px = -uz;
+    const pz = ux;
+    const along = dx * ux + dz * uz;
+    const across = dx * px + dz * pz;
+    if (Math.abs(along) >= Math.abs(across)) {
+      return new THREE.Vector3(base.x + along * ux, 0, base.z + along * uz);
+    }
+    return new THREE.Vector3(base.x + across * px, 0, base.z + across * pz);
+  }
+
+  if (Math.abs(dx) >= Math.abs(dz)) {
+    return new THREE.Vector3(base.x + dx, 0, base.z);
+  }
+  return new THREE.Vector3(base.x, 0, base.z + dz);
+}
+
+function groundPoint(e: MouseEvent): THREE.Vector3 | null {
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(ndcOf(e), ctx.world.camera.three);
+  const hits = ray.intersectObjects([ctx.groundPlane], false);
+  if (!hits.length) return null;
+
+  let p = hits[0].point.clone();
+  const snapResult = currentSnapForEvent(e);
+  if (snapResult) {
+    p = snapResult.point.clone();
+  } else {
+    p.x = snap(p.x, snapping.getGridSize());
+    p.z = snap(p.z, snapping.getGridSize());
+  }
+  p.y = 0;
+
+  try {
+    if (accuDraw.isActive()) p = accuDraw.constrain(p);
+  } catch { /* */ }
+
+  p = applyShiftPerpendicular(p, e, chainStart, chainStartDir);
+
+  // Reference-line tracking for all linear chain tools
+  try {
+    if (
+      (chainStart || chainCorners.length) &&
+      activeTool &&
+      LINEAR_CHAIN_TOOLS.has(String(activeTool))
+    ) {
+      p = applyReferenceTracking(p, chainStart);
+      p = applyParallelTracking(p, chainStart, activeTool);
+    }
+  } catch { /* never break picking */ }
+
+  return p;
+}
+
+/**
+ * The cached snap result, but only when it was computed for (nearly) the
+ * pointer position of `e`. The snap cache is updated asynchronously on
+ * hover (rAF-throttled), while clicks are dispatched synchronously — so
+ * at click time the cache may still hold a previous hover's result. Using
+ * it unconditionally lets an instant click commit the previous position.
+ * Returns null when there is no event, no valid result, or the result is
+ * stale for this pointer position; callers then fall back to grid snap
+ * of the ray hit at the actual click position.
+ */
+function currentSnapForEvent(e: MouseEvent | undefined | null): import("./snapping").SnapResult | null {
+  if (!e) return null;
+  if (!snapping.isEnabled() || !lastSnapValid || !lastSnapResult) return null;
+  if (!isSnapFreshForEvent(lastSnapEvent, { x: e.clientX, y: e.clientY })) return null;
+  return lastSnapResult;
+}
+
+async function updateSnapAsync(e: MouseEvent, cursorWorld: THREE.Vector3 | null) {
+  const gen = snapGeneration.next();
+  lastSnapValid = false;
+  lastSnapResult = null;
+  lastSnapEvent = null;
+  if (!snapping.isEnabled() || (snapping as any).isSuspended?.()) {
+    snapping.hideIndicator();
+    return;
+  }
+  try {
+    const s = await snapping.query(e, cursorWorld);
+    // A newer hover may have started while this query was in flight; a
+    // stale result must never overwrite the newer one.
+    if (!snapGeneration.isCurrent(gen)) return;
+    lastSnapResult = s;
+    lastSnapValid = !!s;
+    lastSnapEvent = s ? { x: e.clientX, y: e.clientY } : null;
+    snapping.showIndicator(s);
+  } catch {
+    if (!snapGeneration.isCurrent(gen)) return;
+    snapping.hideIndicator();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// History-wrapped mutations
+// ═══════════════════════════════════════════════════════════════════════════
+async function createElement(
+  type: ElementType,
+  params: Partial<AuthoredElement["params"]>,
+  props?: Record<string, unknown>,
+  hostId?: string,
+): Promise<AuthoredElement | null> {
+  const presetKey = activePreset && DEFAULTS[activePreset] ? activePreset : type;
+  const baseDefaults = DEFAULTS[presetKey] ?? DEFAULTS[type] ?? { height: 1, thickness: 0.2 };
+  const userDefaults = getTypeDefaults(type);
+  const displayName = activePreset
+    ? nextName(activePreset.replace(/-/g, " "))
+    : (userDefaults.name || nextName(type));
+
+  // openbim-family-placement: when a family is active, its resolved
+  // parameters take precedence over the hardcoded DEFAULTS so the type
+  // the user picked in the Family Browser actually drives the geometry
+  // of the element that gets placed.
+  let familyGeometry: Partial<AuthoredElement["params"]> = {};
+  if (activeFamilyId) {
+    try {
+      const famMod: any = (ctx.features as any).family;
+      const resolved = famMod?.resolveParams?.(activeFamilyId, activeFamilyTypeId, undefined);
+      if (resolved) {
+        const keys = ["height", "thickness", "width", "depth", "sillHeight", "frameThickness"];
+        for (const k of keys) {
+          const v = resolved[k];
+          if (typeof v === "number" && Number.isFinite(v)) {
+            (familyGeometry as any)[k] = v;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[authoring] family resolve failed", err);
+    }
+  }
+
+  const el: AuthoredElement = {
+    id: uid(),
+    type,
+    name: displayName,
+    color: userDefaults.color || COLORS[type] || COLORS[presetKey] || "#cccccc",
+    hostId,
+    levelId: activeLevelId ?? undefined,
+    // openbim-families:instance-wiring
+    familyId: activeFamilyId ?? undefined,
+    familyTypeId: activeFamilyTypeId ?? undefined,
+    params: {
+      height: baseDefaults.height,
+      thickness: baseDefaults.thickness,
+      elevation: level,
+      ...familyGeometry,
+      ...(baseDefaults.width !== undefined ? { width: baseDefaults.width } : {}),
+      ...userDefaults.params,
+      ...params,
+      ...((type === "wall" || type === "column" || type === "curtain-wall") && activeLevelId
+        ? (() => {
+            const lv = levels.find((l) => l.id === activeLevelId);
+            const elev = Number(params?.elevation ?? level) || 0;
+            if (!lv) return {};
+            const sorted = levels.slice().sort((a, b) => a.elevation - b.elevation);
+            const idx = sorted.findIndex((l) => l.id === lv.id);
+            const above = idx >= 0 ? sorted[idx + 1] : undefined;
+            const out: Record<string, unknown> = {
+              baseLevelId: lv.id,
+              baseOffset: +(elev - lv.elevation).toFixed(6),
+            };
+            // Multi-storey gap: walls span base → next level unless height was explicit
+            if (above && params?.height == null && userDefaults.params?.height == null) {
+              const span = Math.max(0.5, above.elevation - elev);
+              out.height = +span.toFixed(6);
+              out.topLevelId = above.id;
+              out.topOffset = 0;
+            }
+            return out;
+          })()
+        : {}),
+    },
+    properties: {
+      ...userDefaults.properties,
+      ...(activePreset ? { category: activePreset, family: activePreset } : {}),
+      ...(type === "curtain-wall"
+        ? {
+            system: "mullion-panel",
+            vDivisions: userDefaults.properties?.vDivisions ?? undefined,
+            hDivisions: userDefaults.properties?.hDivisions ?? undefined,
+            panelType: userDefaults.properties?.panelType ?? "glazed",
+            mullionProfile: userDefaults.properties?.mullionProfile ?? "rect",
+          }
+        : {}),
+      ...(props ?? {}),
+    },
+  };
+  const validation = validateNativeModel({ elements: [...elements, el], levels, grids })
+    .filter((diagnostic) => diagnostic.elementId === el.id && diagnostic.severity === "error");
+  if (validation.length) {
+    const details = validation.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`).join("\n");
+    window.dispatchEvent(new CustomEvent("obs-toast", {
+      detail: {
+        message: `Cannot create ${el.name}. Correct the placement or dimensions first.\n${details}`,
+        kind: "error",
+      },
+    }));
+    return null;
+  }
+
+  // K1 validation gate: the mesh this element would commit must pass the
+  // kernel validity gate before the element enters the model. The probe
+  // mesh is built (then disposed) so the gate sees the final geometry,
+  // including three-csg opening/reveal cuts — K4 gates those cuts at
+  // the source (general-kernel fallback; FAILED-TO-CUT quarantine +
+  // error toast on total failure); this gate covers their output.
+  // Calibration: only the unbuildable subset (empty mesh / non-finite
+  // geometry) refuses creation outright. Every other failure quarantines
+  // the element (recorded in the quarantine registry + warning toast)
+  // because the commit path legitimately produces non-solid meshes
+  // (imported native-twin tessellation, curtain-wall assemblies, hosted
+  // door/window parts) and no browser proof exists on this VM to
+  // allowlist solid-candidate builders — see validation-gate.ts.
+  try {
+    const probe = createMesh(el);
+    if (probe) {
+      try {
+        probe.updateMatrixWorld(true);
+        const probeMeshes: THREE.Mesh[] = [];
+        probe.traverse((o) => { if ((o as THREE.Mesh).isMesh) probeMeshes.push(o as THREE.Mesh); });
+        for (const pm of probeMeshes) {
+          const geo = pm.geometry as THREE.BufferGeometry | undefined;
+          const posAttr = geo?.getAttribute?.("position") as THREE.BufferAttribute | undefined;
+          if (!posAttr) continue;
+          const idxAttr = (geo?.getIndex?.() as THREE.BufferAttribute | null)?.array as ArrayLike<number> | null;
+          const indexed = threeGeometryToIndexedMesh(
+            posAttr.array as ArrayLike<number>,
+            idxAttr ?? null,
+            (pm.matrixWorld?.elements as unknown as ArrayLike<number> | undefined),
+          );
+          const verdict = gateSolid(indexed, `${el.type}:${el.id}`, { source: "authoring-commit", id: el.id });
+          if (verdict.verdict === "refused" && verdict.hardRefusal) {
+            window.dispatchEvent(new CustomEvent("obs-toast", {
+              detail: {
+                message: `Cannot create ${el.name}: the geometry failed validation (unbuildable).\n${summarizeGateDiagnostics(verdict.diagnostics)}`,
+                kind: "error",
+              },
+            }));
+            return null;
+          }
+          if (verdict.verdict !== "ok") {
+            window.dispatchEvent(new CustomEvent("obs-toast", {
+              detail: {
+                message: `${el.name}: geometry committed with a recorded validity warning (${verdict.errors.map((d) => d.code).join(", ")}). See diagnostics.`,
+                kind: "warning",
+              },
+            }));
+          }
+        }
+      } finally {
+        disposeObj(probe);
+      }
+    }
+  } catch (err) {
+    // Gate infrastructure failure (not a geometry verdict — those return
+    // above): fail closed rather than committing unvalidated geometry.
+    window.dispatchEvent(new CustomEvent("obs-toast", {
+      detail: {
+        message: `Cannot create ${el.name}: geometry validation failed (${err instanceof Error ? err.message : String(err)}).`,
+        kind: "error",
+      },
+    }));
+    return null;
+  }
+
+  await history.exec({
+    label: `Create ${cap(type)}`,
+    apply: () => {
+      if (!elements.includes(el)) elements.push(el);
+      rebuild();
+      markDirty();
+      if (type === "wall" || type === "curtain-wall") {
+        try { autoJoinNewWall(el); } catch (e) { console.warn("[join] autoJoinNewWall", e); }
+      }
+    },
+    revert: () => {
+      const i = elements.indexOf(el);
+      if (i >= 0) elements.splice(i, 1);
+      rebuild();
+      markDirty();
+    },
+  });
+  // G12 (b): element creation is a model change — notify so the open plan
+  // (and every other onAuthoringChange subscriber) refreshes on its own.
+  // The history mutation bus now notifies for every exec/push/undo/redo
+  // as well; this explicit call stays as belt-and-braces (the duplicate
+  // is coalesced by the subscribers).
+  notifyAuthoringChange();
+  return el;
+}
+
+function deleteElements(ids: string[]) {
+  // Review mode (differentiation item 8) is view-only.
+  if (isReviewMode()) {
+    notify("warn", "Review mode is view-only — add an issue instead of editing the model.");
+    return;
+  }
+  if (!ids.length) return;
+  const targets = elements.filter((e) => ids.includes(e.id));
+  if (!targets.length) return;
+
+  // Transitive host→child cascade for ANY host type (wall, beam, floor,
+  // curtain wall, ...): children referenced via hostId die with their host,
+  // transitively, cycle-safe. Replaces the old wall-only, 1-level-deep scan.
+  let cascade = new Set<string>(ids);
+  let cascadeSummary = "";
+  try {
+    const result = collectDeleteCascade(ids, elements as any);
+    cascade = new Set([...result.seeds.filter((id) => elements.some((e) => e.id === id)), ...result.dependents]);
+    cascadeSummary = result.summary;
+  } catch { /* cascade is best-effort; fall back to the seed set */ }
+
+  // Central worksharing: refusing any member of the delete cascade (host or
+  // hosted child) refuses the whole delete — deleting a host must not kill
+  // a borrowed child.
+  const refused = guardRefusals([...cascade]);
+  if (refused.length) {
+    toastGuardRefusals("delete", refused);
+    return;
+  }
+
+  if (cascadeSummary) {
+    try {
+      window.dispatchEvent(new CustomEvent("obs-toast", {
+        detail: { message: cascadeSummary, kind: "info" },
+      }));
+    } catch { /* toast is cosmetic */ }
+  }
+
+  const allTargets = elements.filter((e) => cascade.has(e.id));
+  const indices = allTargets.map((t) => elements.indexOf(t));
+
+  history.push({
+    label: i18nT("counts.deleteElements", { n: allTargets.length }),
+    apply: () => {
+      for (const t of allTargets) {
+        const i = elements.indexOf(t);
+        if (i >= 0) elements.splice(i, 1);
+      }
+      selectedIds.clear();
+      rebuild();
+      markDirty();
+    },
+    revert: () => {
+      const pairs = allTargets.map((t, i) => ({ t, idx: indices[i] })).sort((a, b) => a.idx - b.idx);
+      for (const { t, idx } of pairs) elements.splice(Math.min(idx, elements.length), 0, t);
+      rebuild();
+      markDirty();
+    },
+  });
+  for (const t of allTargets) {
+    const i = elements.indexOf(t);
+    if (i >= 0) elements.splice(i, 1);
+  }
+  selectedIds.clear();
+  rebuild();
+  markDirty();
+
+  paletteTarget = null;
+  notifyAuthoringChange();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Snap-derived persistent relationships + dependent propagation
+// (Design spec §4.3 commit, §5 magnetic behavior, §6 update-on-modify)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function snapRegistry(): any | null {
+  try {
+    const w = window as any;
+    return w.__obsRelationships?.registry ?? null;
+  } catch { return null; }
+}
+
+const dist2XZ = (ax: number, az: number, bx: number, bz: number) =>
+  (ax - bx) * (ax - bx) + (az - bz) * (az - bz);
+
+/**
+ * Called right after a draw-committed element. Converts the snap that
+ * produced the placement into persistent relationships:
+ *   • endpoint/corner snap onto another linear element → endpoint-constraint
+ *   • snap onto a column/footing face                  → wall-column
+ *     endpoint-constraint (via the wall-column module)
+ *   • connector snap (MEP)                             → mep-connection
+ */
+async function recordSnapRelationships(
+  el: AuthoredElement,
+  snap: import("./snapping").SnapResult | null,
+): Promise<void> {
+  try {
+    const registry = snapRegistry();
+    if (!registry || !snap || !snap.elementId || snap.elementId === el.id) return;
+    const z = (el.params.elevation ?? 0) as number;
+    const other = elements.find((x) => x.id === snap.elementId);
+    if (!other) return;
+
+    // 1) Wall/beam endpoint landing on another linear element's endpoint.
+    const linearTypes = new Set(["wall", "curtain-wall", "beam", "strip", "mline", "duct", "pipe", "cable-tray", "conduit"]);
+    if (
+      (snap.type === "endpoint" || snap.type === "corner") &&
+      linearTypes.has(other.type) && linearTypes.has(el.type) &&
+      other.params.start && other.params.end && el.params.start && el.params.end
+    ) {
+      registry.createRelationship({
+        type: "endpoint-constraint",
+        source: {
+          elementId: other.id,
+          kind: "endpoint",
+          position: [snap.point.x, snap.point.z, z],
+        },
+        target: {
+          elementId: el.id,
+          kind: "endpoint",
+          position: [snap.point.x, snap.point.z, z],
+        },
+        reconnection: "follow-source",
+        deletionPolicy: "break",
+        origin: "automatic",
+      });
+      return;
+    }
+
+    // 2) Linear element ending on a column / isolated footing face.
+    if (
+      el.params.start && el.params.end &&
+      (other.type === "column" || other.type === "footing") &&
+      other.params.point
+    ) {
+      const t = other.params.thickness ?? 0.3;
+      const d = other.params.depth ?? t;
+      const [cx, cz] = other.params.point;
+      const baseZ = other.params.elevation ?? 0;
+      const topZ = baseZ + (other.params.height ?? 3);
+      const wc = await import("../modules/snapping/wall-column");
+      const footprint: Array<[number, number]> = [
+        [cx - t / 2, cz - d / 2], [cx + t / 2, cz - d / 2],
+        [cx + t / 2, cz + d / 2], [cx - t / 2, cz + d / 2],
+      ];
+      const colRef = wc.getColumnReferenceGeometry({
+        elementId: other.id, footprint, baseZ, topZ,
+      });
+      const justificationMap: Record<string, "core-centerline" | "finish-face-exterior" | "finish-face-interior"> = {
+        "wall-centerline": "core-centerline",
+        "core-centerline": "core-centerline",
+        "finish-exterior": "finish-face-exterior",
+        "finish-interior": "finish-face-interior",
+        "core-exterior": "finish-face-exterior",
+        "core-interior": "finish-face-interior",
+      };
+      const wl: import("../modules/projects/types").ElementType = el.type;
+      void wl;
+      const wallLine = wc.getWallLocationLine({
+        start: el.params.start,
+        end: el.params.end,
+        width: el.params.thickness ?? 0.2,
+        justification: justificationMap[(el.properties as any)?.locationLine as string] ?? "core-centerline",
+      });
+      const contacts = wc.findWallColumnContactCandidates(wallLine, colRef);
+      if (!contacts.length) return;
+      const contact = contacts[0];
+      // Bind the wall endpoint that sits at the contact face.
+      const startD = dist2XZ(el.params.start[0], el.params.start[1], contact.point[0], contact.point[1]);
+      const endD = dist2XZ(el.params.end[0], el.params.end[1], contact.point[0], contact.point[1]);
+      const endpoint: [number, number] = startD <= endD ? el.params.start : el.params.end;
+      wc.createWallColumnRelationship(registry, wallLine, colRef, el.id, endpoint, contact, z);
+      return;
+    }
+
+    // 3) MEP run started/ended on an equipment/fitting connector.
+    if (snap.type === "connector" && linearTypes.has(el.type)) {
+      const endPt = el.params.end ?? el.params.start;
+      registry.createRelationship({
+        type: "mep-connection",
+        source: {
+          elementId: other.id,
+          kind: "connector",
+          position: [snap.point.x, snap.point.y, snap.point.z],
+        },
+        target: {
+          elementId: el.id,
+          kind: "endpoint",
+          position: [endPt?.[0] ?? snap.point.x, endPt?.[1] ?? snap.point.z, el.params.endElevation ?? z],
+        },
+        reconnection: "follow-source",
+        deletionPolicy: "break",
+        origin: "automatic",
+      });
+    }
+  } catch (err) {
+    console.warn("[authoring] snap relationship recording failed", err);
+  }
+}
+
+export interface ParamPatch {
+  el: AuthoredElement;
+  before: AuthoredElement["params"];
+  after: AuthoredElement["params"];
+  relationshipId: string;
+  endpoint: [number, number];
+}
+
+/**
+ * Design spec §6 — moving a referenced object updates dependent
+ * geometry. Collects (without applying) the parameter patches for every
+ * endpoint-constraint dependent of the moved elements:
+ *   • wall-column constraints re-resolve the wall endpoint against the
+ *     column's NEW footprint (already moved by the caller);
+ *   • plain endpoint constraints translate the bound endpoint by the
+ *     same delta so coincident corners stay coincident.
+ * Callers fold the patches into the SAME undo transaction as the move.
+ */
+function collectDependentPatches(movedIds: string[], dx: number, dz: number): ParamPatch[] {
+  const registry = snapRegistry();
+  if (!registry) return [];
+  const moved = new Set(movedIds);
+  const seenRel = new Set<string>();
+  const patches: ParamPatch[] = [];
+  for (const mid of movedIds) {
+    let deps: any[] = [];
+    try { deps = registry.getRelationshipDependents(mid) ?? []; } catch { continue; }
+    for (const rec of deps) {
+      if (rec.type !== "endpoint-constraint" || seenRel.has(rec.id)) continue;
+      seenRel.add(rec.id);
+      const depId = rec.target?.elementId;
+      if (!depId || moved.has(depId)) continue;
+      const dep = elements.find((x) => x.id === depId);
+      if (!dep || dep.properties?.pinned) continue;
+      if (!dep.params.start || !dep.params.end) continue;
+
+      let newEndpoint: [number, number] | null = null;
+
+      if (rec.source?.kind === "edge") {
+        // Wall-column: re-resolve the endpoint against the column's
+        // CURRENT (already moved) footprint.
+        const col = elements.find((x) => x.id === mid && (x.type === "column" || x.type === "footing"));
+        if (col?.params.point) {
+          try {
+            const t = col.params.thickness ?? 0.3;
+            const d = col.params.depth ?? t;
+            const [cx, cz] = col.params.point;
+            const baseZ = col.params.elevation ?? 0;
+            const colRef = {
+              elementId: col.id,
+              footprint: [
+                [cx - t / 2, cz - d / 2], [cx + t / 2, cz - d / 2],
+                [cx + t / 2, cz + d / 2], [cx - t / 2, cz + d / 2],
+              ] as Array<[number, number]>,
+              baseZ,
+              topZ: baseZ + (col.params.height ?? 3),
+              isRectangle: true,
+            };
+            const justificationMap: Record<string, WallColumnLine["justification"]> = {
+              "wall-centerline": "core-centerline",
+              "core-centerline": "core-centerline",
+              "finish-exterior": "finish-face-exterior",
+              "finish-interior": "finish-face-interior",
+              "core-exterior": "finish-face-exterior",
+              "core-interior": "finish-face-interior",
+            };
+            const wallLine = toWallColumnLine({
+              start: dep.params.start,
+              end: dep.params.end,
+              width: dep.params.thickness ?? 0.2,
+              justification: justificationMap[(dep.properties as any)?.locationLine as string] ?? "core-centerline",
+            });
+            const resolved = calculateWallEndpoint(wallLine, colRef);
+            if (resolved) {
+              newEndpoint = resolved.endpoint;
+            }
+          } catch { /* fall through to plain follow */ }
+        }
+      }
+
+      if (!newEndpoint) {
+        // Plain follow-source: translate the bound endpoint by the delta.
+        const tp = rec.target.position;
+        const startD = dist2XZ(dep.params.start[0], dep.params.start[1], tp[0], tp[1]);
+        const endD = dist2XZ(dep.params.end[0], dep.params.end[1], tp[0], tp[1]);
+        newEndpoint = startD <= endD
+          ? [dep.params.start[0] + dx, dep.params.start[1] + dz]
+          : [dep.params.end[0] + dx, dep.params.end[1] + dz];
+      }
+      if (!newEndpoint) continue;
+
+      const before = JSON.parse(JSON.stringify(dep.params)) as AuthoredElement["params"];
+      const after = JSON.parse(JSON.stringify(dep.params)) as AuthoredElement["params"];
+      const startIsBound = dist2XZ(after.start![0], after.start![1], newEndpoint[0], newEndpoint[1]) <=
+        dist2XZ(after.end![0], after.end![1], newEndpoint[0], newEndpoint[1]);
+      if (startIsBound) after.start = newEndpoint;
+      else after.end = newEndpoint;
+      patches.push({ el: dep, before, after, relationshipId: rec.id, endpoint: newEndpoint });
+    }
+  }
+  return patches;
+}
+
+/** Push refreshed reference positions into the registry after a move. */
+function refreshDependentRefs(patches: ParamPatch[]): void {
+  const registry = snapRegistry();
+  if (!registry) return;
+  for (const p of patches) {
+    try {
+      registry.updateRelationshipReference(p.relationshipId, "target", {
+        elementId: p.el.id,
+        kind: "endpoint",
+        position: [p.endpoint[0], p.endpoint[1], p.el.params.elevation ?? 0],
+      });
+    } catch { /* registry optional */ }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Slab / params
+// ═══════════════════════════════════════════════════════════════════════════
+function finishSlab() {
+  if (poly.length >= 3) {
+    const type = activeTool === "terrain" ? "terrain" : "slab";
+    void createElement(type as any, { polygon: poly.map((p) => [snap(p.x), snap(p.z)] as Vec2) });
+  }
+  poly = [];
+  clearPreviews();
+  try { accuDraw.end(); } catch { /* */ }
+}
+
+
+function rejectInvalidOperation(
+  candidateElements: AuthoredElement[],
+  affectedIds: Set<string>,
+  operation: string,
+): boolean {
+  const diagnostics = validateNativeModel({ elements: candidateElements, levels, grids })
+    .filter((diagnostic) => diagnostic.elementId != null && affectedIds.has(diagnostic.elementId) && diagnostic.severity === "error");
+  if (!diagnostics.length) return false;
+  const details = diagnostics.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`).join("\\n");
+  window.dispatchEvent(new CustomEvent("obs-toast", {
+    detail: {
+      message: `Cannot ${operation}. The operation would create invalid geometry.\\n${details}`,
+      kind: "error",
+    },
+  }));
+  return true;
+}
+
+function shiftParams(el: AuthoredElement, dx: number, dz: number) {
+  if (el.params.start) el.params.start = [el.params.start[0] + dx, el.params.start[1] + dz];
+  if (el.params.end) el.params.end = [el.params.end[0] + dx, el.params.end[1] + dz];
+  if (el.params.point) el.params.point = [el.params.point[0] + dx, el.params.point[1] + dz];
+  if (el.params.polygon) el.params.polygon = el.params.polygon.map(([x, z]) => [x + dx, z + dz] as Vec2);
+}
+
+/**
+ * Keyboard nudge: move selected authored elements / grids by (dx, dz) on plan
+ * and optional dy elevation. Skips pinned elements. Undoable via transformElements.
+ */
+export function nudgeSelectedByKeyboard(dx: number, dz: number, dy = 0): number {
+  // Selected grid datum
+  if (selectedDatum?.kind === "grid" && selectedIds.size === 0) {
+    const gr = grids.find((g) => g.id === selectedDatum!.id);
+    if (!gr) return 0;
+    const before = { start: [...gr.start] as [number, number], end: [...gr.end] as [number, number] };
+    gr.start = [gr.start[0] + dx, gr.start[1] + dz];
+    gr.end = [gr.end[0] + dx, gr.end[1] + dz];
+    const after = { start: [...gr.start] as [number, number], end: [...gr.end] as [number, number] };
+    history.push({
+      label: "Nudge grid",
+      apply: () => { gr.start = [...after.start]; gr.end = [...after.end]; rebuildDatums(); markDirty(); notifyAuthoringChange(); },
+      revert: () => { gr.start = [...before.start]; gr.end = [...before.end]; rebuildDatums(); markDirty(); notifyAuthoringChange(); },
+    });
+    rebuildDatums(); markDirty(); notifyAuthoringChange();
+    return 1;
+  }
+
+  const targets = elements.filter((el) => selectedIds.has(el.id) && !el.properties?.pinned);
+  if (!targets.length) return 0;
+
+  transformElements(targets.map((t) => t.id), (el) => {
+    shiftParams(el, dx, dz);
+    if (dy) {
+      el.params.elevation = (Number(el.params.elevation) || 0) + dy;
+      if (el.params.endElevation != null) {
+        el.params.endElevation = Number(el.params.endElevation) + dy;
+      }
+    }
+    if (el.transform?.position) {
+      el.transform.position[0] += dx;
+      el.transform.position[2] += dz;
+      if (dy) el.transform.position[1] += dy;
+    }
+  }, { dx, dz, dy });
+  return targets.length;
+}
+
+function rotateElement(el: AuthoredElement, center: THREE.Vector3, angle: number) {
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  const rotatePt = (x: number, z: number): Vec2 => {
+    const dx = x - center.x;
+    const dz = z - center.z;
+    return [center.x + dx * c - dz * s, center.z + dx * s + dz * c];
+  };
+  if (el.params.start) el.params.start = rotatePt(el.params.start[0], el.params.start[1]);
+  if (el.params.end) el.params.end = rotatePt(el.params.end[0], el.params.end[1]);
+  if (el.params.point) el.params.point = rotatePt(el.params.point[0], el.params.point[1]);
+  if (el.params.polygon) el.params.polygon = el.params.polygon.map(([x, z]) => rotatePt(x, z));
+}
+
+function mirrorElement(el: AuthoredElement, a: THREE.Vector3, b: THREE.Vector3) {
+  const ax = a.x, az = a.z, bx = b.x, bz = b.z;
+  const dx = bx - ax, dz = bz - az;
+  const len2 = dx * dx + dz * dz;
+  if (len2 < 1e-9) return;
+  const mirrorPt = (x: number, z: number): Vec2 => {
+    const t = ((x - ax) * dx + (z - az) * dz) / len2;
+    const projX = ax + t * dx;
+    const projZ = az + t * dz;
+    return [2 * projX - x, 2 * projZ - z];
+  };
+  if (el.params.start) el.params.start = mirrorPt(el.params.start[0], el.params.start[1]);
+  if (el.params.end) el.params.end = mirrorPt(el.params.end[0], el.params.end[1]);
+  if (el.params.point) el.params.point = mirrorPt(el.params.point[0], el.params.point[1]);
+  if (el.params.polygon) el.params.polygon = el.params.polygon.map(([x, z]) => mirrorPt(x, z)).reverse();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Click dispatch — AccuDraw anchored on chain starts + auto-fittings
+// ═══════════════════════════════════════════════════════════════════════════
+function onDrawClick(pt: THREE.Vector3, e?: MouseEvent) {
+  if (activeTool === "door" || activeTool === "window") {
+    if (!e) return;
+    const wall = wallAtPoint(e);
+    if (!wall) return;
+    // Options-bar values (width / height / sill) override the built-in defaults.
+    const d: Record<string, any> = { ...DEFAULTS[activeTool], ...getTypeDefaults(activeTool).params };
+    const w = d.width ?? 0.9;
+    const hostEl = elements.find((x) => x.id === wall.wallId);
+    if (!hostEl?.params.start || !hostEl.params.end) return;
+    const [ax, az] = hostEl.params.start;
+    const [bx, bz] = hostEl.params.end;
+    const L = Math.hypot(bx - ax, bz - az);
+    const half = w / 2;
+    const offset = Math.max(half, Math.min(L - half, wall.offset));
+
+    void createElement(
+      activeTool,
+      {
+        width: w,
+        offsetAlongHost: snap(offset, 0.05),
+        sillHeight: d.sillHeight ?? (activeTool === "window" ? 0.9 : 0),
+        frameThickness: activeTool === "window" ? 0.05 : 0.06,
+        doorPanel: activeTool === "door" ? "swing" : undefined,
+        windowPanel: activeTool === "window" ? "casement" : undefined,
+      },
+      undefined,
+      wall.wallId,
+    );
+    return;
+  }
+
+  switch (activeTool) {
+    case "wall":
+    case "curtain-wall":
+    case "strip":
+    case "beam":
+    case "mline":
+    case "duct":
+    case "pipe":
+    case "cable-tray":
+    case "conduit": {
+      { // magnetic join to a nearby free end of the same type
+        const mg = magnetSameTypeEnd(elements as any, activeTool as string, [pt.x, pt.z]);
+        if (mg) { pt = pt.clone(); pt.x = mg[0]; pt.z = mg[1]; }
+      }
+      if (!chainStart) {
+        chainStart = pt.clone();
+        chainStartDir = null;
+        chainCorners = [pt.clone()];
+        refSnapActive = null;
+        try { accuDraw.begin(chainStart); } catch { /* */ }
+      } else {
+        if (Math.hypot(pt.x - chainStart.x, pt.z - chainStart.z) >= 0.1) {
+          const startPt = chainStart.clone();
+          const endPt = pt.clone();
+          const newDir = Math.atan2(endPt.z - startPt.z, endPt.x - startPt.x);
+
+          // Auto-fitting at the bend, if the direction changed.
+          if (chainStartDir !== null && FITTED_TYPES.has(activeTool as ElementType)) {
+            const angleDelta = Math.abs(
+              ((newDir - chainStartDir + Math.PI) % (2 * Math.PI)) - Math.PI,
+            );
+            if (angleDelta > 0.05) {
+              const parent = elements[elements.length - 1];
+              if (parent) {
+                spawnFitting(
+                  activeTool as ElementType,
+                  parent,
+                  startPt.x,
+                  startPt.z,
+                  chainStartDir,
+                  newDir,
+                );
+              }
+            }
+          }
+
+          const tool = activeTool as ElementType;
+          const dp = effectiveDrawParams(tool);
+          const placed = justifyLinearSegment(tool, startPt, endPt, dp);
+          // Design spec §3.3 — the committed element records HOW it sits
+          // on the reference, so later edits can reproduce the offset.
+          const drawProps: Record<string, unknown> = {};
+          if (tool === "wall" || tool === "curtain-wall") {
+            drawProps.locationLine = wallLocationLine;
+            drawProps.joinStatus = wallJoinStatus;
+            drawProps.chain = wallChain;
+          }
+           // G7: a pending insulation style (set by the ribbon) rides on the
+           // mline run's properties so the plan view renders it as batting.
+           if (tool === "mline" && nextMlineLineStyle) {
+             drawProps.lineStyle = nextMlineLineStyle;
+             nextMlineLineStyle = null;
+           }
+           const snapAtClick = currentSnapForEvent(e);
+          void createElement(tool, {
+            start: placed.start,
+            end: placed.end,
+            elevation: placed.elevation,
+            endElevation: placed.endElevation,
+          }, drawProps).then((el) => {
+            if (el) {
+              void recordSnapRelationships(el, snapAtClick);
+              // Keep the slope-chaining state coherent for 3D chains too
+              // (reference-path end, so chained matches work under any
+              // justification).
+              if (FITTED_TYPES.has(tool)) {
+                lastPlanLinear = {
+                  type: tool,
+                  end: [endPt.x, endPt.z],
+                  dir: newDir,
+                  thickness: dp.thickness,
+                  height: dp.height,
+                  elevation: placed.elevation ?? level,
+                  endElevation: placed.endElevation,
+                  id: el.id,
+                };
+              }
+            }
+          });
+          chainStartDir = newDir;
+          // Chain continues along the REFERENCE path (the justified face
+          // stays bound to it), matching BIM chain drawing.
+          chainStart = endPt.clone();
+          chainCorners.push(endPt.clone());
+          if (chainCorners.length > 24) chainCorners = chainCorners.slice(-24);
+          try { accuDraw.begin(chainStart); } catch { /* */ }
+        }
+      }
+      break;
+    }
+    case "brace":
+      if (!chainStart) {
+        chainStart = pt.clone();
+        chainStartDir = null;
+        chainCorners = [pt.clone()];
+        try { accuDraw.begin(chainStart); } catch { /* */ }
+      } else {
+        if (Math.hypot(pt.x - chainStart.x, pt.z - chainStart.z) >= 0.1) {
+          void createElement("brace", { start: [chainStart.x, chainStart.z], end: [pt.x, pt.z] });
+          chainCorners.push(pt.clone());
+          chainStart = null;
+          chainStartDir = null;
+          try { accuDraw.end(); } catch { /* */ }
+        }
+      }
+      break;
+    case "truss":
+      if (!chainStart) {
+        chainStart = pt.clone();
+        chainStartDir = null;
+        chainCorners = [pt.clone()];
+        try { accuDraw.begin(chainStart); } catch { /* */ }
+      } else {
+        if (Math.hypot(pt.x - chainStart.x, pt.z - chainStart.z) >= 0.5) {
+          void createElement(
+            "truss",
+            { start: [chainStart.x, chainStart.z], end: [pt.x, pt.z] },
+            { panels: 4 },
+          );
+          chainCorners.push(pt.clone());
+          chainStart = null;
+          chainStartDir = null;
+          try { accuDraw.end(); } catch { /* */ }
+        }
+      }
+      break;
+    case "slab":
+    case "terrain":
+      if (poly.length && pt.distanceTo(poly[0]) < 0.3) {
+        finishSlab();
+        return;
+      }
+      if (poly.length === 0) {
+        try { accuDraw.begin(pt); } catch { /* */ }
+      }
+      poly.push(pt.clone());
+      break;
+    case "column":
+      void createElement("column", { point: [pt.x, pt.z] });
+      break;
+    case "equipment":
+      void createElement("equipment", { point: [pt.x, pt.z] });
+      break;
+    case "ramp":
+      // Real authored ramp: params.height = rise, width/thickness from draw
+      // defaults; slope/run/angle live in properties (see property-schema).
+      void createElement("ramp", { point: [pt.x, pt.z] });
+      break;
+    case "footing":
+      void createElement("footing", { point: [pt.x, pt.z] });
+      break;
+    case "vertical-opening":
+      void createElement("vertical-opening", { point: [pt.x, pt.z] }, { cutNote: "Cuts every slab/roof/ceiling its footprint and Z span reach" });
+      break;
+    case "grid": {
+      if (!chainStart) {
+        chainStart = pt.clone();
+        chainStartDir = null;
+        chainCorners = [pt.clone()];
+        try { accuDraw.begin(chainStart); } catch { /* */ }
+      } else {
+        if (Math.hypot(pt.x - chainStart.x, pt.z - chainStart.z) >= 0.5) {
+          const letter = String.fromCharCode(65 + (gridIdx % 26));
+          grids.push({ id: uid(), label: letter, start: [chainStart.x, chainStart.z], end: [pt.x, pt.z] });
+          gridIdx++;
+          chainCorners.push(pt.clone());
+          chainStart = null;
+          chainStartDir = null;
+          try { accuDraw.end(); } catch { /* */ }
+          rebuildDatums();
+          markDirty();
+        }
+      }
+      break;
+    }
+    case "level": {
+      levelIdx++;
+      levels.push({ id: uid(), name: `Level ${levelIdx}`, elevation: level });
+      rebuildDatums();
+      markDirty();
+      setAuthoringTool(null);
+      break;
+    }
+  }
+  clearPreviews();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Operation dispatch
+// ═══════════════════════════════════════════════════════════════════════════
+function onModifyClick(pt: THREE.Vector3, e: MouseEvent) {
+  switch (pendingOp.kind) {
+    case "move-copy": {
+      const op = pendingOp;
+      // Started with a selection (e.g. from the right-click menu): act on it, no second pick needed.
+      if (!op.id) { op.id = elementAt(e); updateLabel(); return; }
+      if (!op.base) { op.base = pt.clone(); updateLabel(); return; }
+      const dx = snap(pt.x - op.base.x);
+      const dz = snap(pt.z - op.base.z);
+      const sourceIds = op.ids && op.ids.length ? op.ids : [op.id];
+      const sources = sourceIds.map((sid) => elements.find((x) => x.id === sid)).filter((x): x is AuthoredElement => !!x);
+      const src = sources[0];
+      const pinned = sources.filter((x) => x.properties?.pinned);
+      const resetOp = () => { pendingOp = { kind: "move-copy", mode: op.mode, id: null, base: null }; updateLabel(); };
+      if (pinned.length === sources.length && pinned.length) {
+        window.dispatchEvent(new CustomEvent("obs-toast", { detail: { message: `${pinned[0].name} is pinned — unpin before moving or copying.`, kind: "info" } }));
+        resetOp();
+        break;
+      }
+      const label = sources.length > 1 ? `${sources.length} elements` : (src?.name ?? "element");
+      if (src && (dx !== 0 || dz !== 0)) {
+        if (op.mode === "copy") {
+          const clones: AuthoredElement[] = [];
+          for (const so of sources) {
+            if (so.properties?.pinned) continue;
+            const clone: AuthoredElement = JSON.parse(JSON.stringify(so));
+            clone.id = uid();
+            clone.name = `${so.name} (copy)`;
+            if (clone.hostId) clone.hostId = undefined;
+            shiftParams(clone, dx, dz);
+            clones.push(clone);
+          }
+          if (clones.length && !rejectInvalidOperation([...elements, ...clones], new Set(clones.map((c) => c.id)), `copy ${label}`)) {
+            history.exec({
+              label: `Copy ${label}`,
+              apply: () => { for (const c of clones) if (!elements.includes(c)) elements.push(c); rebuild(); markDirty(); },
+              revert: () => { for (const c of clones) { const i = elements.indexOf(c); if (i >= 0) elements.splice(i, 1); } rebuild(); markDirty(); },
+            });
+          }
+        } else {
+          const movers = expandConnectedIds(sources.map((x) => x.id))
+            .map((mid) => elements.find((x) => x.id === mid))
+            .filter((x): x is AuthoredElement => !!x && !x.properties?.pinned);
+          const candidates = movers.map((m0) => { const c = JSON.parse(JSON.stringify(m0)) as AuthoredElement; shiftParams(c, dx, dz); return c; });
+          const candById = new Map(candidates.map((c) => [c.id, c]));
+          if (!rejectInvalidOperation(elements.map((item) => candById.get(item.id) ?? item), new Set(movers.map((m0) => m0.id)), `move ${label}`)) {
+            // Design spec §6 — dependents follow the move in the SAME
+            // undo transaction (endpoint constraints / wall-column binds).
+            const depPatches = collectDependentPatches(movers.map((m0) => m0.id), dx, dz);
+            const snaps = movers.map((m0) => ({ el: m0, before: JSON.parse(JSON.stringify(m0.params)), after: JSON.parse(JSON.stringify(candById.get(m0.id)!.params)) }));
+            // Connected MEP parts / joined walls follow (fittings move, neighbours stretch) in the same undo step.
+            for (const u of mepFollowPatches(movers.map((m0) => m0.id), dx, dz)) {
+              const fe = elements.find((x) => x.id === u.id);
+              if (fe && !snaps.some((o) => o.el === fe)) snaps.push({ el: fe, before: JSON.parse(JSON.stringify(fe.params)), after: { ...JSON.parse(JSON.stringify(fe.params)), ...u.patch } });
+            }
+            history.push({
+              label: movers.length > 1 ? `Move ${label}${sources.length === 1 ? ` + ${movers.length - 1} connected` : ""}` : `Move ${label}`,
+              apply: () => {
+                for (const o of snaps) o.el.params = JSON.parse(JSON.stringify(o.after));
+                for (const p of depPatches) p.el.params = JSON.parse(JSON.stringify(p.after));
+                rebuild(); markDirty();
+              },
+              revert: () => {
+                for (const o of snaps) o.el.params = JSON.parse(JSON.stringify(o.before));
+                for (const p of depPatches) p.el.params = JSON.parse(JSON.stringify(p.before));
+                rebuild(); markDirty();
+              },
+            });
+            for (const o of snaps) o.el.params = JSON.parse(JSON.stringify(o.after));
+            for (const p of depPatches) p.el.params = JSON.parse(JSON.stringify(p.after));
+            refreshDependentRefs(depPatches);
+            rebuild();
+            markDirty();
+          }
+        }
+      }
+      resetOp();
+      break;
+    }
+    case "rotate": {
+      const op = pendingOp;
+      if (!op.center) { op.center = pt.clone(); updateLabel(); return; }
+      if (!op.ref) { op.ref = pt.clone(); updateLabel(); return; }
+      const v0 = new THREE.Vector2(op.ref.x - op.center.x, op.ref.z - op.center.z);
+      const v1 = new THREE.Vector2(pt.x - op.center.x, pt.z - op.center.z);
+      const angle = Math.atan2(v1.y, v1.x) - Math.atan2(v0.y, v0.x);
+      const targets = elements.filter((el) => op.ids.includes(el.id) && !el.properties?.pinned);
+      const candidates = targets.map((t) => {
+        const candidate: AuthoredElement = JSON.parse(JSON.stringify(t));
+        rotateElement(candidate, op.center!, angle);
+        return candidate;
+      });
+      const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+      const candidateElements = elements.map((item) => candidateById.get(item.id) ?? item);
+      if (!rejectInvalidOperation(candidateElements, new Set(candidates.map((candidate) => candidate.id)), "rotate selected elements")) {
+        const before = targets.map((t) => JSON.parse(JSON.stringify(t.params)));
+        const after = candidates.map((candidate) => JSON.parse(JSON.stringify(candidate.params)));
+        history.push({
+          label: i18nT("counts.rotateElements", { n: targets.length }),
+          apply: () => { targets.forEach((t, i) => (t.params = JSON.parse(JSON.stringify(after[i])))); rebuild(); markDirty(); },
+          revert: () => { targets.forEach((t, i) => (t.params = JSON.parse(JSON.stringify(before[i])))); rebuild(); markDirty(); },
+        });
+        targets.forEach((t, i) => (t.params = JSON.parse(JSON.stringify(after[i]))));
+        rebuild();
+        markDirty();
+      }
+      pendingOp = { kind: "none" };
+      updateLabel();
+      break;
+    }
+    case "mirror": {
+      const op = pendingOp;
+      if (!op.axisA) { op.axisA = pt.clone(); updateLabel(); return; }
+      if (!op.axisB) {
+        op.axisB = pt.clone();
+        const targets = elements.filter((el) => op.ids.includes(el.id) && !el.properties?.pinned);
+        const clones: AuthoredElement[] = [];
+        for (const t of targets) {
+          const c: AuthoredElement = JSON.parse(JSON.stringify(t));
+          c.id = uid();
+          c.name = `${t.name} (mirror)`;
+          if (c.hostId) c.hostId = undefined;
+          mirrorElement(c, op.axisA, op.axisB);
+          clones.push(c);
+        }
+        const axisLength = Math.hypot(op.axisB.x - op.axisA.x, op.axisB.z - op.axisA.z);
+        if (axisLength < 1e-6) {
+          window.dispatchEvent(new CustomEvent("obs-toast", { detail: { message: "Mirror axis must have a non-zero length.", kind: "error" } }));
+        } else if (!rejectInvalidOperation([...elements, ...clones], new Set(clones.map((clone) => clone.id)), "mirror selected elements")) {
+          history.exec({
+            label: i18nT("counts.mirrorElements", { n: clones.length }),
+            apply: () => { for (const c of clones) elements.push(c); rebuild(); markDirty(); },
+            revert: () => { for (const c of clones) { const i = elements.indexOf(c); if (i >= 0) elements.splice(i, 1); } rebuild(); markDirty(); },
+          });
+        }
+        pendingOp = { kind: "none" };
+        updateLabel();
+      }
+      break;
+    }
+    case "array": {
+      const op = pendingOp;
+      if (!op.base) {
+        op.base = pt.clone();
+        void (async () => {
+          const countStr = await promptLine("Array", "Number of copies:", "3");
+          if (!countStr) { pendingOp = { kind: "none" }; updateLabel(); return; }
+          const count = Math.floor(Number(countStr));
+          const spacingStr = await promptLine("Array", "Spacing (m):", "3.0");
+          if (spacingStr == null) { pendingOp = { kind: "none" }; updateLabel(); return; }
+          const spacing = Number(spacingStr);
+          if (!Number.isFinite(count) || count < 1 || count > 500 ||
+              !Number.isFinite(spacing) || spacing <= 0) {
+            window.dispatchEvent(new CustomEvent("obs-toast", {
+              detail: { message: "Array requires 1–500 copies and a positive spacing.", kind: "error" },
+            }));
+            pendingOp = { kind: "none" };
+            updateLabel();
+            return;
+          }
+          op.count = count;
+          op.spacing = spacing;
+          updateLabel();
+        })();
+        return;
+      }
+
+      const dxRaw = pt.x - op.base.x;
+      const dzRaw = pt.z - op.base.z;
+      const length = Math.hypot(dxRaw, dzRaw);
+      if (length < 1e-6) {
+        window.dispatchEvent(new CustomEvent("obs-toast", {
+          detail: { message: "Choose a direction point different from the array base point.", kind: "error" },
+        }));
+        pendingOp = { kind: "none" };
+        updateLabel();
+        return;
+      }
+
+      const count = op.count ?? 3;
+      const spacing = op.spacing ?? 3;
+      const dirX = dxRaw / length;
+      const dirZ = dzRaw / length;
+      const targets = elements.filter((el) => op.ids.includes(el.id) && !el.properties?.pinned);
+      const clones: AuthoredElement[] = [];
+      for (let i = 1; i <= count; i++) {
+        for (const t of targets) {
+          const c: AuthoredElement = JSON.parse(JSON.stringify(t));
+          c.id = uid();
+          c.name = `${t.name} (${i})`;
+          if (c.hostId) c.hostId = undefined;
+          shiftParams(c, dirX * spacing * i, dirZ * spacing * i);
+          clones.push(c);
+        }
+      }
+      if (!clones.length) {
+        window.dispatchEvent(new CustomEvent("obs-toast", {
+          detail: { message: "Select at least one unpinned element before creating an array.", kind: "info" },
+        }));
+      } else if (!rejectInvalidOperation([...elements, ...clones], new Set(clones.map((clone) => clone.id)), "array selected elements")) {
+        history.exec({
+          label: i18nT("counts.arrayElements", { n: targets.length, count }),
+          apply: () => { for (const c of clones) elements.push(c); rebuild(); markDirty(); },
+          revert: () => { for (const c of clones) { const i = elements.indexOf(c); if (i >= 0) elements.splice(i, 1); } rebuild(); markDirty(); },
+        });
+      }
+      pendingOp = { kind: "none" };
+      updateLabel();
+      break;
+    }
+    case "offset": {
+      const op = pendingOp;
+      if (!op.id) { op.id = elementAt(e); updateLabel(); return; }
+      if (!op.base) {
+        op.base = pt.clone();
+        const src = elements.find((x) => x.id === op.id);
+        if (!src || !src.params.start || !src.params.end) { pendingOp = { kind: "none" }; updateLabel(); return; }
+        const [ax, az] = src.params.start;
+        const [bx, bz] = src.params.end;
+        const side = Math.sign((pt.x - ax) * (bz - az) - (pt.z - az) * (bx - ax));
+        op.side = (side || 1) as 1 | -1;
+        void (async () => {
+          const distanceStr = await promptLine("Offset", "Offset distance (m):", "0.2");
+          const distance = parseFloat(distanceStr ?? "0.2") || 0.2;
+          const dxv = (bz - az) / Math.hypot(bx - ax, bz - az);
+          const dzv = -(bx - ax) / Math.hypot(bx - ax, bz - az);
+          const ddx = dxv * distance * (op.side ?? 1);
+          const ddz = dzv * distance * (op.side ?? 1);
+          const clone: AuthoredElement = JSON.parse(JSON.stringify(src));
+          clone.id = uid();
+          clone.name = `${src.name} (offset)`;
+          if (clone.hostId) clone.hostId = undefined;
+          shiftParams(clone, ddx, ddz);
+          history.exec({
+            label: `Offset ${src.name}`,
+            apply: () => { elements.push(clone); rebuild(); markDirty(); },
+            revert: () => { const i = elements.indexOf(clone); if (i >= 0) elements.splice(i, 1); rebuild(); markDirty(); },
+          });
+          pendingOp = { kind: "none" };
+          updateLabel();
+        })();
+      }
+      break;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Previews + BIM-style dashed alignment guides
+// ═══════════════════════════════════════════════════════════════════════════
+const guideGroup = new THREE.Group();
+guideGroup.name = "obs-alignment-guides";
+
+function clearGuides() {
+  while (guideGroup.children.length) {
+    const c = guideGroup.children[0];
+    guideGroup.remove(c);
+    disposeObj(c);
+  }
+}
+
+function clearPreviews() {
+  for (const obj of [preview, polyLine, polyStartMarker]) {
+    if (!obj) continue;
+    previewGroup.remove(obj);
+    disposeObj(obj);
+  }
+  preview = polyLine = polyStartMarker = null as any;
+  hoveredWall = null;
+  clearGuides();
+  refSnapActive = null;
+  hideTempDim();
+}
+
+
+function ensureTempDim(): HTMLDivElement {
+  if (tempDimEl && document.body.contains(tempDimEl)) return tempDimEl;
+  const el = document.createElement("div");
+  el.className = "obs-temp-dim";
+  el.style.cssText =
+    "position:fixed;z-index:9200;pointer-events:none;padding:3px 8px;border-radius:4px;" +
+    "background:rgba(15,23,42,.92);border:1px solid #38bdf8;color:#e0f2fe;font:600 12px/1.3 system-ui,sans-serif;" +
+    "box-shadow:0 4px 14px rgba(0,0,0,.35);display:none;transform:translate(-50%,-120%);";
+  document.body.appendChild(el);
+  tempDimEl = el;
+  return el;
+}
+
+function hideTempDim(): void {
+  if (tempDimEl) tempDimEl.style.display = "none";
+}
+
+function showTempDimWorld(a: THREE.Vector3, b: THREE.Vector3, extra?: string): void {
+  try {
+    const el = ensureTempDim();
+    const mid = new THREE.Vector3((a.x + b.x) / 2, (a.y + b.y) / 2 + 0.05, (a.z + b.z) / 2);
+    const cam = ctx.world.camera.three;
+    const renderer = ctx.world.renderer?.three ?? (ctx.world as any).renderer;
+    const canvas = renderer?.domElement as HTMLCanvasElement | undefined;
+    if (!canvas || !cam) return;
+    const v = mid.clone().project(cam);
+    const rect = canvas.getBoundingClientRect();
+    const sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+    const sy = (-v.y * 0.5 + 0.5) * rect.height + rect.top;
+    if (v.z > 1) { el.style.display = "none"; return; }
+    const len = Math.hypot(b.x - a.x, b.z - a.z);
+    const ang = ((Math.atan2(b.z - a.z, b.x - a.x) * 180) / Math.PI + 360) % 360;
+    el.textContent = extra ? `${len.toFixed(3)} m  ·  ${ang.toFixed(1)}°  ·  ${extra}` : `${len.toFixed(3)} m  ·  ${ang.toFixed(1)}°`;
+    el.style.left = `${sx}px`;
+    el.style.top = `${sy}px`;
+    el.style.display = "block";
+  } catch {
+    /* */
+  }
+}
+
+/** Attract cursor to parallel alignment with nearby existing linear elements. */
+function applyParallelTracking(
+  p: THREE.Vector3,
+  base: THREE.Vector3 | null,
+  tool: string | null,
+): THREE.Vector3 {
+  if (!base || !tool || !LINEAR_CHAIN_TOOLS.has(String(tool))) return p;
+  try {
+    const dx = p.x - base.x, dz = p.z - base.z;
+    const len = Math.hypot(dx, dz);
+    if (len < 0.05) return p;
+    const ux = dx / len, uz = dz / len;
+    let best: { pt: THREE.Vector3; dist: number } | null = null;
+    const types = new Set(["wall", "curtain-wall", "beam", "strip", "duct", "pipe", "cable-tray", "conduit"]);
+    for (const o of elements) {
+      if (!types.has(o.type) || !o.params?.start || !o.params?.end) continue;
+      const [ax, az] = o.params.start;
+      const [bx, bz] = o.params.end;
+      const olx = bx - ax, olz = bz - az;
+      const oL = Math.hypot(olx, olz);
+      if (oL < 0.05) continue;
+      const oux = olx / oL, ouz = olz / oL;
+      // parallel if cross product small
+      const cross = Math.abs(ux * ouz - uz * oux);
+      if (cross > 0.08) continue;
+      // distance from base to the infinite line of other
+      const toB = (base.x - ax) * (-ouz) + (base.z - az) * oux;
+      // Prefer staying parallel at same offset
+      if (Math.abs(toB) > 8) continue;
+      // Project current length along other's direction from base, keep offset
+      const along = (p.x - base.x) * oux + (p.z - base.z) * ouz;
+      const cand = new THREE.Vector3(
+        base.x + oux * along,
+        0,
+        base.z + ouz * along,
+      );
+      // Also snap length endpoints to align with other ends along axis
+      for (const ep of [[ax, az], [bx, bz]] as [number, number][]) {
+        const tAlong = (ep[0] - base.x) * oux + (ep[1] - base.z) * ouz;
+        if (tAlong > 0.1) {
+          const c2 = new THREE.Vector3(base.x + oux * tAlong, 0, base.z + ouz * tAlong);
+          const d2 = Math.hypot(c2.x - p.x, c2.z - p.z);
+          if (d2 < 0.4 && (!best || d2 < best.dist)) best = { pt: c2, dist: d2 };
+        }
+      }
+      const d = Math.hypot(cand.x - p.x, cand.z - p.z);
+      if (d < 0.35 && (!best || d < best.dist)) best = { pt: cand, dist: d };
+    }
+    return best ? best.pt.clone() : p;
+  } catch {
+    return p;
+  }
+}
+
+/** Dashed construction line (BIM-style). */
+function dashedLine(
+  a: THREE.Vector3,
+  b: THREE.Vector3,
+  color: number,
+  dashSize = 0.25,
+  gapSize = 0.15,
+): THREE.Line {
+  const geo = new THREE.BufferGeometry().setFromPoints([a, b]);
+  const mat = new THREE.LineDashedMaterial({
+    color,
+    dashSize,
+    gapSize,
+    transparent: true,
+    opacity: 0.92,
+    depthTest: false,
+  });
+  const line = new THREE.Line(geo, mat);
+  line.computeLineDistances();
+  line.renderOrder = 999;
+  return line;
+}
+
+/**
+ * BIM-like alignment guides while drawing:
+ *  - Orthogonal dashed tracks from start
+ *  - Extension rays along the draft direction
+ *  - Parallel / colinear guides from existing walls
+ *  - Temporary dimension ticks + offset length line
+ */
+function updateAlignmentGuides(start: THREE.Vector3, end: THREE.Vector3) {
+  clearGuides();
+  const y = level + 0.02;
+  const s = new THREE.Vector3(start.x, y, start.z);
+  const e = new THREE.Vector3(end.x, y, end.z);
+  const dx = e.x - s.x;
+  const dz = e.z - s.z;
+  const len = Math.hypot(dx, dz);
+  if (len < 0.01) return;
+
+  // ── Reference lines from prior chain corners (close 4th wall / 90° chains) ──
+  // Through each corner: long X and Z dashed tracks so the user sees where the
+  // next segment should stop to stay perpendicular to the first wall.
+  const SPAN = 200;
+  const cornerOrigins = refLinesOn ? chainCorners.slice(-8) : [];
+  try {
+    for (const o of cornerOrigins) {
+      if (!o || !Number.isFinite(o.x) || !Number.isFinite(o.z)) continue;
+      guideGroup.add(dashedLine(
+        new THREE.Vector3(o.x - SPAN, y, o.z),
+        new THREE.Vector3(o.x + SPAN, y, o.z),
+        0x38bdf8, 0.55, 0.28,
+      ));
+      guideGroup.add(dashedLine(
+        new THREE.Vector3(o.x, y, o.z - SPAN),
+        new THREE.Vector3(o.x, y, o.z + SPAN),
+        0x38bdf8, 0.55, 0.28,
+      ));
+    }
+  } catch { /* guide paint optional */ }
+  // Extended tracking lines (from earlier walls): anchor -> snapped point, coloured by kind.
+  if (refLinesOn && extTrack) {
+    try {
+      const col = { axis: 0x22d3ee, colinear: 0xfbbf24, perpendicular: 0xf472b6 } as const;
+      const [hx, hz] = extTrack.point;
+      for (const l of extTrack.lines) {
+        const len2 = Math.hypot(hx - l.from[0], hz - l.from[1]);
+        if (len2 < 0.01) continue;
+        const ux = (hx - l.from[0]) / len2, uz = (hz - l.from[1]) / len2, over = Math.min(0.6, len2 * 0.15);
+        guideGroup.add(dashedLine(new THREE.Vector3(l.from[0], y, l.from[1]), new THREE.Vector3(hx + ux * over, y, hz + uz * over), col[l.kind], 0.5, 0.25));
+      }
+    } catch { /* guide paint optional */ }
+  }
+  // Closing-point marker: intersection of first-corner axes with current cursor axes
+  if (refLinesOn && chainCorners.length >= 1) {
+    const o0 = chainCorners[0];
+    const closeA = new THREE.Vector3(o0.x, y, end.z);
+    const closeB = new THREE.Vector3(end.x, y, o0.z);
+    for (const c of [closeA, closeB]) {
+      const d = Math.hypot(c.x - end.x, c.z - end.z);
+      if (d < 2.5) {
+        guideGroup.add(dashedLine(new THREE.Vector3(o0.x, y, o0.z), c, 0xfbbf24, 0.4, 0.2));
+        guideGroup.add(dashedLine(c, e.clone(), 0xfbbf24, 0.4, 0.2));
+      }
+    }
+    if (refSnapActive) {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(0.1, 10, 10),
+        new THREE.MeshBasicMaterial({ color: 0xfbbf24, depthTest: false }),
+      );
+      m.position.set(refSnapActive.x, y + 0.02, refSnapActive.z);
+      m.renderOrder = 1000;
+      guideGroup.add(m);
+    }
+  }
+
+
+  const dir = new THREE.Vector3(dx / len, 0, dz / len);
+  const ang = Math.abs(Math.atan2(dz, dx));
+
+  // ── Intelligent guides ───────────────────────────────────────────────
+  // Only what is relevant to what is being drawn is shown:
+  //  • ortho track: only while the draft is (nearly) horizontal / vertical, drawn from the start to the cursor
+  //  • references: only elements of the SAME kind as the active tool (wall↔wall, duct↔duct …),
+  //    on the same level for walls/strips, and close to the cursor
+  //  • each guide is a finite segment between the reference and the cursor (never an infinite ray)
+  //  • at most the 2 nearest parallel / alignment references, so guides never pile up
+  const TRACK_TOL = 0.09;        // ~5° from an axis
+  const NEAR = 4;                // m: references farther than this from the cursor are ignored
+  const alignTol = 0.12;
+  const parTol = 0.05;
+  const horizontal = ang < TRACK_TOL || Math.abs(ang - Math.PI) < TRACK_TOL;
+  const vertical = Math.abs(ang - Math.PI / 2) < TRACK_TOL;
+  if (horizontal) {
+    guideGroup.add(dashedLine(s.clone(), new THREE.Vector3(e.x, y, s.z), 0x22d3ee, 0.5, 0.12));
+  } else if (vertical) {
+    guideGroup.add(dashedLine(s.clone(), new THREE.Vector3(s.x, y, e.z), 0x22d3ee, 0.5, 0.12));
+  }
+
+  const tool = String(activeTool);
+  const levelSensitive = tool === "wall" || tool === "strip";
+  type Ref = { el: typeof elements[number]; ax: number; az: number; bx: number; bz: number; ux: number; uz: number; d: number };
+  const refs: Ref[] = [];
+  for (const el of elements) {
+    if (el.type !== tool || !el.params.start || !el.params.end) continue;
+    if (levelSensitive && Math.abs((el.params.elevation ?? 0) - level) > 0.3) continue;
+    const [ax, az] = el.params.start;
+    const [bx, bz] = el.params.end;
+    const elLen = Math.hypot(bx - ax, bz - az);
+    if (elLen < 0.05) continue;
+    const ux = (bx - ax) / elLen, uz = (bz - az) / elLen;
+    // distance from the cursor to the element segment
+    const t = Math.max(0, Math.min(elLen, (e.x - ax) * ux + (e.z - az) * uz));
+    const d = Math.hypot(e.x - (ax + ux * t), e.z - (az + uz * t));
+    if (d > NEAR) continue;
+    refs.push({ el, ax, az, bx, bz, ux, uz, d });
+  }
+  refs.sort((p, q) => p.d - q.d);
+
+  let parallelShown = 0;
+  let alignShown = 0;
+  for (const r of refs.slice(0, 6)) {
+    // Parallel to the draft: guide spans the reference and the cursor's projection onto its axis.
+    const cross = Math.abs(dir.x * r.uz - dir.z * r.ux);
+    if (cross < parTol && parallelShown < 1) {
+      const t0 = 0, t1 = Math.hypot(r.bx - r.ax, r.bz - r.az);
+      const tc = (e.x - r.ax) * r.ux + (e.z - r.az) * r.uz;
+      const lo = Math.min(t0, tc), hi = Math.max(t1, tc);
+      guideGroup.add(dashedLine(
+        new THREE.Vector3(r.ax + r.ux * lo, y, r.az + r.uz * lo),
+        new THREE.Vector3(r.ax + r.ux * hi, y, r.az + r.uz * hi),
+        0xf472b6, 0.35, 0.2,
+      ));
+      parallelShown++;
+    }
+    // Endpoint alignment (same x or z as the reference's end) and colinear extension.
+    for (const [px, pz] of [[r.ax, r.az], [r.bx, r.bz]] as [number, number][]) {
+      if (alignShown >= 2) break;
+      if (Math.abs(e.z - pz) < alignTol && Math.abs(e.x - px) > 0.05) {
+        guideGroup.add(dashedLine(new THREE.Vector3(px, y, pz), new THREE.Vector3(e.x, y, pz), 0x34d399, 0.3, 0.15));
+        alignShown++;
+      } else if (Math.abs(e.x - px) < alignTol && Math.abs(e.z - pz) > 0.05) {
+        guideGroup.add(dashedLine(new THREE.Vector3(px, y, pz), new THREE.Vector3(px, y, e.z), 0x34d399, 0.3, 0.15));
+        alignShown++;
+      } else {
+        const toC = new THREE.Vector3(e.x - px, 0, e.z - pz);
+        const along = toC.x * r.ux + toC.z * r.uz;
+        const perp = Math.abs(toC.x * r.uz - toC.z * r.ux);
+        if (perp < alignTol && Math.abs(along) > 0.05) {
+          guideGroup.add(dashedLine(new THREE.Vector3(px, y, pz), e.clone(), 0xfbbf24, 0.22, 0.14));
+          alignShown++;
+        }
+      }
+    }
+  }
+
+  // Temporary dimension ticks + offset length line
+  const tick = 0.12;
+  const nx = -dir.z, nz = dir.x;
+  guideGroup.add(dashedLine(
+    s.clone().add(new THREE.Vector3(nx * tick, 0, nz * tick)),
+    s.clone().add(new THREE.Vector3(-nx * tick, 0, -nz * tick)),
+    0xfacc15, 1, 0,
+  ));
+  guideGroup.add(dashedLine(
+    e.clone().add(new THREE.Vector3(nx * tick, 0, nz * tick)),
+    e.clone().add(new THREE.Vector3(-nx * tick, 0, -nz * tick)),
+    0xfacc15, 1, 0,
+  ));
+  const off = 0.35;
+  guideGroup.add(dashedLine(
+    s.clone().add(new THREE.Vector3(nx * off, 0, nz * off)),
+    e.clone().add(new THREE.Vector3(nx * off, 0, nz * off)),
+    0xfacc15, 0.4, 0.15,
+  ));
+}
+
+function updatePreview(e: MouseEvent | null) {
+  clearPreviews();
+  if (!activeTool) return;
+
+  if (activeTool === "door" || activeTool === "window") {
+    if (!e) return;
+    const wall = wallAtPoint(e);
+    if (!wall) { hoveredWall = null; return; }
+    hoveredWall = wall;
+    const hostEl = elements.find((x) => x.id === wall.wallId);
+    if (!hostEl?.params.start || !hostEl.params.end) return;
+    const [ax, az] = hostEl.params.start;
+    const [bx, bz] = hostEl.params.end;
+    const L = Math.hypot(bx - ax, bz - az);
+    if (L < 0.1) return;
+    // Options-bar values (width / height / sill) override the built-in defaults.
+    const d: Record<string, any> = { ...DEFAULTS[activeTool], ...getTypeDefaults(activeTool).params };
+    const w = d.width ?? 0.9;
+    const half = w / 2;
+    const offset = Math.max(half, Math.min(L - half, wall.offset));
+
+    const temp: AuthoredElement = {
+      id: "preview", type: activeTool as ElementType, name: "", color: "#38bdf8",
+      hostId: wall.wallId,
+      params: {
+        height: d.height, thickness: d.thickness, width: w,
+        elevation: hostEl.params.elevation,
+        offsetAlongHost: offset,
+        sillHeight: d.sillHeight ?? (activeTool === "window" ? 0.9 : 0),
+        frameThickness: 0.05,
+      },
+    };
+    const g = activeTool === "door" ? buildDoor(temp, hostEl) : buildWindow(temp, hostEl);
+    if (g) {
+      placeHostedElement(g, temp, hostEl);
+      g.traverse((m: any) => {
+        if (m.isMesh) {
+          const mm = m.material as THREE.MeshLambertMaterial;
+          if (mm?.color) mm.color.set("#38bdf8");
+          if (mm) { (mm as any).transparent = true; (mm as any).opacity = 0.55; }
+        }
+      });
+      preview = g;
+      previewGroup.add(g);
+    }
+    return;
+  }
+
+  const pt = e ? groundPoint(e) : null;
+  const pm = new THREE.MeshLambertMaterial({ color: "#38bdf8", transparent: true, opacity: 0.55 });
+
+  if (
+    pt && chainStart &&
+    LINEAR_CHAIN_TOOLS.has(String(activeTool)) &&
+    activeTool !== "brace" && activeTool !== "truss" && activeTool !== "grid"
+  ) {
+    const toolKey = activeTool as ElementType;
+    const d = effectiveDrawParams(toolKey);
+    const a = chainStart;
+    const len = Math.hypot(pt.x - a.x, pt.z - a.z);
+    if (len > 0.05) {
+      const placed = justifyLinearSegment(toolKey, a, pt, d);
+      const [ax, az] = placed.start;
+      const [bx, bz] = placed.end;
+      const ghostLen = Math.max(Math.hypot(bx - ax, bz - az), 0.05);
+      preview = new THREE.Mesh(new THREE.BoxGeometry(ghostLen, d.height, d.thickness), pm);
+      preview.position.set((ax + bx) / 2, (placed.elevation ?? level) + d.height / 2, (az + bz) / 2);
+      (preview as THREE.Mesh).rotation.y = Math.atan2(-(bz - az), bx - ax);
+      previewGroup.add(preview);
+      // BIM-style dashed alignment / extension guides, then the
+      // Design spec §3.3 reference-line visualisation on top: the
+      // reference path (light), offset ties (yellow) to the justified face.
+      try {
+        updateAlignmentGuides(a, pt);
+        showTempDimWorld(a, pt);
+        const moved = Math.hypot(ax - a.x, az - a.z) + Math.hypot(bx - pt.x, bz - pt.z);
+        if (moved > 1e-4) {
+          const gy = level + 0.02;
+          guideGroup.add(dashedLine(
+            new THREE.Vector3(a.x, gy, a.z),
+            new THREE.Vector3(pt.x, gy, pt.z),
+            0xe2e8f0, 0.12, 0.08,
+          ));
+          guideGroup.add(dashedLine(
+            new THREE.Vector3(a.x, gy, a.z),
+            new THREE.Vector3(ax, gy, az),
+            0xfacc15, 0.08, 0.05,
+          ));
+          guideGroup.add(dashedLine(
+            new THREE.Vector3(pt.x, gy, pt.z),
+            new THREE.Vector3(bx, gy, bz),
+            0xfacc15, 0.08, 0.05,
+          ));
+        }
+      } catch { /* */ }
+    }
+  } else if (pt && activeTool === "brace" && chainStart) {
+    const a = new THREE.Vector3(chainStart.x, level, chainStart.z);
+    const b = new THREE.Vector3(pt.x, level + DEFAULTS.brace.height, pt.z);
+    preview = memberMesh(a, b, DEFAULTS.brace.thickness, DEFAULTS.brace.thickness, pm);
+    previewGroup.add(preview);
+    try { updateAlignmentGuides(chainStart, pt); showTempDimWorld(chainStart, pt); } catch { /* */ }
+  } else if (pt && activeTool === "truss" && chainStart) {
+    const tmp: AuthoredElement = {
+      id: "preview", type: "truss", name: "", color: "#38bdf8",
+      params: {
+        start: [chainStart.x, chainStart.z], end: [pt.x, pt.z],
+        height: DEFAULTS.truss.height, thickness: DEFAULTS.truss.thickness, elevation: level,
+      },
+    };
+    preview = buildTruss(tmp);
+    preview.traverse((m: any) => { if (m.isMesh) m.material = pm; });
+    previewGroup.add(preview);
+    try { updateAlignmentGuides(chainStart, pt); showTempDimWorld(chainStart, pt); } catch { /* */ }
+  } else if (pt && activeTool === "grid" && chainStart) {
+    try { updateAlignmentGuides(chainStart, pt); } catch { /* */ }
+  } else if (activeTool === "slab") {
+    const pts = [...poly, ...(pt ? [pt] : [])];
+    if (pts.length >= 1) {
+      const g = new THREE.BufferGeometry().setFromPoints(
+        pts.map((p) => new THREE.Vector3(p.x, level + 0.01, p.z)),
+      );
+      polyLine = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0x38bdf8 }));
+      previewGroup.add(polyLine);
+    }
+    if (poly.length) {
+      polyStartMarker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.08),
+        new THREE.MeshBasicMaterial({ color: 0xfacc15 }),
+      );
+      polyStartMarker.position.set(poly[0].x, level + 0.05, poly[0].z);
+      previewGroup.add(polyStartMarker);
+    }
+  } else if (pt && (activeTool === "column" || activeTool === "footing")) {
+    const d = DEFAULTS[activeTool];
+    preview = new THREE.Mesh(new THREE.BoxGeometry(d.thickness, d.height, d.thickness), pm);
+    const y = activeTool === "footing" ? level - d.height / 2 : level + d.height / 2;
+    preview.position.set(pt.x, y, pt.z);
+    previewGroup.add(preview);
+  } else if (pt && activeTool === "vertical-opening") {
+    const d = DEFAULTS["vertical-opening"];
+    // dashed-feel affordance: red rectangle outline at the cut base + one at the top
+    const fp = voOpeningFootprint({
+      id: "preview", type: "vertical-opening",
+      params: { point: [pt.x, pt.z], width: d.width, depth: d.depth ?? d.width, rotation: d.rotation ?? 0 },
+    });
+    for (const y of [level, level + d.height]) {
+      const g = new THREE.BufferGeometry().setFromPoints(
+        [...fp, fp[0]].map(([x, z]) => new THREE.Vector3(x, y, z)),
+      );
+      const line = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xef4444 }));
+      previewGroup.add(line);
+    }
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.05, d.height, 0.05), pm);
+    post.position.set(pt.x, level + d.height / 2, pt.z);
+    previewGroup.add(post);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Datums
+// ═══════════════════════════════════════════════════════════════════════════
+function makeLabelSprite(text: string, color = "#f59e0b"): THREE.Sprite {
+  const c = document.createElement("canvas");
+  c.width = c.height = 128;
+  const g = c.getContext("2d")!;
+  g.strokeStyle = color; g.lineWidth = 6;
+  g.beginPath(); g.arc(64, 64, 54, 0, Math.PI * 2); g.stroke();
+  g.fillStyle = color;
+  g.font = "700 56px system-ui,sans-serif";
+  g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText(text, 64, 66);
+  const tex = new THREE.CanvasTexture(c);
+  const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false }));
+  spr.scale.set(0.9, 0.9, 1);
+  spr.renderOrder = 900;
+  return spr;
+}
+
+function rebuildDatums() {
+  while (datumGroup.children.length) {
+    const ch = datumGroup.children[0];
+    datumGroup.remove(ch);
+    disposeObj(ch);
+  }
+  const SEL = 0x2563eb;
+  const tag = (o: THREE.Object3D, kind: "grid" | "level", id: string) => { o.userData.datumKind = kind; o.userData.datumId = id; };
+  for (const gr of grids) {
+    const sel = selectedDatum?.kind === "grid" && selectedDatum.id === gr.id;
+    const geo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(gr.start[0], -5, gr.start[1]),
+      new THREE.Vector3(gr.end[0], 15, gr.end[1]),
+    ]);
+    const mat = sel
+      ? new THREE.LineBasicMaterial({ color: SEL, depthTest: false })
+      : new THREE.LineDashedMaterial({ color: 0xf59e0b, dashSize: 0.4, gapSize: 0.25 });
+    const line = new THREE.Line(geo, mat);
+    if (sel) line.renderOrder = 950;
+    line.computeLineDistances();
+    tag(line, "grid", gr.id);
+    datumGroup.add(line);
+    const spr = makeLabelSprite(gr.label, sel ? "#60a5fa" : undefined);
+    spr.position.set(gr.end[0], 15.6, gr.end[1]);
+    if (sel) spr.scale.set(1.3, 1.3, 1);
+    tag(spr, "grid", gr.id);
+    datumGroup.add(spr);
+  }
+  for (const lv of levels) {
+    const sel = selectedDatum?.kind === "level" && selectedDatum.id === lv.id;
+    const geo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-25, lv.elevation, 0),
+      new THREE.Vector3(25, lv.elevation, 0),
+    ]);
+    const mat = sel
+      ? new THREE.LineBasicMaterial({ color: SEL, depthTest: false })
+      : new THREE.LineDashedMaterial({ color: 0x22d3ee, dashSize: 0.5, gapSize: 0.25 });
+    const line = new THREE.Line(geo, mat);
+    if (sel) line.renderOrder = 950;
+    line.computeLineDistances();
+    tag(line, "level", lv.id);
+    datumGroup.add(line);
+    const spr = makeLabelSprite(lv.name.replace(/[^0-9]/g, "") || "L", sel ? "#60a5fa" : "#22d3ee");
+    spr.position.set(25.8, lv.elevation, 0);
+    if (sel) spr.scale.set(1.3, 1.3, 1);
+    tag(spr, "level", lv.id);
+    datumGroup.add(spr);
+  }
+}
+
+/** Pick a grid line or level under the cursor (screen-space tolerance ~1% of view distance). */
+function datumAt(e: MouseEvent): { kind: "grid" | "level"; id: string } | null {
+  try {
+    if (!ctx.world?.camera?.three || !datumGroup.children.length) return null;
+    const cam = ctx.world.camera.three as THREE.Camera;
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndcOf(e), cam);
+    let best: { kind: "grid" | "level"; id: string; d: number } | null = null;
+    const onRay = new THREE.Vector3(), onSeg = new THREE.Vector3();
+    for (const o of datumGroup.children) {
+      const kind = o.userData.datumKind, id = o.userData.datumId;
+      if (!kind || !id) continue;
+      let d = Infinity;
+      if ((o as THREE.Line).isLine) {
+        const pos = (o as THREE.Line).geometry.getAttribute("position");
+        const a = new THREE.Vector3().fromBufferAttribute(pos, 0);
+        const b = new THREE.Vector3().fromBufferAttribute(pos, 1);
+        const d2 = ray.ray.distanceSqToSegment(a, b, onRay, onSeg);
+        const tol = Math.max(0.05, onRay.distanceTo(ray.ray.origin) * 0.012);
+        if (d2 <= tol * tol) d = Math.sqrt(d2) / tol;
+      } else if ((o as THREE.Sprite).isSprite) {
+        const hit = ray.intersectObject(o, false)[0];
+        if (hit) d = 0.5;
+      }
+      if (d < Infinity && (!best || d < best.d)) best = { kind, id, d };
+    }
+    return best ? { kind: best.kind, id: best.id } : null;
+  } catch { return null; }
+}
+
+function setDatumSelection(sel: { kind: "grid" | "level"; id: string } | null): void {
+  const same = (!sel && !selectedDatum) || (sel && selectedDatum && sel.kind === selectedDatum.kind && sel.id === selectedDatum.id);
+  selectedDatum = sel;
+  if (!same) rebuildDatums();
+  refreshEditor();
+}
+
+export function getSelectedDatum() { return selectedDatum ? { ...selectedDatum } : null; }
+export function selectDatum(kind: "grid" | "level", id: string): boolean {
+  const exists = kind === "grid" ? grids.some((g) => g.id === id) : levels.some((l) => l.id === id);
+  if (!exists) return false;
+  selectedIds.clear();
+  applySelection(); refreshGrips();
+  setDatumSelection({ kind, id });
+  notifyAuthoringChange();
+  return true;
+}
+
+/** Delete a grid or level (undoable). Elements on a deleted level are kept but unconstrained. */
+export function deleteDatum(kind: "grid" | "level", id: string): boolean {
+  if (kind === "grid") {
+    const idx = grids.findIndex((g) => g.id === id);
+    if (idx < 0) return false;
+    const gr = grids[idx];
+    history.push({
+      label: `Delete grid ${gr.label}`,
+      apply: () => { const i = grids.findIndex((g) => g.id === id); if (i >= 0) grids.splice(i, 1); if (selectedDatum?.id === id) selectedDatum = null; rebuildDatums(); refreshEditor(); markDirty(); notifyAuthoringChange(); },
+      revert: () => { grids.splice(Math.min(idx, grids.length), 0, gr); rebuildDatums(); markDirty(); notifyAuthoringChange(); },
+    });
+    const i = grids.findIndex((g) => g.id === id); grids.splice(i, 1);
+    if (selectedDatum?.id === id) selectedDatum = null;
+    rebuildDatums(); refreshEditor(); markDirty(); notifyAuthoringChange();
+    notify("info", `Deleted grid ${gr.label}`);
+    return true;
+  }
+  const idx = levels.findIndex((l) => l.id === id);
+  if (idx < 0) return false;
+  const lv = levels[idx];
+  const wasActive = activeLevelId === id;
+  const owned = elements.filter((e) => e.levelId === id);
+  const doDelete = () => {
+    const i = levels.findIndex((l) => l.id === id); if (i >= 0) levels.splice(i, 1);
+    for (const e of owned) delete e.levelId;
+    if (activeLevelId === id) activeLevelId = null;
+    if (selectedDatum?.id === id) selectedDatum = null;
+    rebuildDatums(); refreshEditor(); markDirty(); notifyAuthoringChange();
+  };
+  history.push({
+    label: `Delete level ${lv.name}`,
+    apply: doDelete,
+    revert: () => {
+      levels.splice(Math.min(idx, levels.length), 0, lv);
+      for (const e of owned) e.levelId = id;
+      if (wasActive) activeLevelId = id;
+      rebuildDatums(); markDirty(); notifyAuthoringChange();
+    },
+  });
+  doDelete();
+  notify("info", owned.length ? `Deleted ${lv.name} (${owned.length} element(s) no longer constrained to it)` : `Deleted ${lv.name}`);
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Properties editor (inline, bottom-left of viewport) — kept for A/B use.
+// ═══════════════════════════════════════════════════════════════════════════
+const INP = "width:100%;box-sizing:border-box;padding:4px 6px;background:#12131a;border:1px solid #3a3a4a;border-radius:4px;color:#e2e8f0;font-size:11px";
+
+const editor = document.createElement("div");
+editor.style.cssText =
+  "position:absolute;left:12px;bottom:12px;z-index:60;display:none;width:250px;background:#1a1b23;border:1px solid #3a3a4a;border-radius:8px;padding:10px;font:12px system-ui,sans-serif;color:#e2e8f0;box-shadow:0 8px 24px rgba(0,0,0,.5);max-height:70vh;overflow:auto";
+editor.addEventListener("mousedown", (e) => e.stopPropagation());
+
+function field(label: string, input: HTMLElement) {
+  const w = document.createElement("label");
+  w.style.cssText = "display:grid;gap:2px;margin-bottom:6px;font-size:10px;opacity:.85";
+  w.append(label, input);
+  return w;
+}
+
+function numInput(value: number, step: number, on: (v: number) => void) {
+  const i = document.createElement("input");
+  i.type = "number"; i.step = String(step); i.value = String(value);
+  i.style.cssText = INP;
+  i.onchange = () => on(Number(i.value) || 0);
+  return i;
+}
+
+function historyNum(
+  labelOrFn: string | (() => string),
+  el: AuthoredElement,
+  mutate: (v: number) => void,
+  value: number,
+  step: number,
+) {
+  const getLabel = () => (typeof labelOrFn === "function" ? labelOrFn() : String(labelOrFn));
+  const coalesceKey = `edit-${el.id}-${getLabel()}`;
+  return numInput(value, step, (v) => {
+    const before = JSON.parse(JSON.stringify(el.params));
+    const candidate: AuthoredElement = { ...el, params: JSON.parse(JSON.stringify(el.params)) };
+    const originalParams = el.params;
+    try {
+      el.params = candidate.params;
+      mutate(v);
+      candidate.params = el.params;
+    } finally {
+      el.params = originalParams;
+    }
+    const diagnostics = validateNativeModel({
+      elements: elements.map((item) => item.id === el.id ? candidate : item),
+      levels,
+      grids,
+    }).filter((diagnostic) => diagnostic.elementId === el.id && diagnostic.severity === "error");
+    if (diagnostics.length) {
+      window.dispatchEvent(new CustomEvent("obs-toast", {
+        detail: {
+          message: "Cannot apply " + getLabel() + " to " + el.name + ".\n" + diagnostics.map((d) => d.code + ": " + d.message).join("\n"),
+          kind: "error",
+        },
+      }));
+      return;
+    }
+    const after = JSON.parse(JSON.stringify(candidate.params));
+    // Resolve which param key changed for geometry sync
+    const changedKey = (() => {
+      for (const k of Object.keys(after)) {
+        if (JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k])) return k;
+      }
+      return "height";
+    })();
+    history.push(
+      {
+        label: `Edit ${el.name} · ${getLabel()}`,
+        apply: () => {
+          el.params = JSON.parse(JSON.stringify(after));
+          rebuild();
+          markDirty();
+        },
+        revert: () => {
+          el.params = JSON.parse(JSON.stringify(before));
+          rebuild();
+          markDirty();
+        },
+      },
+      coalesceKey,
+    );
+    el.params = JSON.parse(JSON.stringify(before));
+    applyElementParamChange(el.id, changedKey, (after as any)[changedKey]);
+  });
+}
+
+function selectInput<T extends string>(
+  value: T,
+  options: { v: T; label: string }[],
+  on: (v: T) => void,
+): HTMLSelectElement {
+  const s = document.createElement("select");
+  s.style.cssText = INP;
+  s.innerHTML = options.map((o) => `<option value="${escapeHtml(o.v)}" ${o.v === value ? "selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
+  s.onchange = () => on(s.value as T);
+  return s;
+}
+
+function refreshDatumEditor(): void {
+  const sd = selectedDatum!;
+  editor.style.display = "block";
+  editor.innerHTML = "";
+  const title = document.createElement("div");
+  title.style.cssText = "font-weight:700;margin-bottom:8px";
+  editor.appendChild(title);
+  const del = document.createElement("button");
+  del.textContent = "\u{1F5D1} Delete " + sd.kind;
+  del.style.cssText = "width:100%;padding:6px;margin-top:4px;background:#3b0d0d;color:#fca5a5;border:1px solid #ef4444;border-radius:5px;cursor:pointer;font-size:11px";
+  del.onclick = () => deleteDatum(sd.kind, sd.id);
+  if (sd.kind === "grid") {
+    const gr = grids.find((g) => g.id === sd.id);
+    if (!gr) { editor.style.display = "none"; return; }
+    title.textContent = `Grid ${gr.label}`;
+    const lab = document.createElement("input"); lab.value = gr.label; lab.style.cssText = INP;
+    lab.onchange = () => {
+      const before = gr.label, after = lab.value.trim() || before;
+      history.push({ label: `Rename grid ${before}`,
+        apply: () => { gr.label = after; rebuildDatums(); markDirty(); notifyAuthoringChange(); },
+        revert: () => { gr.label = before; rebuildDatums(); markDirty(); notifyAuthoringChange(); } });
+      gr.label = after; rebuildDatums(); markDirty(); notifyAuthoringChange(); refreshEditor();
+    };
+    editor.appendChild(field("Name", lab));
+    const info = document.createElement("div");
+    const len = Math.hypot(gr.end[0] - gr.start[0], gr.end[1] - gr.start[1]);
+    info.style.cssText = "font-size:11px;opacity:.8;margin-bottom:6px;line-height:1.5";
+    info.textContent = `Start ${gr.start[0].toFixed(2)}, ${gr.start[1].toFixed(2)}  End ${gr.end[0].toFixed(2)}, ${gr.end[1].toFixed(2)}  Length ${len.toFixed(2)} m`;
+    editor.appendChild(info);
+  } else {
+    const lv = levels.find((l) => l.id === sd.id);
+    if (!lv) { editor.style.display = "none"; return; }
+    title.textContent = `Level \u2014 ${lv.name}`;
+    const nm = document.createElement("input"); nm.value = lv.name; nm.style.cssText = INP;
+    nm.onchange = () => {
+      const before = lv.name, after = nm.value.trim() || before;
+      history.push({ label: `Rename ${before}`,
+        apply: () => { lv.name = after; rebuildDatums(); markDirty(); notifyAuthoringChange(); },
+        revert: () => { lv.name = before; rebuildDatums(); markDirty(); notifyAuthoringChange(); } });
+      lv.name = after; rebuildDatums(); markDirty(); notifyAuthoringChange(); refreshEditor();
+    };
+    editor.appendChild(field("Name", nm));
+    editor.appendChild(field("Elevation (m)", numInput(lv.elevation, 0.05, (v) => {
+      if (!Number.isFinite(v)) return;
+      const before = lv.elevation;
+      history.push({ label: `Set ${lv.name} elevation`,
+        apply: () => { lv.elevation = v; if (activeLevelId === lv.id) level = v; applyLevelConstraints(); rebuildDatums(); markDirty(); notifyAuthoringChange(); },
+        revert: () => { lv.elevation = before; if (activeLevelId === lv.id) level = before; applyLevelConstraints(); rebuildDatums(); markDirty(); notifyAuthoringChange(); } });
+      lv.elevation = v; if (activeLevelId === lv.id) level = v; applyLevelConstraints(); rebuildDatums(); markDirty(); notifyAuthoringChange();
+    })));
+    const act = document.createElement("button");
+    act.textContent = activeLevelId === lv.id ? "Active level" : "Make active level";
+    act.disabled = activeLevelId === lv.id;
+    act.style.cssText = "width:100%;padding:6px;margin-bottom:4px;background:#12131a;color:#e2e8f0;border:1px solid #3a3a4a;border-radius:5px;cursor:pointer;font-size:11px";
+    act.onclick = () => { setActiveLevelById(lv.id); notifyAuthoringChange(); refreshEditor(); };
+    editor.appendChild(act);
+  }
+  editor.appendChild(del);
+}
+
+function refreshEditor() {
+  if (selectedDatum && selectedIds.size === 0 && activeTool === "select") { refreshDatumEditor(); return; }
+  if (selectedIds.size === 0 || activeTool !== "select") { editor.style.display = "none"; return; }
+  editor.style.display = "block";
+  editor.innerHTML = "";
+
+  if (selectedIds.size > 1) {
+    const t = document.createElement("div");
+    t.textContent = `${selectedIds.size} elements selected`;
+    t.style.cssText = "font-weight:700;margin-bottom:8px";
+    editor.appendChild(t);
+    const del = document.createElement("button");
+    del.textContent = "🗑 Delete selection";
+    del.style.cssText = "width:100%;padding:6px;background:#3b0d0d;color:#fca5a5;border:1px solid #ef4444;border-radius:5px;cursor:pointer;font-size:11px";
+    del.onclick = () => deleteElements([...selectedIds]);
+    editor.appendChild(del);
+    return;
+  }
+
+  const el = elements.find((x) => selectedIds.has(x.id));
+  if (!el) { editor.style.display = "none"; return; }
+
+  const title = document.createElement("div");
+  title.textContent = `${cap(el.type)} properties`;
+  title.style.cssText = "font-weight:700;margin-bottom:8px";
+  editor.appendChild(title);
+
+  const name = document.createElement("input");
+  name.value = el.name;
+  name.style.cssText = INP;
+  name.onchange = () => {
+    const before = el.name;
+    const after = name.value;
+    history.push({
+      label: `Rename ${before}`,
+      apply: () => { el.name = after; markDirty(); },
+      revert: () => { el.name = before; markDirty(); },
+    });
+    markDirty();
+  };
+  editor.appendChild(field("Name", name));
+
+  const addNum = (
+    label: string,
+    key: "height" | "thickness" | "depth" | "width" | "sillHeight" | "frameThickness" | "offsetAlongHost" | "rotation",
+    step: number,
+  ) => {
+    const val =
+      key === "depth"
+        ? (el.params.depth ?? el.params.thickness)
+        : (el.params[key] as number | undefined) ?? 0;
+    editor.appendChild(field(label, historyNum(() => label, el, (v) => { (el.params as any)[key] = v; }, val, step)));
+  };
+
+  switch (el.type) {
+    case "wall": addNum("Height (m)", "height", 0.1); addNum("Thickness (m)", "thickness", 0.05); break;
+    case "door":
+    case "window":
+      addNum("Width (m)", "width", 0.05);
+      addNum("Height (m)", "height", 0.05);
+      addNum("Sill height (m)", "sillHeight", 0.05);
+      addNum("Frame thickness (m)", "frameThickness", 0.005);
+      addNum("Offset along wall (m)", "offsetAlongHost", 0.05);
+      if (el.type === "door") {
+        editor.appendChild(field("Panel type", selectInput<DoorPanelType>(
+          el.params.doorPanel ?? "swing",
+          [
+            { v: "swing", label: "Swing" }, { v: "double", label: "Double" },
+            { v: "sliding", label: "Sliding" }, { v: "folding", label: "Folding" },
+            { v: "pocket", label: "Pocket" },
+          ],
+          (v) => {
+            const before = el.params.doorPanel;
+            el.params.doorPanel = v;
+            history.push({
+              label: `Door type · ${el.name}`,
+              apply: () => { el.params.doorPanel = v; rebuild(); markDirty(); },
+              revert: () => { el.params.doorPanel = before; rebuild(); markDirty(); },
+            });
+            rebuild(); markDirty();
+          },
+        )));
+      } else {
+        editor.appendChild(field("Panel type", selectInput<WindowPanelType>(
+          el.params.windowPanel ?? "casement",
+          [
+            { v: "fixed", label: "Fixed" }, { v: "casement", label: "Casement" },
+            { v: "sliding", label: "Sliding" }, { v: "awning", label: "Awning" },
+            { v: "double", label: "Double" },
+          ],
+          (v) => {
+            const before = el.params.windowPanel;
+            el.params.windowPanel = v;
+            history.push({
+              label: `Window type · ${el.name}`,
+              apply: () => { el.params.windowPanel = v; rebuild(); markDirty(); },
+              revert: () => { el.params.windowPanel = before; rebuild(); markDirty(); },
+            });
+            rebuild(); markDirty();
+          },
+        )));
+      }
+      break;
+    case "beam": addNum("Section depth (m)", "height", 0.05); addNum("Section width (m)", "thickness", 0.05); break;
+    case "brace": addNum("Rise (m)", "height", 0.1); addNum("Member size (m)", "thickness", 0.05); break;
+    case "truss":
+      addNum("Truss height (m)", "height", 0.1);
+      addNum("Member size (m)", "thickness", 0.01);
+      editor.appendChild(field("Panels", numInput(Number(el.properties?.panels ?? 4), 1, (v) => {
+        const before = JSON.stringify(el.properties ?? {});
+        el.properties = { ...el.properties, panels: Math.max(2, Math.round(v)) };
+        const after = JSON.stringify(el.properties ?? {});
+        history.push({
+          label: `Edit ${el.name} · panels`,
+          apply: () => { el.properties = JSON.parse(after); rebuild(); markDirty(); },
+          revert: () => { el.properties = JSON.parse(before); rebuild(); markDirty(); },
+        });
+        rebuild(); markDirty();
+      })));
+      break;
+    case "column":
+    case "equipment":
+      addNum("Height (m)", "height", 0.1); addNum("Width (m)", "thickness", 0.05); addNum("Depth (m)", "depth", 0.05);
+      break;
+    case "ramp":
+      addNum("Rise (m)", "height", 0.1); addNum("Width (m)", "width", 0.1); addNum("Slab thickness (m)", "thickness", 0.02);
+      break;
+    case "vertical-opening":
+      addNum("Width (m)", "width", 0.05);
+      addNum("Depth (m)", "depth", 0.05);
+      addNum("Cut height (m)", "height", 0.1);
+      addNum("Rotation (°)", "rotation", 15);
+      break;
+    case "footing":
+      addNum("Pad thickness (m)", "height", 0.05); addNum("Width (m)", "thickness", 0.05); addNum("Depth (m)", "depth", 0.05);
+      break;
+    case "strip": addNum("Height (m)", "height", 0.05); addNum("Width (m)", "thickness", 0.05); break;
+    case "slab":
+    case "terrain": addNum("Thickness (m)", "height", 0.05); break;
+    case "fitting":
+      addNum("Height (m)", "height", 0.05);
+      addNum("Width/diameter (m)", "thickness", 0.05);
+      break;
+  }
+
+  editor.appendChild(field("Elevation (m)", historyNum("elevation", el, (v) => (el.params.elevation = v), el.params.elevation, 0.1)));
+
+  if (MEP_LINEAR_TYPES.has(el.type) && el.params.start && el.params.end) {
+    const horiz = () => Math.hypot(el.params.end![0] - el.params.start![0], el.params.end![1] - el.params.start![1]);
+    editor.appendChild(field("Slope (%, + rises to end)", historyNum("slope", el, (v) => {
+      el.params.endElevation = Math.abs(v) < 1e-9 ? undefined : endElevationFromSlope(el.params.elevation, horiz(), v);
+    }, +slopePercent(el.params.elevation, el.params.endElevation, horiz()).toFixed(3), 0.1)));
+    editor.appendChild(field("End elevation (m)", historyNum("end-elevation", el, (v) => {
+      el.params.endElevation = Math.abs(v - el.params.elevation) < 1e-9 ? undefined : v;
+    }, el.params.endElevation ?? el.params.elevation, 0.1)));
+  }
+
+  const color = document.createElement("input");
+  color.type = "color";
+  color.value = el.color ?? "#cccccc";
+  color.style.cssText = "width:100%;height:26px;background:none;border:none;cursor:pointer";
+  color.oninput = () => {
+    const before = el.color;
+    el.color = color.value;
+    rebuild(); markDirty();
+    history.push({
+      label: `Recolor ${el.name}`,
+      apply: () => { el.color = color.value; rebuild(); markDirty(); },
+      revert: () => { el.color = before; rebuild(); markDirty(); },
+    });
+  };
+  editor.appendChild(field("Color", color));
+
+  if (el.hostId) {
+    const host = elements.find((x) => x.id === el.hostId);
+    if (host) {
+      const hostInfo = document.createElement("div");
+      hostInfo.style.cssText = "font-size:10px;opacity:.65;margin-bottom:6px";
+      hostInfo.textContent = `Hosted on: ${host.name}`;
+      editor.appendChild(hostInfo);
+    }
+  }
+
+  const del = document.createElement("button");
+  del.textContent = "🗑 Delete element";
+  del.style.cssText = "width:100%;padding:6px;background:#3b0d0d;color:#fca5a5;border:1px solid #ef4444;border-radius:5px;cursor:pointer;font-size:11px";
+  del.onclick = () => deleteElements([el.id]);
+  editor.appendChild(del);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Labels / tool state
+// ═══════════════════════════════════════════════════════════════════════════
+export const activeToolLabel = document.createElement("div");
+activeToolLabel.style.cssText = "font-size:11px;margin-top:6px;color:#facc15";
+
+const TOOL_HINTS: Record<string, string> = {
+  wall: "Wall: click points to chain · Enter ends chain · X/Z/Y to lock axis",
+  strip: "Strip footing: click start → end",
+  beam: "Beam: click start → end",
+  mline: "Model line: click start → end",
+  brace: "Brace: click start → end",
+  truss: "Truss: click start → end",
+  column: "Column: click a point",
+  footing: "Isolated footing: click a point",
+  slab: "Slab: click points · click first point or Enter to close",
+  grid: "Grid: click start → end",
+  level: "Level: click anywhere",
+  door: "Door: click on a wall to insert",
+  window: "Window: click on a wall to insert",
+  duct: "Duct: click points to chain · bends get auto-fittings",
+  pipe: "Pipe: click points to chain · bends get auto-fittings",
+  "cable-tray": "Cable tray: click points to chain · bends get auto-fittings",
+  conduit: "Conduit: click points to chain · bends get auto-fittings",
+  move: "Move: select → base point → target point",
+  copy: "Copy: select → base point → target point",
+  rotate: "Rotate: select element(s), then center → reference → target",
+  mirror: "Mirror: select element(s), then two points defining the mirror line",
+  array: "Array: select element(s), then base point (prompts for count/spacing)",
+  offset: "Offset: click a wall/line, then click the side to offset toward",
+  select: "Select: click elements · Ctrl add · Shift toggle · Alt remove · drag grips to reshape (Shift+drag endpoint = stretch along length)",
+};
+
+function updateLabel() {
+  let suffix = "";
+  switch (pendingOp.kind) {
+    case "move-copy":
+      if (!pendingOp.id) suffix = " — click an element";
+      else if (!pendingOp.base) suffix = " — click base point";
+      else suffix = " — click target point";
+      break;
+    case "rotate":
+      if (!pendingOp.center) suffix = " — click center point";
+      else if (!pendingOp.ref) suffix = " — click reference point";
+      else suffix = " — click target angle";
+      break;
+    case "mirror":
+      if (!pendingOp.axisA) suffix = " — click mirror line start";
+      else if (!pendingOp.axisB) suffix = " — click mirror line end";
+      break;
+    case "array":
+      if (!pendingOp.base) suffix = " — click base point";
+      else suffix = " — click direction point";
+      break;
+    case "offset":
+      if (!pendingOp.id) suffix = " — click a wall/line";
+      else if (!pendingOp.base) suffix = " — click offset side";
+      break;
+  }
+  activeToolLabel.textContent = `Active Tool: ${activeTool ? cap(activeTool) : "None"}${activeTool && TOOL_HINTS[activeTool] ? ` · ${TOOL_HINTS[activeTool]}${suffix}` : ""}`;
+}
+
+export function isDrawingActive() { return activeTool !== null && activeTool !== "select"; }
+
+/** True when a placement/draw tool is active (panel auto-open signal). */
+export function isDrawToolActive(): boolean {
+  return activeTool !== null && DRAW_TOOLS.has(activeTool);
+}
+
+/**
+ * Re-run the placement preview with the last known pointer position so a
+ * parameter change in the modeling panel updates the ghost immediately
+ * (Design spec §2.3 "update the modeling preview immediately").
+ */
+export function refreshPreview(): void {
+  if (!activeTool || activeTool === "select") return;
+  try { updatePreview(lastHoverEvent); } catch { /* */ }
+}
+
+/**
+ * Activate a modeling tool. Accepts internal Tool names or ribbon aliases
+ * (e.g. "outlet", "sprinkler", "pile") which map via TOOL_ALIASES.
+ */
+export function setAuthoringTool(tool: Tool | string | null) {
+  // View-only share link: no modelling tool may activate. Selection stays
+  // available (tool "select"/null); the server is the authority for the
+  // role, this only keeps the UI from pretending an edit is possible.
+  if (tool !== null && tool !== "select" && isViewOnly()) {
+    try {
+      window.dispatchEvent(new CustomEvent("obs-toast", {
+        detail: { message: "View-only share link — editing is disabled for this link.", kind: "error" },
+      }));
+    } catch { /* */ }
+    return;
+  }
+  // Review mode (differentiation item 8) is view-only: only select (or
+  // clearing the tool) is allowed; every edit tool is refused with a toast
+  // pointing at issues instead of silently doing nothing.
+  if (isReviewMode() && tool !== null && String(tool) !== "select") {
+    notify("warn", "Review mode is view-only — add an issue instead of editing the model.");
+    return;
+  }
+  // Selection at the moment the tool starts: Move/Copy/Rotate/Mirror/Array/Offset act on it directly
+  // (it is cleared below for every non-select tool, which used to leave them with nothing).
+  const preSelected = [...selectedIds];
+  if (tool === null) {
+    activePreset = null;
+    activeTool = null;
+  } else {
+    const key = String(tool);
+    activePreset = TOOL_ALIASES[key] ? key : (key in DEFAULTS ? key : null);
+    const mapped = (TOOL_ALIASES[key] ?? key) as Tool;
+    activeTool = mapped;
+    // Remember for Space-bar repeat (skip pure select)
+    if (mapped !== "select") {
+      lastCommand = activePreset || mapped;
+    }
+  }
+
+  chainStart = null;
+  chainStartDir = null;
+  chainCorners = [];
+  refSnapActive = null;
+  clearRefGuides();
+  poly = [];
+          pendingOp = { kind: "none" };
+  clearPreviews();
+  snapping.hideIndicator();
+
+  try { accuDraw.end(); } catch { /* */ }
+
+  ctx.highlighter.enabled = activeTool === null || activeTool === "select";
+
+  if (activeTool && activeTool !== "select") {
+    setMeasureEnabled(false);
+    setSectionOn(false);
+  }
+  if (activeTool !== "select") { selectedIds.clear(); if (selectedDatum) setDatumSelection(null); }
+  if (activeTool === "select" || activeTool === null) {
+    try { accuDraw.end(); } catch { /* */ }
+  }
+
+  const t = activeTool;
+  if (t === "move" || t === "copy") {
+    pendingOp = { kind: "move-copy", mode: t as "move" | "copy", id: preSelected[0] ?? null, ids: preSelected.length ? preSelected : undefined, base: null };
+  } else if (t === "rotate") {
+    pendingOp = { kind: "rotate", ids: preSelected, center: null, ref: null };
+  } else if (t === "mirror") {
+    pendingOp = { kind: "mirror", ids: preSelected, axisA: null, axisB: null };
+  } else if (t === "array") {
+    pendingOp = { kind: "array", ids: preSelected, mode: "linear", base: null };
+  } else if (t === "offset") {
+    pendingOp = { kind: "offset", id: preSelected.length === 1 ? preSelected[0] : null, base: null, side: null };
+  }
+
+  // Palette sync.
+  if (t && DRAW_TOOLS.has(t)) {
+    paletteTarget = { mode: "defaults", type: t as ElementType };
+  } else if (t === "select") {
+    const ids = [...selectedIds];
+    if (ids.length === 1) {
+      const el = elements.find((e) => e.id === ids[0]);
+      paletteTarget = el ? { mode: "edit", elementId: el.id, type: el.type } : null;
+    } else {
+      paletteTarget = null;
+    }
+  } else {
+    paletteTarget = null;
+  }
+
+  applySelection();
+  refreshGrips();
+  updateLabel();
+  notifyAuthoringChange();
+}
+
+export function getActiveTool() { return activeTool; }
+export function setLevel(v: number) {
+  level = v;
+  // BIM-style: if a named level exists at this elevation, adopt it.
+  const hit = levels.find((l) => Math.abs(l.elevation - v) <= 0.001);
+  if (hit) activeLevelId = hit.id;
+}
+export function getLevel() { return level; }
+
+/** BIM-style active level id. Null when no named level is selected. */
+export function getActiveLevelId(): string | null { return activeLevelId; }
+
+/** Activate a named level; also moves the numeric draw elevation to match. */
+export function setActiveLevelById(id: string | null): void {
+  if (!id) { activeLevelId = null; return; }
+  const hit = levels.find((l) => l.id === id);
+  if (!hit) return;
+  activeLevelId = hit.id;
+  level = hit.elevation;
+}
+
+// openbim-families:instance-wiring
+/** BIM-style active family id. Null when no family is selected. */
+export function getActiveFamilyId(): string | null { return activeFamilyId; }
+
+/** BIM-style active family type id. Null when no type is selected. */
+export function getActiveFamilyTypeId(): string | null { return activeFamilyTypeId; }
+
+/** BIM-style: the family/type the NEXT placed element will adopt. */
+export function setActiveFamily(familyId: string | null, familyTypeId: string | null): void {
+  activeFamilyId = familyId;
+  activeFamilyTypeId = familyTypeId;
+}
+
+/**
+ * Re-resolve every instance of `familyId` (optionally restricted to one
+ * type) from its family definition, propagating changed dimension
+ * parameters. Placement coordinates, elevation, x/z, hostId are never
+ * touched -- only the parametric size fields are synced.
+ *
+ * Instance overrides survive a type change: when `overridesByElement` is
+ * supplied (captured by the caller against the type *before* it changed,
+ * as `editFamilyParameter` does, or against the current type resolution,
+ * as the manual "Sync instances" action does via
+ * `placement.captureManualSyncOverrides`), each instance is re-resolved
+ * with its own overrides on top of the new type values. Without it,
+ * instances are re-resolved from the type alone (the previous behaviour
+ * — still used by type swaps, where no pre-change capture exists).
+ *
+ * Syncs exactly the geometry-key set `placement.ts` defines
+ * (`GEOMETRY_KEYS`), via `applyResolvedParams` — not a second hard-coded
+ * list. `elevation` and `offsetAlongHost` are therefore synced too, which
+ * the old six-key list never did.
+ *
+ * Returns the number of instances whose params actually changed.
+ */
+export function syncFamilyInstances(
+  familyId: string,
+  familyTypeId: string | null,
+  overridesByElement?: Map<string, Record<string, any>> | null,
+): number {
+  const familyService: any = (ctx.features as any).family;
+  if (!familyService) return 0;
+  const def = familyService.get?.(familyId);
+  if (!def) return 0;
+
+  const targets = elements.filter((el) => {
+    if (el.familyId !== familyId) return false;
+    if (familyTypeId === null) return true;
+    return el.familyTypeId === familyTypeId;
+  });
+  if (!targets.length) return 0;
+
+  let changed = 0;
+  for (const el of targets) {
+    const overrides = overridesByElement?.get(el.id);
+    const resolved = familyService.resolveParams(
+      familyId,
+      el.familyTypeId ?? familyTypeId,
+      overrides,
+    ) as Record<string, any> | null;
+    if (!resolved) continue;
+
+    if (applyResolvedParams(el, resolved)) changed++;
+  }
+
+  if (changed > 0) {
+    rebuild();
+    markDirty();
+    notifyAuthoringChange();
+  }
+  return changed;
+}
+export function getElementCount() { return elements.length; }
+export function getElements() { return elements; }
+
+/** Expose the authored-elements THREE.Group for push/pull raycasting. */
+export function getAuthoredGroup(): THREE.Group { return group; }
+export function getSelectedIds(): string[] { return [...selectedIds]; }
+
+function nativeElementTypeFromIfc(entity: string): ElementType {
+  return elementTypeFromIfcEntity(entity);
+}
+
+
+/** Capture reference dimensions once so later param edits can scale/regenerate. */
+function ensureNativeBaseDimensions(el: AuthoredElement): void {
+  const props = (el.properties ??= {}) as Record<string, unknown>;
+  if (props.nativeBaseElevation == null && Number.isFinite(el.params.elevation)) {
+    props.nativeBaseElevation = el.params.elevation;
+  }
+  if (props.nativeBaseHeight == null && Number.isFinite(el.params.height) && (el.params.height as number) > 0) {
+    props.nativeBaseHeight = el.params.height;
+  }
+  if (props.nativeBaseThickness == null && Number.isFinite(el.params.thickness) && (el.params.thickness as number) > 0) {
+    props.nativeBaseThickness = el.params.thickness;
+  }
+  if (props.nativeBaseWidth == null) {
+    const w = (el.params.width ?? el.params.depth) as number | undefined;
+    if (Number.isFinite(w) && (w as number) > 0) props.nativeBaseWidth = w;
+  }
+  if (props.nativeBaseLength == null && el.params.start && el.params.end) {
+    const len = Math.hypot(
+      (el.params.end[0] as number) - (el.params.start[0] as number),
+      (el.params.end[1] as number) - (el.params.start[1] as number),
+    );
+    if (Number.isFinite(len) && len > 1e-6) props.nativeBaseLength = len;
+  }
+  // Derive from geometry if still missing
+  if (props.nativeBaseHeight == null && el.nativeGeometry?.positions?.length) {
+    const pos = el.nativeGeometry.positions;
+    let minY = Infinity, maxY = -Infinity;
+    for (let i = 1; i < pos.length; i += 3) {
+      const y = pos[i];
+      if (Number.isFinite(y)) { minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
+    }
+    if (Number.isFinite(minY) && maxY > minY) props.nativeBaseHeight = maxY - minY;
+  }
+}
+
+/** Params of every MEP part (plus `el`) so a stretch that drags fittings and neighbours is ONE undo step. */
+function snapshotMepParams(el?: AuthoredElement): Map<string, any> {
+  const m = new Map<string, any>();
+  for (const e of elements) if (isMepElement(e) || FOLLOW_LINEAR.has(e.type) || e === el) m.set(e.id, JSON.parse(JSON.stringify(e.params)));
+  return m;
+}
+function pushMepParamsHistory(label: string, before: Map<string, any>, after: Map<string, any>): void {
+  const restore = (snap: Map<string, any>) => {
+    for (const [id, params] of snap) { const e = elements.find((x) => x.id === id); if (e) e.params = JSON.parse(JSON.stringify(params)); }
+    rebuild(); markDirty();
+  };
+  history.push({ label, apply: () => restore(after), revert: () => restore(before) });
+}
+/** Apply a stretch plan for run `runId` (fittings + neighbouring runs follow its moved end). */
+function applyMepStretchPlan(runId: string, next: { start?: any; end?: any; elevation?: number; endElevation?: number }): string[] {
+  const ups = planMepStretch(elements as any, runId, next);
+  for (const u of ups) { const e = elements.find((x) => x.id === u.id); if (e) Object.assign(e.params, u.patch); }
+  return ups.map((u) => u.id);
+}
+
+/**
+ * Authoritative parametric property update used by the Properties panel and
+ * inline editors. Updates params, regenerates geometry via rebuild, and
+ * keeps Native Twin gizmo clones in sync when present.
+ */
+export function applyElementParamChange(
+  elementId: string,
+  key: string,
+  value: number | string | boolean,
+  extra?: Record<string, unknown>,
+): { ok: boolean; reason?: string } {
+  const el = elements.find((e) => e.id === elementId);
+  if (!el) return { ok: false, reason: "element_not_found" };
+  // Central worksharing: an element borrowed by another user (or in a
+  // workset owned by another user) refuses the edit with a named reason.
+  const guard = checkEditAllowed(elementId);
+  if (!guard.allowed) return { ok: false, reason: guard.reason };
+  ensureNativeBaseDimensions(el);
+  const before = JSON.parse(JSON.stringify(el.params));
+  const candidateParams = JSON.parse(JSON.stringify(el.params));
+  if (key === "length") {
+    const a = candidateParams.start, b = candidateParams.end;
+    const ne = a && b && typeof value === "number" ? endpointForLength(a, b, value) : null;
+    if (!ne) return { ok: false, reason: "length_requires_linear_element_and_positive_value" };
+    candidateParams.end = ne;
+  } else if (key === "rotation") {
+    (candidateParams as any).rotation = normalizeDeg(Number(value) || 0);
+  } else if (key === "baseLevelId" || key === "baseOffset" || key === "topLevelId" || key === "topOffset") {
+    const p = candidateParams as any;
+    if (key === "baseLevelId" || key === "topLevelId") p[key] = String(value || "");
+    else p[key] = Number(value) || 0;
+    if (key === "baseLevelId" && p.baseLevelId) {
+      // Keep the element where it is: express its current elevation as an offset from the new base level.
+      const lv = levels.find((l) => l.id === p.baseLevelId);
+      if (lv) p.baseOffset = +(Number(before.elevation) - lv.elevation).toFixed(6);
+    }
+    if (key === "topLevelId" && p.topLevelId && p.topOffset === undefined) p.topOffset = 0;
+    const r = resolveVertical(p, levels, { elevation: Number(p.elevation) || 0, height: Number(p.height) || 0 });
+    if (!r.ok) return { ok: false, reason: r.reason };
+    p.elevation = r.elevation; p.height = r.height;
+  } else {
+    (candidateParams as any)[key] = value;
+    if (key === "elevation" && (candidateParams as any).baseLevelId) {
+      const lv = levels.find((l) => l.id === (candidateParams as any).baseLevelId);
+      if (lv) {
+        (candidateParams as any).baseOffset = +(Number(value) - lv.elevation).toFixed(6);
+        const r = resolveVertical(candidateParams as any, levels, { elevation: Number(value), height: Number(candidateParams.height) });
+        if (r.ok) (candidateParams as any).height = r.height;
+      }
+    }
+  }
+  // Companion params changed together with `key` (e.g. anchored dimension edits move start AND end).
+  if (extra) for (const [k, v] of Object.entries(extra)) (candidateParams as any)[k] = v;
+  const candidate: AuthoredElement = { ...el, params: candidateParams };
+  const diagnostics = validateNativeModel({
+    elements: elements.map((item) => (item.id === el.id ? candidate : item)),
+    levels,
+    grids,
+  }).filter((d) => d.elementId === el.id && d.severity === "error");
+  if (diagnostics.length) {
+    return { ok: false, reason: diagnostics.map((d) => d.code + ": " + d.message).join("; ") };
+  }
+  // MEP runs: fittings and neighbouring runs follow a moved end.
+  const beforeOthers = LINEAR_MEP.has(el.type) ? snapshotMepParams() : null;
+  el.params = candidateParams;
+  if (beforeOthers) {
+    const cp: any = candidateParams, bp: any = before;
+    if (JSON.stringify([cp.start, cp.end, cp.elevation, cp.endElevation]) !== JSON.stringify([bp.start, bp.end, bp.elevation, bp.endElevation])) {
+      // plan against the PRE-edit model, then drop the run itself (already updated)
+      el.params = before;
+      const ups = planMepStretch(elements as any, el.id, { start: cp.start, end: cp.end, elevation: cp.elevation, endElevation: cp.endElevation });
+      el.params = candidateParams;
+      for (const u of ups) { const o = elements.find((x) => x.id === u.id); if (o && o.id !== el.id) Object.assign(o.params, u.patch); }
+    }
+  }
+  // Snapshot frozen mesh provenance; createMesh prefers parametric solids when capable.
+  const mode = String((el.properties as any)?.editMode ?? "");
+  const geomKeys = new Set(["baseLevelId", "baseOffset", "topLevelId", "topOffset", "length", "rotation", "height", "thickness", "width", "depth", "elevation", "sillHeight", "offsetAlongHost", "frameThickness"]);
+  if (el.nativeGeometry && geomKeys.has(key)) {
+    (el.properties as any).nativeGeometrySnapshot = el.nativeGeometry;
+    // Parametric modes keep nativeGeometry for provenance but rebuild via builders / scaled mesh.
+  }
+  // Preserve Layer 2 archive; mark dimension fields as native-modified only.
+  try {
+    markNativeDimensionModified(el.sourceArchive, key);
+  } catch { /* */ }
+  try {
+    rebuild();
+  } catch (err) {
+    // Atomic edit: geometry regeneration failed -> restore the previous valid parameters.
+    el.params = before;
+    if (beforeOthers) for (const [id, params] of beforeOthers) { const o = elements.find((x) => x.id === id); if (o && o.id !== el.id) o.params = params; }
+    try { rebuild(); } catch { /* keep going; previous state restored in the model */ }
+    return { ok: false, reason: "geometry_regeneration_failed: " + (err instanceof Error ? err.message : String(err)) };
+  }
+  markDirty();
+  notifyAuthoringChange();
+  if (TWIN_PLACEMENT_KEYS.has(key)) syncTwinGizmoPosition(el.id);
+  // Parametric equal-param groups (height/thickness/…) follow the driver
+  try {
+    const vNum = typeof value === "number" ? value : Number(value);
+    if (Number.isFinite(vNum)) {
+      import("../modules/parametric/wire-authoring").then((m) => {
+        m.onParametricParamWritten?.(el.id, key, vNum);
+      }).catch(() => {});
+    }
+  } catch { /* */ }
+  console.info(
+    `[authoring] param ${key}=${String(value)} applied to ${el.id} (${el.type}); geometry rebuilt`,
+  );
+  return { ok: true };
+}
+
+
+/** Create a persistent project object from an IFC/FRAG object's exact geometry. */
+export function addNativeGeometryElement(input: {
+  name: string;
+  entity: string;
+  globalId?: string;
+  sourceGlobalId?: string;
+  predefinedType?: string;
+  tag?: string;
+  description?: string;
+  sourceModelId?: string;
+  sourceLocalId?: number;
+  sourceModelName?: string;
+  propertySets?: Record<string, unknown>;
+  quantities?: Record<string, unknown>;
+  positions: number[];
+  color?: string;
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+  scale: [number, number, number];
+  dimensions?: { width: number; height: number; depth: number };
+  /** Full source item record from getItemsData (Layer 2 archive). */
+  sourceRawItem?: unknown;
+  sourceArchive?: SourceArchive;
+  geometryProvenance?: {
+    extractionPath?: string;
+    triangleCount?: number;
+    meshCount?: number;
+    vertexCount?: number;
+    bounds?: { min: [number, number, number]; max: [number, number, number]; center: [number, number, number] };
+    modelMatrixWorld?: number[];
+  };
+}): AuthoredElement {
+  const id = uid();
+  const type = nativeElementTypeFromIfc(input.entity);
+  const pos = input.position;
+  // Reject non-finite geometry — prevents WebGL corruption / black viewport.
+  const positions = input.positions ?? [];
+  if (positions.length < 9) {
+    throw new Error("Native twin geometry has insufficient positions");
+  }
+  for (let i = 0; i < positions.length; i++) {
+    if (!Number.isFinite(positions[i])) {
+      throw new Error(`Native twin geometry has non-finite coordinate at index ${i}`);
+    }
+  }
+  for (const n of [...input.position, ...input.quaternion, ...input.scale]) {
+    if (!Number.isFinite(n)) {
+      throw new Error("Native twin transform contains non-finite values");
+    }
+  }
+
+  // K1: gate the imported twin tessellation before admission. The twin
+  // is admitted with its diagnostics recorded (quarantine) — imported
+  // tessellation is routinely open / non-manifold, so hard refusal here
+  // would break IFC conversion flows that work today. Unbuildable
+  // geometry (empty / non-finite) already throws above.
+  const twinGate = gateSolid(
+    threeGeometryToIndexedMesh(positions, null),
+    `native-twin:${id}`,
+    { source: "import:native-twin", id },
+  );
+  if (twinGate.verdict === "refused") {
+    recordQuarantinedSolid({
+      id,
+      owner: `native-twin:${id}`,
+      source: "import:native-twin",
+      disposition: "quarantined",
+      admitted: true,
+      diagnostics: twinGate.errors.map((d) => ({ code: d.code, message: d.message })),
+      volume: twinGate.volume,
+    });
+  }
+  if (twinGate.verdict !== "ok") {
+    console.warn(`[authoring] native twin ${id} admitted with recorded validity diagnostics: ${summarizeGateDiagnostics(twinGate.diagnostics)}`);
+  }
+
+  // Recover parametric definition from exact source geometry (all disciplines).
+  const derived = deriveLinearParamsFromPositions(
+    positions,
+    input.position,
+    input.quaternion,
+    input.scale,
+  );
+  const planPoly = derivePlanAabbPolygon(positions, input.position, input.scale);
+  const height = derived?.height ?? input.dimensions?.height ?? 0;
+  const thickness = derived?.thickness ?? input.dimensions?.depth ?? input.dimensions?.width ?? 0.2;
+  const elevation = derived?.elevation ?? input.position[1] - (height || 0) / 2;
+  const width = input.dimensions?.width ?? thickness;
+  const depth = input.dimensions?.depth ?? thickness;
+  // Plan point = centre of the placed footprint, NOT the mesh origin (IFC origins are often a corner/base).
+  const fpc = footprintCenterXZ(positions, input.position, input.quaternion, input.scale);
+  const point: [number, number] = fpc ?? [pos[0], pos[2]];
+  const useLinear = LINEAR_ELEMENT_TYPES.has(type) && !!(derived && derived.reliable);
+  const useVertical = !useLinear && (
+    type === "column" || type === "footing" || type === "equipment" || type === "fitting"
+  );
+  const useSlab = !useLinear && !useVertical && !!planPoly && (
+    type === "slab" || type === "roof" || type === "ceiling" || type === "terrain" || type === "room" || type === "area"
+  );
+
+  const caps = classifyTwinCapabilities({
+    type,
+    hasPositions: positions.length >= 9,
+    hasLinearBaseline: useLinear,
+    linearReliable: !!(derived && derived.reliable),
+    hasPoint: useVertical || !!point,
+    hasPolygon: !!planPoly && (useSlab || type === "slab"),
+    vertexCount: Math.floor(positions.length / 3),
+  });
+  // Prefer category-specific parametric modes when recovery succeeded.
+  // Visual mode is always source-mesh for Digital Twins. Parametric capability is
+  // recorded separately so Properties can edit dimensions without replacing geometry
+  // with an approximate box (which caused wall rotation/shape loss).
+  let editMode = "boundary-mesh";
+  let parametricCapability: string = caps.editMode;
+  if (useLinear) parametricCapability = "parametric-linear";
+  else if (useVertical) parametricCapability = "parametric-vertical";
+  else if (useSlab) parametricCapability = "parametric-slab";
+
+  const el: AuthoredElement = {
+    id, type,
+    name: input.name || `${type} native twin`,
+    color: input.color,
+    params: {
+      point,
+      height,
+      thickness,
+      elevation,
+      width,
+      depth,
+      ...(useLinear && derived ? { start: derived.start, end: derived.end } : {}),
+      ...(useSlab && planPoly ? { polygon: planPoly } : {}),
+    },
+    properties: {
+      nativeTwin: true,
+      nativeBaseHeight: height,
+      nativeBaseThickness: thickness,
+      nativeBaseWidth: width,
+      nativeBaseLength: useLinear && derived ? Math.hypot(derived.end[0] - derived.start[0], derived.end[1] - derived.start[1]) : undefined,
+      editMode,
+      parametricCapability,
+      forceParametricSolid: false,
+      preserveSourceGeometry: true,
+      twinCapabilities: caps.notes,
+      sourceModelId: input.sourceModelId,
+      sourceLocalId: input.sourceLocalId,
+      sourceGlobalId: input.sourceGlobalId || input.globalId,
+      sourceModelName: input.sourceModelName,
+      editable: editMode !== "read-only",
+      pinned: false,
+    },
+    nativeGeometry: { positions: [...positions] },
+    ifc: {
+      entity: input.entity || "IfcBuildingElementProxy",
+      globalId: input.globalId,
+      sourceGlobalId: input.sourceGlobalId || input.globalId,
+      predefinedType: input.predefinedType,
+      tag: input.tag,
+      description: input.description,
+      sourceModelId: input.sourceModelId,
+      sourceLocalId: input.sourceLocalId,
+      sourceModelName: input.sourceModelName,
+      propertySets: input.propertySets,
+      quantities: input.quantities,
+    },
+    transform: { position: [...input.position], quaternion: [...input.quaternion], scale: [...input.scale] },
+    sourceArchive: input.sourceArchive ?? buildSourceArchive({
+      rawItem: input.sourceRawItem ?? {
+        propertySets: input.propertySets,
+        quantities: input.quantities,
+        GlobalId: input.globalId,
+        Name: input.name,
+        Description: input.description,
+        Tag: input.tag,
+        PredefinedType: input.predefinedType,
+        Entity: input.entity,
+      },
+      identity: {
+        sourceModelId: input.sourceModelId,
+        sourceLocalId: input.sourceLocalId,
+        sourceModelName: input.sourceModelName,
+        globalId: input.globalId || input.sourceGlobalId,
+        entityType: input.entity,
+        predefinedType: input.predefinedType,
+        name: input.name,
+        tag: input.tag,
+        description: input.description,
+      },
+      geometry: {
+        ...(input.geometryProvenance ?? {}),
+        tessellationPositionsCount: positions.length,
+        notes: [
+          "Tessellated positions are the editable/render representation; original source topology remains in rawItem when provided by the loader.",
+        ],
+      },
+      sourceDimensions: {
+        height: input.dimensions?.height ?? null,
+        width: input.dimensions?.width ?? null,
+        depth: input.dimensions?.depth ?? null,
+      },
+    }),
+  };
+  elements.push(el);
+  // Incremental add — avoid full authored-scene dispose/rebuild which can
+  // flash the viewport black and drop unrelated meshes under load.
+  try {
+    const mesh = createMesh(el);
+    if (mesh) group.add(mesh);
+    applySelection();
+  } catch (err) {
+    const idx = elements.findIndex((e) => e.id === id);
+    if (idx >= 0) elements.splice(idx, 1);
+    throw err;
+  }
+  markDirty();
+  notifyAuthoringChange();
+  return el;
+}
+
+/** Update a reconstructed object's transform without rebuilding the complete scene. */
+export function updateNativeGeometryElement(
+  id: string,
+  transform: { position: [number, number, number]; quaternion: [number, number, number, number]; scale: [number, number, number] },
+  rebuildScene = false,
+): boolean {
+  const el = getElementById(id);
+  if (!el?.nativeGeometry) return false;
+  el.transform = {
+    position: [...transform.position],
+    quaternion: [...transform.quaternion],
+    scale: [...transform.scale],
+  };
+  el.params.elevation = transform.position[1];
+  (el.properties as any).nativeBaseElevation = el.params.elevation; // gizmo move re-baselines the elevation shift
+  if (!rebuildScene) {
+    group.traverse((obj: any) => {
+      if (obj?.isMesh && obj.userData?.elementId === id) {
+        obj.position.set(...transform.position);
+        obj.quaternion.set(...transform.quaternion);
+        obj.scale.set(...transform.scale);
+        obj.updateMatrixWorld(true);
+      }
+    });
+    markDirty();
+  } else {
+    rebuild();
+    markDirty();
+    notifyAuthoringChange();
+  }
+  return true;
+}
+
+/**
+ * Delete one authored element (undoable via history / Ctrl+Z).
+ * Delegates to deleteElements so host-cascade and the undo stack stay consistent.
+ */
+export function removeElementById(id: string): boolean {
+  const idx = elements.findIndex((el) => el.id === id);
+  if (idx < 0) return false;
+  // Central worksharing: a borrowed element refuses removal (deleteElements
+  // re-checks the full host→child cascade as well).
+  const refused = guardRefusals([id]);
+  if (refused.length) {
+    toastGuardRefusals("delete", refused);
+    return false;
+  }
+  deleteElements([id]);
+  return true;
+}
+
+export function setElementVisibility(id: string, visible: boolean): void {
+  const group = getAuthoredGroup();
+  group.traverse((obj: any) => {
+    if (obj.userData.elementId === id) {
+      obj.visible = visible;
+    }
+  });
+}
+
+export function getElementById(id: string): AuthoredElement | null {
+  return elements.find((el) => el.id === id) ?? null;
+}
+
+export function isElementPinned(id: string): boolean {
+  const el = getElementById(id);
+  return !!el?.properties?.pinned;
+}
+
+/** Run `fn` and record ONE undo step covering every element's parameters (multi-element edits). */
+function withParamHistory<T>(label: string, fn: () => T, didChange: (r: T) => boolean): T {
+  const snap = () => new Map(elements.map((e) => [e.id, JSON.parse(JSON.stringify(e.params))] as [string, any]));
+  const before = snap();
+  const r = fn();
+  if (!didChange(r)) return r;
+  const after = snap();
+  const restore = (m: Map<string, any>) => {
+    for (const e of elements) { const p = m.get(e.id); if (p) e.params = JSON.parse(JSON.stringify(p)); }
+    rebuild(); markDirty(); notifyAuthoringChange();
+  };
+  history.push({ label, apply: () => restore(after), revert: () => restore(before) });
+  return r;
+}
+
+/** Set the same parameter(s) on every selected, unpinned element (Modify options bar). One undo step. */
+export function editSelectedParams(patch: Record<string, number>): { changed: number; failed: string[] } {
+  const ids = [...selectedIds].filter((id) => !elements.find((e) => e.id === id)?.properties?.pinned);
+  if (!ids.length) return { changed: 0, failed: [] };
+  return withParamHistory(i18nT("counts.editElements", { n: ids.length }), () => {
+    let changed = 0; const failed: string[] = [];
+    for (const id of ids) {
+      const el = elements.find((e) => e.id === id)!;
+      for (const [k, v] of Object.entries(patch)) {
+        if (!(k in (el.params as any))) continue; // the element has no such parameter
+        const r = applyElementParamChange(id, k, v);
+        if (r.ok) changed++; else failed.push(`${el.name}: ${r.reason}`);
+      }
+    }
+    return { changed, failed };
+  }, (r) => r.changed > 0);
+}
+
+/** Reverse the drawing direction of the selected linear elements (start <-> end). One undo step. */
+/** Add a sweep (baseboard / cornice / wainscot / reveal) to every selected wall. One undo step. */
+export function addWallSweepToSelected(placement: Omit<WallSweepPlacement, "wallId">): number {
+  const walls = [...selectedIds].map((id) => elements.find((e) => e.id === id)).filter((e): e is AuthoredElement => !!e && e.type === "wall");
+  if (!walls.length) return 0;
+  return withParamHistory(i18nT("counts.addWallSweep", { n: walls.length }), () => {
+    for (const w of walls) {
+      const list = (((w.params as any).sweeps ?? []) as WallSweepPlacement[]).slice();
+      list.push({ ...placement, wallId: w.id });
+      (w.params as any).sweeps = list;
+    }
+    rebuild(); markDirty(); notifyAuthoringChange();
+    return walls.length;
+  }, (n) => n > 0);
+}
+
+/** Remove all sweeps from the selected walls. One undo step. */
+export function clearWallSweepsSelected(): number {
+  const walls = [...selectedIds].map((id) => elements.find((e) => e.id === id)).filter((e): e is AuthoredElement => !!e && e.type === "wall" && ((e.params as any).sweeps?.length ?? 0) > 0);
+  if (!walls.length) return 0;
+  return withParamHistory(`Clear wall sweeps (${walls.length})`, () => {
+    for (const w of walls) delete (w.params as any).sweeps;
+    rebuild(); markDirty(); notifyAuthoringChange();
+    return walls.length;
+  }, (n) => n > 0);
+}
+
+export function reverseSelected(): number {
+  const targets = elements.filter((e) => selectedIds.has(e.id) && !e.properties?.pinned && e.params.start && e.params.end);
+  if (!targets.length) return 0;
+  return withParamHistory(i18nT("counts.flipElements", { n: targets.length }), () => {
+    for (const el of targets) {
+      const p: any = el.params;
+      [p.start, p.end] = [p.end, p.start];
+      if (p.endElevation !== undefined) [p.elevation, p.endElevation] = [p.endElevation, p.elevation];
+    }
+    rebuild(); markDirty(); notifyAuthoringChange();
+    return targets.length;
+  }, (n) => n > 0);
+}
+
+export function pinSelected(pinned = true): number {
+  let changed = 0;
+  const targets = elements.filter((el) => selectedIds.has(el.id));
+  if (!targets.length) return 0;
+  const before = targets.map((el) => JSON.parse(JSON.stringify(el.properties ?? {})));
+  for (const el of targets) {
+    const next = { ...(el.properties ?? {}) };
+    if (!!next.pinned === pinned) continue;
+    next.pinned = pinned;
+    el.properties = next;
+    changed += 1;
+  }
+  if (!changed) return 0;
+  const after = targets.map((el) => JSON.parse(JSON.stringify(el.properties ?? {})));
+  history.push({
+    label: i18nT(pinned ? "counts.pinElements" : "counts.unpinElements", { n: changed }),
+    apply: () => { targets.forEach((el, i) => { el.properties = JSON.parse(JSON.stringify(after[i])); }); markDirty(); notifyAuthoringChange(); },
+    revert: () => { targets.forEach((el, i) => { el.properties = JSON.parse(JSON.stringify(before[i])); }); markDirty(); notifyAuthoringChange(); },
+  });
+  markDirty();
+  notifyAuthoringChange();
+  return changed;
+}
+
+export function createSimilarFromSelection(): string | null {
+  const id = [...selectedIds][0];
+  const el = id ? getElementById(id) : null;
+  if (!el) return null;
+  const type = el.type === "fitting" ? (el.params.parentType ?? "equipment") :
+    (el.type === "room" || el.type === "area" || el.type === "stairs" || el.type === "railing" || el.type === "ramp" || el.type === "curtain-wall" || el.type === "generic" ? "equipment" : el.type);
+  setAuthoringTool(type);
+  return type;
+}
+
+export function joinSelectedWalls(): number {
+  const walls = elements.filter((el) => selectedIds.has(el.id) && el.type === "wall" && !el.properties?.pinned);
+  if (!walls.length) return 0;
+  let changed = 0;
+  for (const wall of walls) {
+    const before = JSON.stringify(wall.params);
+    autoJoinWallToNeighbors(wall.id);
+    if (before !== JSON.stringify(wall.params)) changed += 1;
+  }
+  if (changed) {
+    markDirty();
+    notifyAuthoringChange();
+  }
+  return changed;
+}
+
+export function splitSelectedAtMidpoint(): number {
+  const lineTypes = new Set<ElementType>([
+    "wall", "beam", "brace", "duct", "pipe", "cable-tray", "conduit", "mline"
+  ]);
+  const targets = elements.filter((el) => selectedIds.has(el.id) && !el.properties?.pinned && lineTypes.has(el.type) && el.params.start && el.params.end);
+  if (!targets.length) return 0;
+
+  const clones: AuthoredElement[] = [];
+  const originals = targets.map((el) => ({ el, params: JSON.parse(JSON.stringify(el.params)) }));
+  for (const el of targets) {
+    const [sx, sz] = el.params.start!;
+    const [ex, ez] = el.params.end!;
+    const mid: Vec2 = [(sx + ex) / 2, (sz + ez) / 2];
+    el.params.end = mid;
+    const clone: AuthoredElement = {
+      ...JSON.parse(JSON.stringify(el)),
+      id: uid(),
+      name: `${el.name} B`,
+      params: { ...JSON.parse(JSON.stringify(el.params)), start: mid, end: [ex, ez] },
+      properties: { ...(el.properties ?? {}), splitFrom: el.id },
+    };
+    clones.push(clone);
+  }
+  const splitParams = targets.map((el) => JSON.parse(JSON.stringify(el.params)));
+  elements.push(...clones);
+  rebuild();
+  history.push({
+    label: i18nT("counts.splitElements", { n: targets.length }),
+    apply: () => {
+      originals.forEach(({ el }, i) => { el.params = JSON.parse(JSON.stringify(splitParams[i])); });
+      for (const c of clones) if (!elements.includes(c)) elements.push(c);
+      rebuild(); markDirty();
+    },
+    revert: () => {
+      for (const c of clones) {
+        const idx = elements.findIndex((x) => x.id === c.id);
+        if (idx >= 0) elements.splice(idx, 1);
+      }
+      originals.forEach(({ el, params }) => { el.params = JSON.parse(JSON.stringify(params)); });
+      rebuild(); markDirty();
+    },
+  });
+  markDirty();
+  notifyAuthoringChange();
+  return targets.length;
+}
+
+export function alignSelectedAxis(axis: "x" | "z"): number {
+  const targets = elements.filter((el) => selectedIds.has(el.id) && !el.properties?.pinned);
+  if (targets.length < 2) return 0;
+  const coord = (el: AuthoredElement): number => {
+    if (el.params.point) return axis === "x" ? el.params.point[0] : el.params.point[1];
+    if (el.params.start && el.params.end) return axis === "x" ? (el.params.start[0] + el.params.end[0]) / 2 : (el.params.start[1] + el.params.end[1]) / 2;
+    return 0;
+  };
+  const target = coord(targets[0]);
+  transformElements(targets.map((el) => el.id), (el) => {
+    if (el.params.point) {
+      if (axis === "x") el.params.point[0] = target; else el.params.point[1] = target;
+    }
+    if (el.params.start && el.params.end) {
+      const delta = target - coord(el);
+      if (axis === "x") { el.params.start[0] += delta; el.params.end[0] += delta; }
+      else { el.params.start[1] += delta; el.params.end[1] += delta; }
+    }
+  });
+  return targets.length - 1;
+}
+
+export function deleteSelectedElement() {
+  if (selectedDatum && selectedIds.size === 0) { deleteDatum(selectedDatum.kind, selectedDatum.id); return; }
+  deleteElements([...selectedIds]);
+}
+
+/**
+ * Bulk-select authored elements by id, replacing the current authored
+ * selection. Pass an empty array to clear the authored selection.
+ *
+ * Used by select-all.ts to combine fragment + authored selection.
+ */
+export function selectAllAuthored(ids: string[]): void {
+  // Same replace as setSelectedAuthored, routed through it so Select All
+  // also records the previous selection for Select Previous.
+  setSelectedAuthored(ids, "replace");
+}
+
+/** Whether an authored previous selection exists to restore. */
+export function hasPreviousAuthoredSelection(): boolean {
+  return previousAuthoredStore.hasPrevious();
+}
+
+/**
+ * Revit "Select Previous" for authored elements: restore the authored ids
+ * in place before the last selection change (swap, so a second press
+ * toggles back). Returns false when there is nothing to restore.
+ */
+export function selectPreviousAuthored(): boolean {
+  const prev = previousAuthoredStore.restore([...selectedIds]);
+  if (!prev) return false;
+  restoringPreviousAuthored = true;
+  try {
+    setSelectedAuthored(prev, "replace");
+  } finally {
+    restoringPreviousAuthored = false;
+  }
+  return true;
+}
+
+export async function clearAllElements(force = false): Promise<void> {
+  if (!elements.length) return;
+  if (!force && !(await confirmDialog("Delete all", `Delete all ${elements.length} authored objects?`))) return;
+  const snapshot = JSON.parse(JSON.stringify(elements));
+  history.exec({
+    label: `Clear all ${elements.length} elements`,
+    apply: () => {
+      elements.length = 0;
+      selectedIds.clear();
+      for (const k of Object.keys(counters)) delete counters[k];
+      rebuild(); markDirty();
+      paletteTarget = null;
+      notifyAuthoringChange();
+    },
+    revert: () => {
+      elements.length = 0;
+      for (const el of snapshot) elements.push(el);
+      for (const el of elements) {
+        const n = parseInt(el.name.split(" ").pop() ?? "0", 10);
+        if (Number.isFinite(n)) counters[el.type] = Math.max(counters[el.type] ?? 0, n);
+      }
+      rebuild(); markDirty();
+    },
+  });
+}
+
+export function clearDatums() {
+  grids = []; levels = []; gridIdx = 0; levelIdx = 0;
+  rebuildDatums(); markDirty();
+}
+
+export function getGrids() { return grids; }
+export function setGrids(list: GridDatum[] | undefined | null) {
+  grids = Array.isArray(list) ? list : [];
+  gridIdx = grids.length;
+  if (selectedDatum?.kind === "grid" && !grids.some((g) => g.id === selectedDatum!.id)) selectedDatum = null;
+  rebuildDatums();
+}
+export function getLevels() { return levels; }
+export function setLevels(list: LevelDatum[] | undefined | null) {
+  levels = Array.isArray(list) ? list : [];
+  levelIdx = levels.length;
+  if (selectedDatum?.kind === "level" && !levels.some((l) => l.id === selectedDatum!.id)) selectedDatum = null;
+  rebuildDatums();
+}
+
+export function setElements(list: AuthoredElement[]) {
+  elements.length = 0;
+  for (const el of list) elements.push(el);
+  try {
+    const repaired = repairMistypedOpenings();
+    if (repaired > 0) {
+      console.info(`[authoring] repaired ${repaired} plan-placed door/window element(s) authored with the wrong type`);
+    }
+  } catch (err) {
+    console.warn("[authoring] opening repair failed", err);
+  }
+  for (const k of Object.keys(counters)) delete counters[k];
+  for (const el of elements) {
+    const n = parseInt(el.name.split(" ").pop() ?? "0", 10);
+    if (Number.isFinite(n)) counters[el.type] = Math.max(counters[el.type] ?? 0, n);
+  }
+  selectedIds.clear();
+  rebuild();
+  paletteTarget = null;
+  notifyAuthoringChange();
+}
+export function clearElements() { setElements([]); }
+/**
+ * Bulk-select authored elements with explicit mode control.
+ * Used by box-selection.ts to combine a rubber band with the current
+ * selection (add / remove / replace).
+ */
+/** Return the authored element id under the supplied viewport pointer, without changing selection. */
+export function pickAuthoredElementAt(e: MouseEvent): string | null {
+  return elementAt(e);
+}
+
+/** Nearest authored element under the pointer with its ray distance (for depth arbitration vs linked models). */
+export function pickAuthoredHitAt(e: MouseEvent): { id: string; distance: number; isNativeTwin: boolean } | null {
+  const hits = pickAuthoredHitsAt(e);
+  return hits.length ? hits[0] : null;
+}
+
+/**
+ * G3 — every authored element under the pointer, nearest first (one raycast
+ * over the authoring group, deduped by element id). This is the 3D hover
+ * hit-stack Tab cycles through. It must raycast the group directly: the
+ * meshes carry their element id in `userData.elementId` and are never named
+ * by id, so `scene.getObjectByName(id)` — what the old preselection tooltip
+ * used — finds nothing and the hover card never appears. Same pinned /
+ * category filtering as `elementAt`, applied per hit.
+ */
+export function pickAuthoredHitsAt(e: MouseEvent): Array<{ id: string; distance: number; isNativeTwin: boolean }> {
+  const out: Array<{ id: string; distance: number; isNativeTwin: boolean }> = [];
+  try {
+    if (!ctx.world?.camera?.three || !group.children.length) return out;
+    const allowPinned = getSelectionPrefs().pinned;
+    const ray = new THREE.Raycaster();
+    ray.params.Line = { threshold: 0.15 };
+    ray.params.Points = { threshold: 0.2 };
+    ray.setFromCamera(ndcOf(e), ctx.world.camera.three);
+    const seen = new Set<string>();
+    for (const h of ray.intersectObjects(group.children, true)) {
+      if (!visibleChain(h.object)) continue;
+      let o: THREE.Object3D | null = h.object;
+      while (o) {
+        const id = o.userData?.elementId;
+        if (id) {
+          const el = elements.find((x) => x.id === String(id));
+          if (el && !selection.matchesAuthoredCategoryFilter(el.type, el.properties as any)) {
+            o = o.parent;
+            continue;
+          }
+          if (!allowPinned && (el as any)?.properties?.pinned) {
+            o = o.parent;
+            continue;
+          }
+          if (!seen.has(String(id))) {
+            seen.add(String(id));
+            out.push({ id: String(id), distance: h.distance, isNativeTwin: !!(el?.properties as any)?.nativeTwin });
+          }
+          break;
+        }
+        o = o.parent;
+      }
+    }
+  } catch { /* */ }
+  return out;
+}
+
+export function setSelectedAuthored(
+  ids: string[],
+  mode: "replace" | "add" | "remove" = "replace",
+): void {
+  // Remember the selection before this change, so Select Previous
+  // (Ctrl+Left) can restore it. No-op when nothing actually changes.
+  if (!restoringPreviousAuthored) {
+    const next = mode === "replace" ? new Set(ids) : new Set(selectedIds);
+    if (mode === "add") for (const id of ids) next.add(id);
+    if (mode === "remove") for (const id of ids) next.delete(id);
+    const changed =
+      next.size !== selectedIds.size || [...next].some((id) => !selectedIds.has(id));
+    if (changed) previousAuthoredStore.note([...selectedIds]);
+  }
+  if (mode === "replace") {
+    selectedIds.clear();
+    for (const id of ids) selectedIds.add(id);
+  } else if (mode === "add") {
+    for (const id of ids) selectedIds.add(id);
+  } else {
+    for (const id of ids) selectedIds.delete(id);
+  }
+  applySelection();
+  refreshGrips();
+  updateLabel();
+  if (selectedIds.size === 1) {
+    const el = elements.find((e) => e.id === [...selectedIds][0]);
+    paletteTarget = el ? { mode: "edit", elementId: el.id, type: el.type } : null;
+  } else {
+    paletteTarget = null;
+  }
+  notifyAuthoringChange();
+}
+
+/**
+ * Compute the world-space AABB of one authored element.
+ * Builds a temporary mesh, measures it, then disposes it — no scene
+ * mutation. Used by box-selection.ts during rubber-band queries.
+ */
+export function getElementWorldBox(el: AuthoredElement): THREE.Box3 | null {
+  let mesh: THREE.Object3D | null = null;
+  try {
+    mesh = createMesh(el);
+  } catch {
+    mesh = null;
+  }
+  if (!mesh) return null;
+  const box = new THREE.Box3().setFromObject(mesh);
+  disposeObj(mesh);
+  return box.isEmpty() ? null : box;
+}
+export function rebuildAuthored(): void { rebuild(); markDirty(); }
+
+/** When on, moving an MEP part also moves everything connected to it (default on). */
+let moveConnectedMep = (() => { try { return localStorage.getItem("obs.moveConnectedMep") !== "0"; } catch { return true; } })();
+try { (window as any).__obsMoveConnected = moveConnectedMep; } catch { /* */ }
+export function isMoveConnectedMep(): boolean { return moveConnectedMep; }
+export function setMoveConnectedMep(on: boolean): void {
+  moveConnectedMep = on;
+  try { localStorage.setItem("obs.moveConnectedMep", on ? "1" : "0"); } catch { /* */ }
+}
+/**
+ * BIM authoring software-style Tab on an MEP part: 1st press selects its branch (up to the next junction),
+ * 2nd press selects the whole connected network, 3rd press returns to the single part.
+ * Returns the stage applied, or null when the selection is not a single MEP part / cycle.
+ */
+let mepTabState: { anchor: string; stage: 0 | 1 | 2; sig: string } | null = null;
+const selSig = (ids: string[]) => [...ids].sort().join("|");
+export function cycleMepSelection(): "branch" | "network" | "single" | null {
+  const ids = [...selectedIds].map(String);
+  const cont = !!mepTabState && selSig(ids) === mepTabState.sig; // selection untouched since our last Tab
+  const anchor = cont ? mepTabState!.anchor : ids.length === 1 ? ids[0] : null;
+  if (!anchor) return null;
+  const el = elements.find((e) => e.id === anchor);
+  if (!el || !isMepElement(el)) return null;
+  const stage = (cont ? mepTabState!.stage : 0);
+  const next = ((stage + 1) % 3) as 0 | 1 | 2;
+  const picked = next === 0 ? [anchor] : connectedSelection(anchor, elements as any, next === 1 ? "branch" : "network");
+  mepTabState = { anchor, stage: next, sig: selSig(picked) };
+  setSelectedAuthored(picked, "replace");
+  if (next === 0) return "single";
+  return next === 1 ? "branch" : "network";
+}
+
+/**
+ * Ids to move rigidly with `ids`. Connected MEP parts are no longer dragged as a rigid network:
+ * they FOLLOW (see mepFollowPatches). To move a whole network, Tab-select it first.
+ */
+export function expandConnectedIds(ids: Iterable<string>): string[] {
+  return [...ids];
+}
+/**
+ * BIM authoring software-style follow: patches for the MEP parts that stay behind when `movedIds` move by (dx,dz,dy):
+ * fittings at the moved ends follow, the other runs on them stretch. Empty when the option is off.
+ * `baseline` (id -> params) plans against a pre-drag state so live drags stay idempotent.
+ */
+export function mepFollowPatches(movedIds: Iterable<string>, dx: number, dz: number, dy = 0, baseline?: Map<string, any>): Array<{ id: string; patch: Record<string, unknown> }> {
+  if (!moveConnectedMep) return [];
+  const ids = [...movedIds].map(String);
+  const kinds = ids.map((id) => elements.find((x) => x.id === id)).filter(Boolean) as AuthoredElement[];
+  const hasMep = kinds.some((e) => isMepElement(e));
+  const hasLinear = kinds.some((e) => FOLLOW_LINEAR.has(e.type));
+  if (!hasMep && !hasLinear) return [];
+  const view = baseline ? elements.map((e) => (baseline.has(e.id) ? { ...e, params: baseline.get(e.id) } : e)) : elements;
+  // walls / beams / strips that share an end stay joined; MEP fittings follow and runs stretch
+  const merged = new Map<string, Record<string, unknown>>();
+  const add = (list: Array<{ id: string; patch: Record<string, unknown> }>) => { for (const u of list) merged.set(u.id, { ...(merged.get(u.id) ?? {}), ...u.patch }); };
+  if (hasMep) add(planMepMove(view as any, ids, dx, dz, dy));
+  if (hasLinear) add(planLinearFollow(view as any, ids, dx, dz, dy));
+  return [...merged].map(([id, patch]) => ({ id, patch }));
+}
+
+/** Replace an element's boundary polygon (Edit Boundary), with undo/redo. Returns false if rejected. */
+export function setElementPolygon(id: string, polygon: Vec2[], label = "Edit boundary"): boolean {
+  const el = elements.find((e) => e.id === id);
+  if (!el || !el.params.polygon || el.properties?.pinned) return false;
+  if (!isValidBoundary(polygon as Array<[number, number]>)) return false;
+  const before = JSON.parse(JSON.stringify(el.params.polygon)) as Vec2[];
+  const after = polygon.map((p) => [p[0], p[1]] as Vec2);
+  if (JSON.stringify(before) === JSON.stringify(after)) return true;
+  history.push({
+    label: `${label} · ${el.name}`,
+    apply: () => { el.params.polygon = after.map((p) => [p[0], p[1]] as Vec2); rebuild(); markDirty(); notifyAuthoringChange(); },
+    revert: () => { el.params.polygon = before.map((p) => [p[0], p[1]] as Vec2); rebuild(); markDirty(); notifyAuthoringChange(); },
+  });
+  el.params.polygon = after.map((p) => [p[0], p[1]] as Vec2);
+  rebuild(); markDirty(); notifyAuthoringChange();
+  return true;
+}
+
+/**
+ * Place a linear authored element from plan coordinates (Floor Plan modeling).
+ * Used by Plan View Wall tool — draw in plan → creates 3D wall.
+ */
+export async function addLinearElement(
+  type: "wall" | "beam" | "strip" | "duct" | "pipe" | "cable-tray" | "conduit" | "mline",
+  x1: number,
+  z1: number,
+  x2: number,
+  z2: number,
+  elev?: number,
+  size?: { thickness?: number; height?: number },
+  /** Extra element properties, e.g. { lineStyle: "insulation" } for G7 insulation runs. */
+  extraProps?: Record<string, unknown>,
+): Promise<void> {
+  if (elev != null) level = elev;
+  const d = DEFAULTS[type] ?? { height: 3, thickness: 0.2 };
+  const thick = size?.thickness ?? d.thickness;
+  const height = size?.height ?? d.height;
+  let sx = x1, sz = z1, ex = x2, ez = z2;
+  const props: Record<string, unknown> = {
+    ...(type === "wall"
+      ? {
+          locationLine: wallLocationLine,
+          joinStatus: wallJoinStatus,
+          chain: wallChain,
+          offset: wallOffset,
+        }
+      : {}),
+    ...(extraProps ?? {}),
+  };
+  // Location-line offset is wall-only. MEP runs stay on the drawn centerline.
+  if (type === "wall") {
+    const off = applyWallLocationOffset(x1, z1, x2, z2, thick);
+    sx = off.start[0]; sz = off.start[1];
+    ex = off.end[0]; ez = off.end[1];
+  }
+  const dir = Math.atan2(ez - sz, ex - sx);
+  let bendInfo: {
+    parent: AuthoredElement;
+    originalEnd: [number, number];
+    trimmedEnd: [number, number];
+    bendX: number;
+    bendZ: number;
+    angleIn: number;
+    angleOut: number;
+    bendRadius: number;
+  } | null = null;
+
+  // Auto MEP fitting at chain bend. The linear runs terminate exactly at the
+  // fitting connection planes so the duct/pipe/tray/conduit never penetrates
+  // the elbow. The same connection sequence is used for every fitted MEP type.
+  if (FITTED_TYPES.has(type as ElementType) && lastPlanLinear && lastPlanLinear.type === type) {
+    const dEnd = Math.hypot(sx - lastPlanLinear.end[0], sz - lastPlanLinear.end[1]);
+    if (dEnd < 0.15) {
+      const angDiff = ((dir - lastPlanLinear.dir + Math.PI) % (2 * Math.PI)) - Math.PI;
+      if (Math.abs(angDiff) > 0.15 && Math.abs(Math.abs(angDiff) - Math.PI) > 0.15) {
+        const parent = elements.find((e) => e.id === lastPlanLinear!.id) ?? null;
+        if (parent?.params?.start && parent.params.end) {
+          const prevLen = Math.hypot(
+            lastPlanLinear.end[0] - parent.params.start[0],
+            lastPlanLinear.end[1] - parent.params.start[1],
+          );
+          const nextLen = Math.hypot(ex - sx, ez - sz);
+          // BIM authoring software-style elbow: centreline radius 1.5 x width, shrunk only when the
+          // adjoining runs are too short. Runs end at the true tangent points
+          // (tangent length = r * tan(turn / 2), not r, for non-90 degree bends).
+          const bendX = lastPlanLinear.end[0];
+          const bendZ = lastPlanLinear.end[1];
+          const turn = turnAngle(lastPlanLinear.dir, dir);
+          const bendRadius = clampBendRadius(defaultBendRadius(Math.max(thick, height)), turn, prevLen, nextLen);
+          const eg = elbowGeometry([bendX, bendZ], lastPlanLinear.dir, dir, bendRadius);
+          const inX = eg ? eg.T1[0] : bendX;
+          const inZ = eg ? eg.T1[1] : bendZ;
+          const outX = eg ? eg.T2[0] : bendX;
+          const outZ = eg ? eg.T2[1] : bendZ;
+
+          // Trim the previous run back to the elbow's inlet connection.
+          // The mutation is committed atomically with the fitting + new run below.
+          const originalEnd: [number, number] = [parent.params.end[0], parent.params.end[1]];
+          const trimmedEnd: [number, number] = [inX, inZ];
+          parent.params.end = trimmedEnd;
+          sx = outX;
+          sz = outZ;
+          bendInfo = {
+            parent, originalEnd, trimmedEnd, bendX, bendZ,
+            angleIn: lastPlanLinear.dir, angleOut: dir, bendRadius,
+          };
+        }
+      }
+    }
+  }
+
+  // Tee: new run starts on an existing MEP segment mid-point
+  if (FITTED_TYPES.has(type as ElementType)) {
+    for (const el of elements) {
+      if (el.type !== type || !el.params.start || !el.params.end) continue;
+      const [ax, az] = el.params.start;
+      const [bx, bz] = el.params.end;
+      const dx = bx - ax, dz = bz - az;
+      const L2 = dx * dx + dz * dz || 1;
+      let t = ((sx - ax) * dx + (sz - az) * dz) / L2;
+      if (t > 0.12 && t < 0.88) {
+        const px = ax + t * dx, pz = az + t * dz;
+        if (Math.hypot(sx - px, sz - pz) < Math.max(0.2, thick)) {
+          const hostDir = Math.atan2(dz, dx);
+          spawnFitting(
+            type as ElementType,
+            el,
+            px, pz,
+            hostDir,
+            dir,
+            "tee",
+            { thickness: thick, height, elevation: level },
+          );
+          break;
+        }
+      }
+    }
+  }
+
+  // Chain: snap NEW wall start to previous end only — previous wall stays fixed
+  if (lastPlanLinear && lastPlanLinear.type === type && wallChain) {
+    const dEnd = Math.hypot(sx - lastPlanLinear.end[0], sz - lastPlanLinear.end[1]);
+    if (dEnd < 0.35) {
+      sx = lastPlanLinear.end[0];
+      sz = lastPlanLinear.end[1];
+      // Do NOT mutate previous element endpoints (that skewed existing walls)
+    }
+  }
+
+  // End-point snap onto any existing wall centerline / end (new wall only)
+  if (type === "wall") {
+    const endTol = Math.max(0.12, thick * 0.85);
+    const faceTol = Math.max(0.14, thick * 0.95);
+    const snapPt = (px: number, pz: number): [number, number] => {
+      let best: { x: number; z: number; d: number } | null = null;
+      for (const other of elements) {
+        if (other.type !== "wall" || !other.params.start || !other.params.end) continue;
+        const [ax, az] = other.params.start;
+        const [bx, bz] = other.params.end;
+        for (const ep of [[ax, az], [bx, bz]] as [number, number][]) {
+          const d = Math.hypot(px - ep[0], pz - ep[1]);
+          if (d <= endTol && (!best || d < best.d)) best = { x: ep[0], z: ep[1], d };
+        }
+        const proj = projectOntoSegment(px, pz, ax, az, bx, bz);
+        if (proj.t > 0.02 && proj.t < 0.98 && proj.dist <= faceTol) {
+          if (!best || proj.dist < best.d) best = { x: proj.x, z: proj.z, d: proj.dist };
+        }
+      }
+      return best ? [best.x, best.z] : [px, pz];
+    };
+    [sx, sz] = snapPt(sx, sz);
+    [ex, ez] = snapPt(ex, ez);
+  }
+
+  let el: AuthoredElement | null = null;
+  if (bendInfo) {
+    await history.transaction(`Create ${cap(type)} with connected elbow`, async () => {
+      history.push({
+        label: `Trim ${cap(type)} to fitting`,
+        apply: () => { bendInfo!.parent.params.end = [...bendInfo!.trimmedEnd]; rebuild(); markDirty(); },
+        revert: () => { bendInfo!.parent.params.end = [...bendInfo!.originalEnd]; rebuild(); markDirty(); },
+      });
+      spawnFitting(
+        type as ElementType,
+        bendInfo.parent,
+        bendInfo.bendX,
+        bendInfo.bendZ,
+        bendInfo.angleIn,
+        bendInfo.angleOut,
+        "elbow",
+        { thickness: thick, height, elevation: level, bendRadius: bendInfo.bendRadius },
+      );
+      el = await createElement(type as any, {
+        start: [sx, sz],
+        end: [ex, ez],
+        height,
+        thickness: thick,
+        ...slopedElevations(type, sx, sz, ex, ez),
+      }, props);
+    });
+  } else {
+    el = await createElement(type as any, {
+      start: [sx, sz],
+      end: [ex, ez],
+      height,
+      thickness: thick,
+      ...slopedElevations(type, sx, sz, ex, ez),
+    }, props);
+  }
+
+  if (!el) return;
+
+  if (type === "wall" && wallJoinStatus !== "disallow") {
+    try { autoJoinWallToNeighbors(el.id); } catch { /* */ }
+  }
+
+  lastPlanLinear = {
+    type,
+    end: [ex, ez],
+    dir,
+    thickness: thick,
+    height,
+    elevation: level,
+    endElevation: el.params.endElevation,
+    id: el.id,
+  };
+
+  try {
+    window.dispatchEvent(
+      new CustomEvent("obs-toast", {
+        detail: { message: `${type} placed` + (FITTED_TYPES.has(type as ElementType) ? " (+ fittings)" : ""), kind: "success" },
+      }),
+    );
+  } catch { /* */ }
+}
+
+/** Place a standalone IFC-style fitting (elbow, tee, cross…). */
+export async function addFittingElement(
+  parentType: "duct" | "pipe" | "cable-tray" | "conduit",
+  kind: FittingKind,
+  x: number,
+  z: number,
+  elev?: number,
+  size?: { thickness?: number; height?: number },
+): Promise<void> {
+  if (elev != null) level = elev;
+  const d = DEFAULTS[parentType] ?? { height: 0.3, thickness: 0.3 };
+  spawnFitting(
+    parentType as ElementType,
+    null,
+    x, z,
+    0,
+    Math.PI / 2,
+    kind,
+    {
+      thickness: size?.thickness ?? d.thickness,
+      height: size?.height ?? d.height,
+      elevation: level,
+    },
+  );
+  try {
+    window.dispatchEvent(
+      new CustomEvent("obs-toast", {
+        detail: { message: `${parentType} ${kind} placed`, kind: "success" },
+      }),
+    );
+  } catch { /* */ }
+}
+
+
+/** Place a point element from plan (column, footing, equipment…). */
+export async function addPointElement(
+  type: "column" | "footing" | "equipment",
+  x: number,
+  z: number,
+  elev?: number,
+  preset?: string,
+): Promise<void> {
+  if (elev != null) level = elev;
+  if (preset) activePreset = preset;
+  const d = (preset && DEFAULTS[preset]) || DEFAULTS[type] || { height: 3, thickness: 0.3 };
+  await createElement(type as any, {
+    point: [x, z],
+    height: d.height,
+    thickness: d.thickness,
+    elevation: level,
+  });
+  activePreset = null;
+  try {
+    window.dispatchEvent(
+      new CustomEvent("obs-toast", {
+        detail: { message: `${preset || type} placed from Floor Plan`, kind: "success" },
+      }),
+    );
+  } catch { /* */ }
+}
+
+/** Nearest wall whose centerline passes within grab distance of a world point. */
+function hostedWallAt(x: number, z: number): { wallId: string; offset: number } | null {
+  let best: { wallId: string; offset: number } | null = null;
+  let bestDist = Infinity;
+  for (const el of elements) {
+    if (el.type !== "wall" || !el.params.start || !el.params.end) continue;
+    const [ax, az] = el.params.start;
+    const [bx, bz] = el.params.end;
+    const dx = bx - ax, dz = bz - az;
+    const L = Math.hypot(dx, dz);
+    if (L < 0.05) continue;
+    const t = ((x - ax) * dx + (z - az) * dz) / (L * L);
+    if (t < 0 || t > 1) continue;
+    const dist = Math.hypot(x - (ax + t * dx), z - (az + t * dz));
+    const grab = (el.params.thickness ?? 0.2) / 2 + 0.3;
+    if (dist > grab || dist >= bestDist) continue;
+    bestDist = dist;
+    best = { wallId: el.id, offset: Math.round(t * L * 1000) / 1000 };
+  }
+  return best;
+}
+
+/**
+ * Place a hosted door/window from the 2D Floor Plan.
+ *
+ * The plan-view door/window tools used to route through addPointElement as
+ * type "equipment" with no hostId: the wall was never cut, the plan drew a
+ * plain equipment box instead of the swing symbol, and Door/Window schedules
+ * (IFCDOOR / IFCWINDOW) returned 0 rows. This mirrors the 3D-viewport hosted
+ * path (onDrawClick for door/window): find the wall under the point, clamp
+ * the offset along the host, and create a properly typed, hosted element.
+ * With no wall under the point nothing is placed — a door must be hosted.
+ */
+export async function addHostedOpening(
+  kind: "door" | "window",
+  x: number,
+  z: number,
+  elev?: number,
+): Promise<{ ok: boolean; reason?: "no-wall" | "rejected" }> {
+  const host = hostedWallAt(x, z);
+  if (!host) return { ok: false, reason: "no-wall" };
+  if (elev != null) level = elev;
+  const d: Record<string, any> = { ...DEFAULTS[kind], ...getTypeDefaults(kind).params };
+  const el = await createElement(kind, {
+    width: d.width ?? (kind === "door" ? 0.9 : 1.2),
+    offsetAlongHost: host.offset,
+    sillHeight: d.sillHeight ?? (kind === "window" ? 0.9 : 0),
+    frameThickness: kind === "window" ? 0.05 : 0.06,
+    doorPanel: kind === "door" ? "swing" : undefined,
+    windowPanel: kind === "window" ? "casement" : undefined,
+  }, undefined, host.wallId);
+  if (!el) return { ok: false, reason: "rejected" };
+  try {
+    window.dispatchEvent(
+      new CustomEvent("obs-toast", {
+        detail: { message: `${kind} placed from Floor Plan`, kind: "success" },
+      }),
+    );
+  } catch { /* */ }
+  return { ok: true };
+}
+
+/**
+ * Repair doors/windows authored by the old plan-view path, which created
+ * them as type "equipment" (properties.category "door"/"window", a point,
+ * no hostId). Type-driven consumers all missed them: Door/Window schedules
+ * returned 0 rows, walls were never cut in 3D, plan drawings drew an
+ * equipment box instead of the swing symbol, and clash / export layers
+ * misclassified them. Runs whenever a project document is loaded
+ * (setElements). Elements with no wall under their point are left untouched
+ * rather than converted into invisible hostless doors (a door mesh only
+ * builds against its host).
+ */
+function repairMistypedOpenings(): number {
+  let fixed = 0;
+  for (const el of elements) {
+    if (el.type !== "equipment" || el.hostId) continue;
+    const cat = (el.properties as any)?.category;
+    if (cat !== "door" && cat !== "window") continue;
+    const pt = el.params.point;
+    if (!pt) continue;
+    const host = hostedWallAt(pt[0], pt[1]);
+    if (!host) continue;
+    el.type = cat;
+    if ((el.properties as any)?.category === cat) delete (el.properties as any).category;
+    if ((el.properties as any)?.family === cat) delete (el.properties as any).family;
+    el.hostId = host.wallId;
+    el.params.offsetAlongHost = host.offset;
+    delete el.params.point;
+    if (el.color === COLORS.equipment) el.color = COLORS[cat] ?? el.color;
+    fixed++;
+  }
+  return fixed;
+}
+
+const followPending = new Map<string, Record<string, unknown>>();
+export function transformElements(
+  ids: string[],
+  transform: (el: AuthoredElement, idx: number) => void,
+  /** When the transform is a translation, connected MEP parts follow (fittings move, runs stretch). */
+  follow?: { dx: number; dz: number; dy?: number },
+): void {
+  // Review mode (differentiation item 8) is view-only.
+  if (isReviewMode()) {
+    notify("warn", "Review mode is view-only — add an issue instead of editing the model.");
+    return;
+  }
+  const targets = elements.filter((el) => ids.includes(el.id));
+  if (!targets.length) return;
+  if (follow) {
+    // plan against the pre-move state, then treat the followers as extra targets of this transaction
+    const ups = mepFollowPatches(targets.map((t) => t.id), follow.dx, follow.dz, follow.dy ?? 0);
+    for (const u of ups) {
+      const fe = elements.find((x) => x.id === u.id);
+      if (fe && !targets.includes(fe)) { targets.push(fe); followPending.set(fe.id, u.patch); }
+    }
+  }
+  // Central worksharing: borrowed targets stay put; the rest still move.
+  const refused = guardRefusals(targets.map((t) => t.id));
+  if (refused.length) {
+    toastGuardRefusals("move", refused);
+    const refusedIds = new Set(refused.map((r) => r.id));
+    for (const id of refusedIds) followPending.delete(id);
+    const kept = targets.filter((t) => !refusedIds.has(t.id));
+    if (!kept.length) return;
+    targets.length = 0;
+    targets.push(...kept);
+  }
+  const before = targets.map((t) => JSON.parse(JSON.stringify(t.params)));
+  let i = 0;
+  for (const el of targets) { if (followPending.has(el.id)) Object.assign(el.params, followPending.get(el.id)); else transform(el, i++); }
+  followPending.clear();
+  const after = targets.map((t) => JSON.parse(JSON.stringify(t.params)));
+  history.push({
+    label: i18nT("counts.transformElements", { n: targets.length }),
+    apply: () => { targets.forEach((t, i) => (t.params = JSON.parse(JSON.stringify(after[i])))); rebuild(); markDirty(); },
+    revert: () => { targets.forEach((t, i) => (t.params = JSON.parse(JSON.stringify(before[i])))); rebuild(); markDirty(); },
+  });
+  rebuild(); markDirty();
+  // RVT compatibility: locked dims / equality / alignment re-enforce themselves
+  // right after the move commit (debounced; toggle lives with the Solve control).
+  // The moved elements are the anchors — where the user dropped them stays,
+  // the constraints pull the neighbours to them.
+  try { scheduleAutoSolve(targets.map((t) => t.id)); } catch { /* auto-solve is best-effort */ }
+  // Parametric equal-length groups: stretch one linked wall → peers match length
+  try {
+    import("../modules/parametric/wire-authoring").then((m) => {
+      m.syncEqualLengthAfterTransform?.(targets.map((t) => t.id));
+    }).catch(() => {});
+  } catch { /* */ }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Setup
+// ═══════════════════════════════════════════════════════════════════════════
+/* ── MEP fitting radius migration ─────────────────────────────────────
+   Normalizes every elbow fitting's bendRadius to at least one duct
+   width (BIM default) and re-trims the two ducts that feed the
+   fitting so their ends meet the new tangent points. Idempotent —
+   safe to call repeatedly. Returns the number of fittings changed. */
+/* ── MEP fitting migration + connector enforcement ─────────────────────
+   mep-connector-v2
+
+   Two responsibilities, both idempotent:
+
+   1. Radius normalisation — every elbow's bendRadius is bumped to at
+      least one duct width (BIM default). Fittings already at or above
+      the floor are left alone.
+
+   2. Connector enforcement — for every elbow, any same-type duct whose
+      endpoint sits near the corner OR near either tangent point is
+      snapped exactly onto the elbow's connection plane. This is what
+      BIM calls a connector: the duct terminates at the fitting, not at
+      the corner, so the two never overlap.
+
+   The duct snap uses a generous tolerance (max of 1.5× radius,
+   2.5× duct width, 0.5 m) so it also repairs ducts drawn before the
+   current elbow geometry existed. Ducts deliberately detached from the
+   elbow (endpoint further away) are never touched.
+
+   Returns the total number of mutations (fittings + duct endpoints). */
+export function migrateMepFittingRadii(onlyId?: string, forceRadius?: number): number {
+  const mepTypes = new Set(["duct", "pipe", "cable-tray", "conduit"]);
+  const fittings = elements.filter(
+    (e) => e.type === "fitting" &&
+           String((e.params as any).fittingKind || "elbow") === "elbow" &&
+           mepTypes.has(String((e.params as any).parentType ?? "duct")) &&
+           (!onlyId || e.id === onlyId),
+  );
+
+  let changedFittings = 0;
+  let changedDuctEnds = 0;
+
+  for (const f of fittings) {
+    const t = f.params.thickness ?? 0.3;
+    const ductWidth = Math.max(t, 0.05);
+    const stored = Number((f.params as any).bendRadius);
+    const legacy = !(Number.isFinite(stored) && stored > 0);
+    const oldR = legacy ? ductWidth / 2 : stored;
+    // Only legacy fittings (no stored radius) get the BIM authoring software default; an explicit radius is never overridden.
+    const newR = forceRadius != null && forceRadius > 0 ? forceRadius : legacy ? defaultBendRadius(ductWidth) : oldR;
+
+    const cx = (f.params as any).point?.[0];
+    const cz = (f.params as any).point?.[1];
+    if (cx == null || cz == null) continue;
+    const aIn  = Number((f.params as any).angleIn  ?? 0);
+    const aOut = Number((f.params as any).angleOut ?? Math.PI / 2);
+
+    const oldG = elbowGeometry([cx, cz], aIn, aOut, oldR);
+    const newG = elbowGeometry([cx, cz], aIn, aOut, newR);
+    if (!oldG || !newG) continue;
+    const oldT1: [number, number] = oldG.T1;
+    const oldT2: [number, number] = oldG.T2;
+    const newT1: [number, number] = newG.T1;
+    const newT2: [number, number] = newG.T2;
+
+    const parentType = String((f.params as any).parentType ?? "duct");
+    const tol = Math.max(newR * 1.5, ductWidth * 2.5, 0.5);
+
+    for (const e of elements) {
+      if (e.id === f.id) continue;
+      if (e.type !== parentType) continue;
+      if (!e.params.start || !e.params.end) continue;
+      const [sx, sz] = e.params.start;
+      const [ex, ez] = e.params.end;
+
+      // Duct END → fitting INLET (tangent point OR corner)
+      const dEndNewT1 = Math.hypot(ex - newT1[0], ez - newT1[1]);
+      const dEndOldT1 = Math.hypot(ex - oldT1[0], ez - oldT1[1]);
+      const dEndCorner = Math.hypot(ex - cx, ez - cz);
+      if (
+        dEndNewT1 > 0.005 &&
+        (dEndNewT1 < tol || dEndOldT1 < tol || dEndCorner < ductWidth * 2)
+      ) {
+        e.params.end = [newT1[0], newT1[1]];
+        changedDuctEnds++;
+      }
+
+      // Duct START → fitting OUTLET (tangent point OR corner)
+      const dStartNewT2 = Math.hypot(sx - newT2[0], sz - newT2[1]);
+      const dStartOldT2 = Math.hypot(sx - oldT2[0], sz - oldT2[1]);
+      const dStartCorner = Math.hypot(sx - cx, sz - cz);
+      if (
+        dStartNewT2 > 0.005 &&
+        (dStartNewT2 < tol || dStartOldT2 < tol || dStartCorner < ductWidth * 2)
+      ) {
+        e.params.start = [newT2[0], newT2[1]];
+        changedDuctEnds++;
+      }
+    }
+
+    if (Math.abs(oldR - newR) > 1e-6) {
+      (f.params as any).bendRadius = newR;
+      changedFittings++;
+    }
+  }
+
+  const total = changedFittings + changedDuctEnds;
+  if (total > 0) {
+    rebuild();
+    markDirty();
+    notifyAuthoringChange();
+  }
+
+  console.log(
+    `[mep-connector] ${changedFittings} fitting(s) resized, ` +
+    `${changedDuctEnds} duct endpoint(s) re-trimmed onto connection planes`,
+  );
+  return total;
+}
+/**
+ * Set an elbow's centreline bend radius (Properties > Bend Radius) and re-trim the
+ * connected runs onto the new tangent points. Refuses (returns false) if a run would
+ * become shorter than 5 cm. Undo-able as one step.
+ */
+export function setElbowBendRadius(fittingId: string, radius: number): boolean {
+  const f = elements.find((e) => e.id === fittingId && e.type === "fitting");
+  if (!f || !(radius > 0)) return false;
+  const mepTypes = ["duct", "pipe", "cable-tray", "conduit"];
+  const parentType = String((f.params as any).parentType ?? "duct");
+  const runs = elements.filter((e) => mepTypes.includes(e.type) && e.type === parentType && e.params.start && e.params.end);
+  const snap = runs.map((e) => ({ e, s: [...e.params.start!] as [number, number], en: [...e.params.end!] as [number, number] }));
+  const oldR = Number((f.params as any).bendRadius);
+  migrateMepFittingRadii(fittingId, radius);
+  const bad = snap.some(({ e }) => Math.hypot(e.params.end![0] - e.params.start![0], e.params.end![1] - e.params.start![1]) < 0.05);
+  if (bad) {
+    for (const x of snap) { x.e.params.start = x.s; x.e.params.end = x.en; }
+    (f.params as any).bendRadius = Number.isFinite(oldR) && oldR > 0 ? oldR : undefined;
+    rebuild(); markDirty();
+    window.dispatchEvent(new CustomEvent("obs-toast", { detail: { message: "Bend radius too large for the connected runs.", kind: "warn" } }));
+    return false;
+  }
+  (f.params as any).bendRadius = radius;
+  rebuild(); markDirty(); notifyAuthoringChange();
+  history.push({
+    label: "Change bend radius",
+    apply: () => { migrateMepFittingRadii(fittingId, radius); (f.params as any).bendRadius = radius; rebuild(); markDirty(); },
+    revert: () => { for (const x of snap) { x.e.params.start = x.s; x.e.params.end = x.en; } (f.params as any).bendRadius = Number.isFinite(oldR) && oldR > 0 ? oldR : undefined; rebuild(); markDirty(); },
+  });
+  return true;
+}
+
+export function setupAuthoring() {
+  ctx.world.scene.three.add(group);
+  try { ctx.world.scene.three.add(guideGroup); } catch { /* */ }
+  ctx.world.scene.three.add(datumGroup);
+  ctx.world.scene.three.add(previewGroup);
+  ctx.world.scene.three.add(gripGroup);
+  ctx.rightHost.appendChild(editor);
+
+  gizmo.setOverrideProvider(async () => {
+    if (selectedIds.size === 0) return null;
+    const box = new THREE.Box3();
+    for (const el of elements) {
+      if (!selectedIds.has(el.id)) continue;
+      const m = createMesh(el);
+      if (!m) continue;
+      box.union(new THREE.Box3().setFromObject(m));
+      disposeObj(m);
+    }
+    if (box.isEmpty()) return null;
+    return { center: box.getCenter(new THREE.Vector3()), box };
+  });
+
+  let gizmoBaseline: Record<string, AuthoredElement["params"]> | null = null;
+  let gizmoMoving = new Set<string>();
+  let gizmoFollowBase: Map<string, any> | null = null;
+
+  gizmo.setCallbacks({
+    onStart: () => {
+      gizmoBaseline = {};
+      gizmoMoving = new Set(expandConnectedIds(selectedIds));
+      gizmoFollowBase = snapshotMepParams();
+      for (const el of elements) {
+        if (gizmoMoving.has(el.id) && !el.properties?.pinned) {
+          gizmoBaseline[el.id] = JSON.parse(JSON.stringify(el.params));
+        }
+      }
+    },
+    onUpdate: (delta) => {
+      if (!gizmoBaseline) return;
+      for (const el of elements) {
+        if (!gizmoMoving.has(el.id) || !!el.properties?.pinned) continue;
+        const base = gizmoBaseline[el.id];
+        if (!base) continue;
+        const p = JSON.parse(JSON.stringify(base)) as AuthoredElement["params"];
+        if (p.start) p.start = [p.start[0] + delta.x, p.start[1] + delta.z] as Vec2;
+        if (p.end) p.end = [p.end[0] + delta.x, p.end[1] + delta.z] as Vec2;
+        if (p.point) p.point = [p.point[0] + delta.x, p.point[1] + delta.z] as Vec2;
+        if (p.polygon) p.polygon = p.polygon.map(([x, z]) => [x + delta.x, z + delta.z] as Vec2);
+        p.elevation += delta.y;
+        if (p.endElevation != null) p.endElevation += delta.y;
+        el.params = p;
+      }
+      // connected MEP parts follow live; re-planned from the pre-drag state each frame
+      if (gizmoFollowBase) {
+        for (const [id, params] of gizmoFollowBase) {
+          if (gizmoMoving.has(id)) continue;
+          const o = elements.find((q) => q.id === id);
+          if (o) o.params = JSON.parse(JSON.stringify(params));
+        }
+        for (const u of mepFollowPatches(gizmoMoving, delta.x, delta.z, delta.y, gizmoFollowBase)) {
+          const o = elements.find((q) => q.id === u.id);
+          if (o && !gizmoMoving.has(o.id)) Object.assign(o.params, u.patch);
+        }
+      }
+      rebuild();
+    },
+    onEnd: (delta) => {
+      if (!gizmoBaseline) return;
+      const moved = Math.abs(delta.x) + Math.abs(delta.y) + Math.abs(delta.z) > 1e-6;
+      if (!moved) { gizmoBaseline = null; return; }
+      const before = gizmoBaseline;
+      const after: Record<string, AuthoredElement["params"]> = {};
+      for (const el of elements) {
+        if (gizmoMoving.has(el.id) && before[el.id]) after[el.id] = JSON.parse(JSON.stringify(el.params));
+      }
+      // followers (fittings / stretched neighbours) join the same undo step
+      if (gizmoFollowBase) {
+        for (const el of elements) {
+          const base = gizmoFollowBase.get(el.id);
+          if (!base || gizmoMoving.has(el.id) || before[el.id]) continue;
+          if (JSON.stringify(base) !== JSON.stringify(el.params)) {
+            before[el.id] = JSON.parse(JSON.stringify(base));
+            after[el.id] = JSON.parse(JSON.stringify(el.params));
+          }
+        }
+        gizmoFollowBase = null;
+      }
+      // Design spec §6 — drag-move also updates bound dependents.
+      const depPatches = collectDependentPatches(Object.keys(after), delta.x, delta.z);
+      for (const el of elements) {
+        if (before[el.id]) el.params = JSON.parse(JSON.stringify(before[el.id]));
+      }
+      rebuild();
+      history.push({
+        label: i18nT("counts.transformElements", { n: Object.keys(after).length }),
+        apply: () => {
+          for (const el of elements) if (after[el.id]) el.params = JSON.parse(JSON.stringify(after[el.id]));
+          for (const p of depPatches) p.el.params = JSON.parse(JSON.stringify(p.after));
+          rebuild(); markDirty();
+        },
+        revert: () => {
+          for (const el of elements) if (before[el.id]) el.params = JSON.parse(JSON.stringify(before[el.id]));
+          for (const p of depPatches) p.el.params = JSON.parse(JSON.stringify(p.before));
+          rebuild(); markDirty();
+        },
+      });
+      for (const el of elements) if (after[el.id]) el.params = JSON.parse(JSON.stringify(after[el.id]));
+      for (const p of depPatches) p.el.params = JSON.parse(JSON.stringify(p.after));
+      refreshDependentRefs(depPatches);
+      rebuild(); markDirty();
+      gizmoBaseline = null;
+      void gizmo.refresh();
+    },
+  });
+
+  /** Select authored element under cursor; returns true if handled. */
+  function pickSelect(e: MouseEvent): boolean {
+    const grip = gripAt(e);
+    if (grip && (activeTool === "select" || activeTool === null)) {
+      e.stopPropagation();
+      e.preventDefault();
+      const pt = groundPoint(e);
+      if (pt) {
+        startGripDrag(grip, pt);
+        (ctx.world.camera.controls as any).enabled = false;
+        ctx.rightHost.style.cursor = "grabbing";
+      }
+      return true;
+    }
+
+    // G3: a Tab-cycled pre-highlight owns the click. When the cycle points
+    // at an authored element, that element is picked even if another element
+    // is nearer; when it points at a linked fragment, this handler must not
+    // steal the click — the fragment pointerup (selection.ts) selects it, so
+    // report "handled" without touching the authored selection.
+    const cycled = hoverPreselectCycle.cycled ? hoverPreselectCycle.current() : null;
+    if (cycled?.kind === "fragment") return true;
+    const hitId = cycled?.kind === "authored" && cycled.authoredId
+      ? cycled.authoredId
+      : elementAt(e);
+    // Only consume the click as selection when in select mode, or no tool,
+    // or user holds Ctrl/Shift/Alt while a draw tool is active (force-select).
+    const forceSelect = e.ctrlKey || e.metaKey || e.shiftKey || e.altKey;
+    const selectMode = !activeTool || activeTool === "select" || forceSelect;
+    if (!selectMode) return false;
+
+    e.stopPropagation();
+    e.preventDefault();
+
+    const ctrl = e.ctrlKey || e.metaKey;
+    const shift = e.shiftKey;
+    const alt = e.altKey;
+    const datumHit = hitId ? null : datumAt(e);
+    if (datumHit) {
+      selectedIds.clear();
+      try { const sel: any = (ctx.features as any).selection; sel?.replace?.({}); void sel?.applyToHighlighter?.(); } catch { /* */ }
+      if (activeTool && activeTool !== "select") { activeTool = "select"; activePreset = null; }
+      setDatumSelection(datumHit);
+      applySelection(); refreshGrips(); updateLabel();
+      paletteTarget = null;
+      notifyAuthoringChange();
+      return true;
+    }
+    if (selectedDatum) setDatumSelection(null);
+    if (!hitId) {
+      if (!ctrl && !shift) {
+        selectedIds.clear();
+        try {
+          const sel: any = (ctx.features as any).selection;
+          sel?.replace?.({});
+          void sel?.applyToHighlighter?.();
+        } catch { /* optional fragment bridge */ }
+      }
+    } else {
+      // Keep the 3D viewport selection unified: authored elements and linked
+      // IFC/fragment elements cannot remain selected simultaneously.
+      if (!ctrl && !shift && !alt) {
+        try {
+          const sel: any = (ctx.features as any).selection;
+          sel?.replace?.({});
+          void sel?.applyToHighlighter?.();
+        } catch { /* optional fragment bridge */ }
+      }
+      if (alt || shift) selectedIds.delete(hitId);
+      else if (ctrl) selectedIds.add(hitId);
+      else {
+        selectedIds.clear();
+        selectedIds.add(hitId);
+      }
+      // Enter select mode when user picks an element
+      if (activeTool && activeTool !== "select") {
+        activeTool = "select";
+        activePreset = null;
+      }
+    }
+    applySelection();
+    refreshGrips();
+    updateLabel();
+    {
+      const ids = [...selectedIds];
+      if (ids.length === 1) {
+        const el2 = elements.find((x) => x.id === ids[0]);
+        paletteTarget = el2 ? { mode: "edit", elementId: el2.id, type: el2.type } : null;
+      } else {
+        paletteTarget = null;
+      }
+      notifyAuthoringChange();
+    }
+    // G3: the click consumed the Tab cycle — a later click re-picks the top hit.
+    if (cycled?.kind === "authored") {
+      hoverPreselectCycle.reset();
+      emitTabCycleStatus(null);
+    }
+    return true;
+  }
+
+  // Priority 10 — lowest; only sees gestures that gizmo, box-select/nav and
+  // context-menu have declined.
+  const unsubGesture = inputRouter.subscribe(handleAuthoringGesture, 10);
+  const unsubHover = inputRouter.subscribeHover(handleAuthoringHover);
+
+  // The router reports drag-start only after the pointer has moved a few pixels, which can be off the (small) grip.
+  // Remember which grip was under the pointer at press time so that exact grip is the one dragged.
+  let pressGrip: GripSpec | null = null;
+  (ctx.rightHost as HTMLElement).addEventListener("pointerdown", (e: PointerEvent) => {
+    pressGrip = e.button === 0 && (activeTool === "select" || activeTool === null) ? gripAt(e) : null;
+  }, true);
+  window.addEventListener("pointerup", () => { setTimeout(() => { pressGrip = null; }, 0); }, true);
+  // Tell navigation not to start a selection box when the press began on a grip, so the grip drag reaches us.
+  onNavDrag((g) => g.button === 0 && !!pressGrip && !g.mods.shift);
+  const unsubCancel = inputRouter.registerCancel(handleAuthoringCancel);
+
+  // Space / Enter only — Escape is owned by registerCancel.
+  window.addEventListener("keydown", onAuthoringKeys);
+
+  /* ── Gesture dispatch ──────────────────────────────────────────────── */
+
+  function handleAuthoringGesture(g: Gesture): boolean {
+    // View-only share link: grip drags move elements, so they fall through
+    // to navigation (orbit) instead of starting a drag here.
+    if (isViewOnly() && (g.kind === "drag-start" || g.kind === "drag-move" || g.kind === "drag-end")) {
+      return false;
+    }
+    // Grip drag owns its own gesture from drag-start to drag-end.
+    if (g.kind === "drag-start") {
+      const grip = (g.button === 0 ? pressGrip : null) ?? gripAt(g.event);
+      if (grip && (activeTool === "select" || activeTool === null)) {
+        const pt = groundPoint(g.event);
+        if (pt) {
+          startGripDrag(grip, pt, g.event.clientY - ctx.rightHost.getBoundingClientRect().top);
+          ctx.rightHost.style.cursor = "grabbing";
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (g.kind === "drag-move" && gripDrag) {
+      const pt = groundPoint(g.event);
+      if (pt) updateGripDrag(pt, (g.event as PointerEvent | MouseEvent).shiftKey === true,
+        g.event.clientY - ctx.rightHost.getBoundingClientRect().top);
+      // Hover (which normally refreshes the snap) is suspended during the drag, so refresh it here; it is used by the next move.
+      try {
+        const ray = new THREE.Raycaster();
+        ray.setFromCamera(ndcOf(g.event), ctx.world.camera.three);
+        const hit = ctx.groundPlane ? ray.intersectObjects([ctx.groundPlane], false) : [];
+        void updateSnapAsync(g.event, hit.length ? hit[0].point.clone() : null);
+      } catch { /* */ }
+      return true;
+    }
+
+    if (g.kind === "drag-end" && gripDrag) {
+      endGripDrag();
+      ctx.rightHost.style.cursor = "";
+      return true;
+    }
+
+    // Plain left click — place, select, or modify.
+    if (g.kind === "click" && g.button === 0) {
+      return handleLeftClick(g.event, g.mods);
+    }
+
+    return false;
+  }
+
+  function handleLeftClick(e: PointerEvent, mods: Mods): boolean {
+    const forceSelect = mods.ctrl || mods.meta || mods.shift || mods.alt;
+    const selectMode = !activeTool || activeTool === "select" || forceSelect;
+
+    if (selectMode) {
+      if (pickSelect(e)) return true;
+      if (!activeTool || activeTool === "select") return true;
+      // Fall through to tool placement when force-select found no element.
+    }
+
+    // View-only share link: selection still works above, but no tool may
+    // place or modify. Swallow the click so it does not reach a tool.
+    if (isViewOnly()) return true;
+
+    if (!activeTool) return true;
+
+    if (
+      activeTool === "move" || activeTool === "copy" ||
+      activeTool === "rotate" || activeTool === "mirror" ||
+      activeTool === "array" || activeTool === "offset"
+    ) {
+      const pt = groundPoint(e);
+      if (pt) onModifyClick(pt, e);
+      return true;
+    }
+
+    if (activeTool === "door" || activeTool === "window") {
+      onDrawClick(new THREE.Vector3(), e);
+      return true;
+    }
+
+    const pt = groundPoint(e);
+    if (pt) onDrawClick(pt, e);
+    return true;
+  }
+
+  /* ── Hover (preview + snap indicator) ───────────────────────────────── */
+
+  function handleAuthoringHover(e: PointerEvent): void {
+    if (gripDrag) return;
+    lastHoverEvent = e;
+
+    // Open hand over an editable (orange) grip so the user knows it can be grabbed and dragged.
+    try {
+      const host = ctx.rightHost as HTMLElement;
+      const overGrip = (activeTool === "select" || activeTool === null) && !!gripAt(e);
+      if (overGrip) { if (host.style.cursor !== "grab") host.style.cursor = "grab"; }
+      else if (host.style.cursor === "grab") host.style.cursor = "";
+    } catch { /* */ }
+
+    // Feed the snap engine the draw context (chain base) so magnetic
+    // perpendicular/parallel snaps can be computed (Design spec §5).
+    try { snapping.setDrawContext(chainStart); } catch { /* */ }
+
+    // Snap indicator updates regardless of tool.
+    try {
+      if (ctx.world?.camera?.three) {
+        const ray = new THREE.Raycaster();
+        ray.setFromCamera(ndcOf(e), ctx.world.camera.three);
+        const hits = ctx.groundPlane ? ray.intersectObjects([ctx.groundPlane], false) : [];
+        const base = hits.length ? hits[0].point.clone() : null;
+        void updateSnapAsync(e, base);
+      }
+    } catch { /* */ }
+
+    if (!activeTool) return;
+    if (
+      activeTool === "select" || activeTool === "move" || activeTool === "copy" ||
+      activeTool === "rotate" || activeTool === "mirror" ||
+      activeTool === "array" || activeTool === "offset"
+    ) return;
+
+    updatePreview(e);
+  }
+
+  /* ── Cancel (Escape) ─────────────────────────────────────────────────── */
+
+  function handleAuthoringCancel(): boolean {
+    try {
+      if ((window as any).__obsPlanVisible?.()) return false;
+    } catch { /* */ }
+
+    const hasSomething =
+      (activeTool !== null && activeTool !== "select") ||
+      chainStart !== null ||
+      poly.length > 0 ||
+      pendingOp.kind !== "none" ||
+      gripDrag !== null;
+
+    if (!hasSomething) {
+      // Already select with nothing in-progress: clear selection like before.
+      if (selectedIds.size) {
+        selectedIds.clear();
+        applySelection();
+        refreshGrips();
+        paletteTarget = null;
+        notifyAuthoringChange();
+        updateLabel();
+        return true;
+      }
+      return false;
+    }
+
+    chainStart = null;
+    chainStartDir = null;
+    poly = [];
+    pendingOp = { kind: "none" };
+    clearPreviews();
+    try { accuDraw.end(); } catch { /* */ }
+    try { snapping.hideIndicator(); } catch { /* */ }
+
+    if (gripDrag) {
+      // CAD semantics: Esc aborts an in-flight grip drag and restores the
+      // pre-drag state instead of committing the intermediate geometry.
+      try { cancelGripDrag(); } catch { /* */ }
+      ctx.rightHost.style.cursor = "";
+    }
+
+    const preserved = lastCommand;
+    setAuthoringTool("select");
+    lastCommand = preserved;
+    notify("info", "Cancelled — Select");
+    try { (window as any).obsRefreshRibbon?.(); } catch { /* */ }
+    return true;
+  }
+
+  /* ── Key handling (Space / Enter only — Escape is in the router) ────── */
+
+  function onAuthoringKeys(e: KeyboardEvent): void {
+    const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
+    if (tag === "input" || tag === "textarea" || (e.target as HTMLElement)?.isContentEditable) return;
+
+    try { if ((window as any).__obsPlanVisible?.()) return; } catch { /* */ }
+
+    // ── Numeric entry during a grip drag: Enter commits precisely ──
+    // Digits typed while a grip is dragged land in AccuDraw's typed buffer
+    // (groundPoint → accuDraw.constrain). Enter applies the exact value:
+    //   height/elevation grips → exact metres; rotate → exact degrees;
+    //   scale → exact factor; planar grips → exact distance along the drag.
+    if (e.key === "Enter" && gripDrag) {
+      const typed = accuDraw.getTypedBuffer();
+      if (typed) {
+        e.preventDefault();
+        e.stopPropagation();
+        commitGripNumeric(typed);
+        return;
+      }
+    }
+
+    // ── Arrow-key nudge of selection (objects, annotations, dims, grids) ──
+    // Base step = grid size (default 0.1 m). Hold Shift → 10× larger step.
+    // Alt+Up/Down moves elevation (Y) instead of plan.
+    // Ctrl/Cmd + Arrow is NOT a nudge: it is Select Previous (Ctrl+Left,
+    // Revit) / reserved, so a held Ctrl/Cmd must not move the selection.
+    {
+      const isArrow =
+        e.key === "ArrowLeft" || e.key === "ArrowRight" ||
+        e.key === "ArrowUp" || e.key === "ArrowDown";
+      const canNudge =
+        isArrow &&
+        !e.ctrlKey && !e.metaKey &&
+        (!activeTool || activeTool === "select") &&
+        (selectedIds.size > 0 || !!selectedDatum);
+      if (canNudge) {
+        e.preventDefault();
+        e.stopPropagation();
+        let step = 0.1;
+        try { step = Math.max(0.01, Number(snapping.getGridSize()) || 0.1); } catch { /* */ }
+        if (e.shiftKey) step *= 10;
+        let dx = 0, dz = 0, dy = 0;
+        if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+          dy = e.key === "ArrowUp" ? step : -step;
+        } else if (e.key === "ArrowLeft") dx = -step;
+        else if (e.key === "ArrowRight") dx = step;
+        else if (e.key === "ArrowUp") dz = -step;
+        else if (e.key === "ArrowDown") dz = step;
+        const n = nudgeSelectedByKeyboard(dx, dz, dy);
+        if (n > 0) {
+          const axis = dy !== 0 ? `Y ${dy > 0 ? "+" : ""}${dy.toFixed(2)}` : `Δ(${dx.toFixed(2)}, ${dz.toFixed(2)})`;
+          notify("info", `Nudge ${n} · ${axis} m${e.shiftKey ? " · Shift×10" : ""}`);
+        }
+        return;
+      }
+    }
+
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && activeTool && activeTool !== "select") {
+      const step = e.shiftKey ? 0.1 : 0.5;
+      const delta = e.key === "ArrowUp" ? step : -step;
+      setLevel(level + delta);
+      notify("info", `Elevation: ${level.toFixed(1)} m`);
+      try { updateLabel(); } catch { /* */ }
+      e.preventDefault();
+      return;
+    }
+
+    // Design spec §4.3 — Tab cycles overlapping snap candidates in the
+    // 3D viewport (Shift+Tab cycles backwards). Pointer movement resets.
+    if (e.key === "Tab" && activeTool && activeTool !== "select") {
+      const cycled = snapping.cycleNext(e.shiftKey ? -1 : 1);
+      if (cycled) {
+        e.preventDefault();
+        e.stopPropagation();
+        notify("info", `Snap: ${cycled}`);
+      }
+      return;
+    }
+
+    if (e.key === "Backspace" || e.code === "Space" || e.key === " ") {
+      if (tag === "button") return;
+      e.preventDefault();
+      e.stopPropagation();
+      const cmd = lastCommand;
+      if (!cmd) {
+        notify("info", "No previous command to repeat — pick a tool first");
+        return;
+      }
+      try {
+        setAuthoringTool(cmd);
+        notify("success", `Repeat: ${cmd}`);
+        try { (window as any).obsRefreshRibbon?.(); } catch { /* */ }
+        try {
+          import("../core/context").then(({ ctx }) => {
+            if ((ctx.features as any)?.planView?.isVisible?.()) {
+              (ctx.features as any).planView.setTool?.(cmd);
+            }
+          }).catch(() => {});
+        } catch { /* */ }
+      } catch (err) {
+        console.warn("[authoring] repeat failed", err);
+      }
+      return;
+    }
+
+    if (e.key === "Enter" && activeTool) {
+      if (
+        activeTool === "wall" || activeTool === "beam" || activeTool === "strip" ||
+        activeTool === "mline" || activeTool === "duct" || activeTool === "pipe" ||
+        activeTool === "cable-tray" || activeTool === "conduit" ||
+        activeTool === "brace" || activeTool === "truss" || activeTool === "grid"
+      ) {
+        chainStart = null;
+        chainStartDir = null;
+        clearPreviews();
+        try { accuDraw.end(); } catch { /* */ }
+        updateLabel();
+      }
+      if (activeTool === "slab") finishSlab();
+    }
+  }
+
+  // Snaps ON with all modes + visible markers
+  try {
+    snapping.enableAllTypes();
+    snapping.setEnabled(true);
+    snapping.setGridSize(0.1);
+    snapping.setPixelTolerance(18);
+  } catch { /* */ }
+
+  // Default tool = Select so drawn elements are immediately clickable
+  try {
+    setAuthoringTool("select");
+  } catch { /* */ }
+
+  const api: AuthoringService & Record<string, any> = {
+    isActive: isDrawingActive,
+    getActiveTool, setAuthoringTool, setLevel, getLevel,
+    getActivePreset, getLastCommand, setLastCommand,
+    getElementCount, getElements, getSelectedIds,
+    getElementById,
+    setElementVisibility,
+    pickAuthoredElementAt, pickAuthoredHitAt, pickAuthoredHitsAt,
+    deleteSelectedElement, clearAllElements, clearDatums,
+    getSelectedDatum, selectDatum, deleteDatum,
+    rebuildAuthored, transformElements,
+    selectAllAuthored,
+    setSelectedAuthored,
+    // Replace-selection primitive under the name the Modify commands
+    // call it by (Select Similar, Invert Selection, Array). It was
+    // missing, so those commands silently did nothing while reporting
+    // success; selectAllAuthored above is the same replace.
+    setSelectedIds: (ids: string[]) => setSelectedAuthored(ids, "replace"),
+    getElementWorldBox,
+    getAuthoredGroup,
+
+    pinSelected, editSelectedParams, applyElementParamChange, reverseSelected, addWallSweepToSelected, clearWallSweepsSelected,
+    createSimilarFromSelection,
+    splitSelectedAtMidpoint,
+    joinSelectedWalls,
+    alignSelectedAxis,
+
+    getWallLocationLine,
+    setWallLocationLine: (v) => setWallLocationLine(v as any),
+    getWallChain, setWallChain,
+    getWallOffset, setWallOffset,
+    getWallJoinStatus,
+    setWallJoinStatus: (v) => setWallJoinStatus(v as any),
+
+    // Design spec §2/§3 — modeling panel + justification state
+    isDrawToolActive,
+    refreshPreview,
+    resetTypeDefaults,
+    getBeamJustification, setBeamJustification: (v: any) => setBeamJustification(v as any),
+    getBeamZJustification, setBeamZJustification: (v: any) => setBeamZJustification(v as any),
+    getMepJustification, setMepJustification: (v: any) => setMepJustification(v as any),
+    getDrawSlope, setDrawSlope,
+
+    getGrids, setGrids, getLevels, setLevels,
+    getActiveLevelId, setActiveLevelById,
+    getActiveFamilyId, getActiveFamilyTypeId, setActiveFamily,
+    syncFamilyInstances,
+
+    // Dim-lock store (Parametric Toolkit report + project persistence)
+    getDimLocks, setDimLocks,
+
+    onAuthoringChange,
+    // Lets overlay editors (wall-handles grips) fire the same change event as
+    // in-panel edits so the properties palette and dependent UIs stay in sync.
+    notifyAuthoringChange: () => notifyAuthoringChange(),
+    migrateMepFittingRadii,
+    setElbowBendRadius,
+
+    // vertical-openings: model-health audit for shaft/vertical/skylight openings
+    auditVerticalOpenings: () =>
+      voAuditVerticalOpenings(
+        elements.filter((e) => e.type === "vertical-opening") as unknown as VerticalOpeningLike[],
+        elements.filter((e) => e.type === "slab" || e.type === "roof" || e.type === "ceiling") as never,
+      ),
+
+    // Remediation Phase 1.4 — real element creation for plugin/API callers.
+    // Delegates to the SAME history-wrapped createElement the draw tools use
+    // (type defaults, family overrides, hosting, snap relationships), with a
+    // strict whitelist so unknown types are an honest rejection, not a stub.
+    createElementByType: async (type: string, params: Record<string, unknown>, hostId?: string) => {
+      // Review mode (differentiation item 8) is view-only: the programmatic
+      // creation path is refused here so palette commands cannot bypass the
+      // tool gates either.
+      if (isReviewMode()) {
+        notify("warn", "Review mode is view-only — add an issue instead of editing the model.");
+        return null;
+      }
+      const t = String(type || "").trim();
+      if (!Object.prototype.hasOwnProperty.call(DEFAULTS, t)) return null;
+      try {
+        const el = await createElement(t as ElementType, (params ?? {}) as Partial<AuthoredElement["params"]>, undefined, hostId);
+        return el ? el.id : null;
+      } catch (err) {
+        console.warn("[authoring] createElementByType rejected:", t, err);
+        return null;
+      }
+    },
+  };
+  (api as any).getGroup = () => group;
+  (api as any).getReferenceTracking = getReferenceTracking;
+  (api as any).setReferenceTracking = setReferenceTracking;
+  (api as any).getRefSnap = () => (refSnapActive ? [refSnapActive.x, refSnapActive.z] : null);
+  ctx.features.authoring = api;
+  register("authoring", api);
+  try { (window as any).__obsAuthoring = api; } catch { /* */ }
+}
+/* ═══════════════════════════════════════════════════════════════════════
+   BIM authoring software-style editable temporary dimensions + dimensional constraints.
+   Appended by the modeling update. Uses module-scoped authoring state.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+interface DimLock { elementId: string; param: string; value: number; }
+const dimLocks: DimLock[] = [];
+const dimSides = new Map<string, number>();
+
+function dimFmt(v: number): string {
+  return Math.abs(v) >= 1 ? `${v.toFixed(3)} m` : `${Math.round(v * 1000)} mm`;
+}
+
+function sideOffset(specId: string, dir: THREE.Vector3): THREE.Vector3 {
+  const i = dimSides.get(specId) ?? 0;
+  const perp = new THREE.Vector3(-dir.z, 0, dir.x).normalize();
+  const up = new THREE.Vector3(0, 1, 0);
+  const opts = [perp, perp.clone().negate(), up, up.clone().negate()];
+  return opts[i % opts.length].multiplyScalar(0.35);
+}
+
+function buildEditableTempDims(): TempDimSpec[] {
+  const out: TempDimSpec[] = [];
+  const selected = [...selectedIds].map(String).slice(0, 4);
+  for (const id of selected) {
+    const el = elements.find((e) => e.id === id);
+    if (!el) continue;
+    const p = el.params;
+    const elev = Number(p.elevation ?? 0);
+    const linear = el.type === "wall" || el.type === "beam" || el.type === "duct" ||
+      el.type === "pipe" || el.type === "cable-tray" || el.type === "conduit" ||
+      el.type === "strip";
+    if (linear && p.start && p.end) {
+      const a = new THREE.Vector3(p.start[0], elev + p.height / 2, p.start[1]);
+      const b = new THREE.Vector3(p.end[0], elev + p.height / 2, p.end[1]);
+      const dir = b.clone().sub(a).setY(0).normalize();
+      const len = a.distanceTo(b);
+      const idLen = `${el.id}:length`;
+      out.push({
+        id: idLen, elementId: el.id, param: "length", kind: "length", a, b,
+        value: len, label: dimFmt(len), editable: true,
+        locked: dimLocks.some((l) => l.elementId === el.id && l.param === "length"),
+        offset: sideOffset(idLen, dir),
+      });
+      const idH = `${el.id}:height`;
+      out.push({
+        id: idH, elementId: el.id, param: "height", kind: "height",
+        a: new THREE.Vector3(p.end[0], elev, p.end[1]),
+        b: new THREE.Vector3(p.end[0], elev + p.height, p.end[1]),
+        value: p.height, label: dimFmt(p.height), editable: true,
+        locked: dimLocks.some((l) => l.elementId === el.id && l.param === "height"),
+        offset: sideOffset(idH, dir),
+      });
+      const idT = `${el.id}:thickness`;
+      const mid = a.clone().add(b).multiplyScalar(0.5);
+      const n = new THREE.Vector3(-dir.z, 0, dir.x).normalize();
+      out.push({
+        id: idT, elementId: el.id, param: "thickness", kind: "thickness",
+        a: mid.clone().addScaledVector(n, -p.thickness / 2),
+        b: mid.clone().addScaledVector(n, p.thickness / 2),
+        value: p.thickness, label: dimFmt(p.thickness), editable: true,
+        locked: dimLocks.some((l) => l.elementId === el.id && l.param === "thickness"),
+        offset: sideOffset(idT, dir),
+      });
+    }
+    if ((el.type === "door" || el.type === "window") && el.hostId && p.offsetAlongHost != null) {
+      const hostEl = elements.find((e) => e.id === el.hostId);
+      if (hostEl?.params.start && hostEl.params.end) {
+        const hs = new THREE.Vector3(hostEl.params.start[0], elev, hostEl.params.start[1]);
+        const he = new THREE.Vector3(hostEl.params.end[0], elev, hostEl.params.end[1]);
+        const hdir = he.clone().sub(hs).normalize();
+        const center = hs.clone().addScaledVector(hdir, p.offsetAlongHost);
+        const w = p.width ?? 1;
+        const idW = `${el.id}:width`;
+        out.push({
+          id: idW, elementId: el.id, param: "width", kind: "width",
+          a: center.clone().addScaledVector(hdir, -w / 2),
+          b: center.clone().addScaledVector(hdir, w / 2),
+          value: w, label: dimFmt(w), editable: true,
+          locked: dimLocks.some((l) => l.elementId === el.id && l.param === "width"),
+          offset: sideOffset(idW, hdir),
+        });
+        const idO = `${el.id}:offset`;
+        out.push({
+          id: idO, elementId: el.id, param: "offsetAlongHost", kind: "offset",
+          a: hs, b: center, value: p.offsetAlongHost,
+          label: dimFmt(p.offsetAlongHost), editable: true,
+          locked: dimLocks.some((l) => l.elementId === el.id && l.param === "offsetAlongHost"),
+          offset: sideOffset(idO, hdir),
+        });
+        if (p.sillHeight != null) {
+          const idS = `${el.id}:sill`;
+          out.push({
+            id: idS, elementId: el.id, param: "sillHeight", kind: "height",
+            a: new THREE.Vector3(center.x, elev, center.z),
+            b: new THREE.Vector3(center.x, elev + p.sillHeight, center.z),
+            value: p.sillHeight, label: dimFmt(p.sillHeight), editable: true,
+            locked: dimLocks.some((l) => l.elementId === el.id && l.param === "sillHeight"),
+            offset: sideOffset(idS, hdir),
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function commitEditableTempDim(spec: TempDimSpec, value: number): boolean {
+  const el = elements.find((e) => e.id === spec.elementId);
+  if (!el || !Number.isFinite(value) || value < 0) return false;
+  const p = el.params as any;
+  let key = spec.param;
+  let val: any = value;
+  let extra: Record<string, unknown> | undefined;
+  const beforeSnap = snapshotMepParams(el);
+  // G13 — plan temporary dimensions to the nearest reference. The plan panel
+  // builds these specs from src/features/plan-temp-dimensions.ts and routes
+  // the edit here so it gets the same validation, history step and
+  // constraint re-solve as a 3D temp-dim edit. A gap may legitimately be
+  // 0 (flush against the reference), so these params skip the value > 0
+  // guard the size params below enforce.
+  if (
+    spec.param === "gapStart" || spec.param === "gapEnd" ||
+    spec.param === "gapPerp" || spec.param === "gapPoint"
+  ) {
+    const r = applyPlanTempDimEdit(
+      el as any,
+      { param: spec.param as any, a: { x: spec.a.x, z: spec.a.z }, b: { x: spec.b.x, z: spec.b.z }, value: spec.value },
+      value,
+    );
+    if (!r) return false;
+    if (r.start) { key = "start"; val = r.start; if (r.end) extra = { end: r.end }; }
+    else if (r.point) { key = "point"; val = r.point; }
+    else if (r.width !== undefined) { key = "width"; val = r.width; }
+    else return false;
+  } else if (value <= 0) {
+    return false;
+  } else if (spec.param === "length") {
+    // Right (or bottom) end stays fixed, the left (or top) end moves.
+    const r = p.start && p.end ? lengthKeepRight(p.start, p.end, value) : null;
+    if (!r) return false;
+    key = "start"; val = r.start; extra = { end: r.end };
+  } else if (spec.param === "height") {
+    // Base elevation stays fixed, the top edge moves.
+    const patch = heightKeepBase(p, value);
+    if (!patch) return false;
+    const { height, ...rest } = patch;
+    key = "height"; val = height; extra = rest;
+  } else if (spec.param === "thickness") {
+    // The bottom/right face stays fixed, the opposite face moves.
+    const r = p.start && p.end ? thicknessKeepFace(p.start, p.end, Number(p.thickness) || value, value) : null;
+    if (!r) return false;
+    key = "thickness"; val = Math.max(0.01, value); extra = { start: r.start, end: r.end };
+  } else if (spec.param === "width") {
+    const host = el.hostId ? elements.find((e) => e.id === el.hostId) : undefined;
+    const hp = host?.params as any;
+    const r = hp?.start && hp?.end ? openingWidthKeepRight(hp.start, hp.end, Number(p.offsetAlongHost) || 0, Number(p.width) || value, Math.max(0.05, value)) : null;
+    key = "width"; val = Math.max(0.05, value);
+    if (r) extra = { offsetAlongHost: r.offsetAlongHost };
+  } else if (spec.param !== "offsetAlongHost" && spec.param !== "sillHeight") {
+    return false;
+  }
+  const res = applyElementParamChange(spec.elementId, key, val, extra);
+  if (!res.ok) { console.warn("[temp-dim] edit rejected:", res.reason); return false; }
+  // A locked dimension keeps its constraint at the new value.
+  const lock = dimLocks.find((l) => l.elementId === spec.elementId && l.param === spec.param);
+  if (lock) lock.value = value;
+  // One undo step covers the edited part AND every fitting / neighbouring run it dragged along.
+  pushMepParamsHistory(`Edit dimension · ${el.name}`, beforeSnap, snapshotMepParams(el));
+  // Dimension-driven editing: queue the debounced constraint solve so stored
+  // constraints (locked distances, equality, alignment, parallel,
+  // perpendicular) re-enforce on the elements the edit pushed around — the
+  // RVT semantic where typing a dimension heals the dependent geometry.
+  // The edited element is the anchor.
+  scheduleAutoSolve([spec.elementId]);
+  return true;
+}
+
+/**
+ * G13 — commit an edited temporary dimension from the plan view. This is the
+ * same function the 3D editable overlay calls, exported so the plan panel
+ * can route its click-to-edit labels through it (same validation, history
+ * step and constraint re-solve — not a second edit path).
+ */
+export function commitTempDimEdit(spec: TempDimSpec, value: number): boolean {
+  return commitEditableTempDim(spec, value);
+}
+
+function toggleDimLock(spec: TempDimSpec): boolean {
+  const i = dimLocks.findIndex((l) => l.elementId === spec.elementId && l.param === spec.param);
+  if (i >= 0) { dimLocks.splice(i, 1); return false; }
+  dimLocks.push({ elementId: spec.elementId, param: spec.param, value: spec.value });
+  return true;
+}
+
+function cycleDimSide(spec: TempDimSpec): boolean {
+  dimSides.set(spec.id, (dimSides.get(spec.id) ?? 0) + 1);
+  return true;
+}
+
+/** Snapshot of the dim-lock store (for project save + the Parametric Toolkit report). */
+export function getDimLocks(): DimLock[] {
+  return dimLocks.map((l) => ({ ...l }));
+}
+
+/** Replace the dim-lock store from a persisted payload. Returns the count accepted. */
+export function setDimLocks(list: Array<{ elementId: string; param: string; value: number }>): number {
+  dimLocks.length = 0;
+  for (const l of Array.isArray(list) ? list : []) {
+    if (l && typeof l.elementId === "string" && typeof l.param === "string" && Number.isFinite(Number(l.value))) {
+      dimLocks.push({ elementId: l.elementId, param: l.param, value: Number(l.value) });
+    }
+  }
+  notifyAuthoringChange();
+  return dimLocks.length;
+}
+
+function applyDimLocks(): void {
+  for (const l of dimLocks) {
+    const el = elements.find((e) => e.id === l.elementId);
+    if (!el) continue;
+    const p = el.params;
+    if (l.param === "length" && p.start && p.end) {
+      const [sx, sz] = p.start;
+      const [ex, ez] = p.end;
+      const len = Math.hypot(ex - sx, ez - sz);
+      if (len > 1e-9) {
+        const k = l.value / len;
+        p.end = [sx + (ex - sx) * k, sz + (ez - sz) * k];
+      }
+    } else if (l.param === "height") p.height = l.value;
+    else if (l.param === "thickness") p.thickness = l.value;
+    else if (l.param === "width") p.width = l.value;
+    else if (l.param === "offsetAlongHost") p.offsetAlongHost = l.value;
+    else if (l.param === "sillHeight") p.sillHeight = l.value;
+  }
+  rebuild();
+  markDirty();
+  notifyAuthoringChange();
+  // Re-applying locked params moved geometry — stored inter-element
+  // constraints must re-enforce on the neighbours it pushed. The locked
+  // elements keep their values (they are the anchors).
+  scheduleAutoSolve(dimLocks.map((l) => l.elementId));
+}
+
+registerTempDimProvider({
+  specs: buildEditableTempDims,
+  commit: commitEditableTempDim,
+  toggleLock: toggleDimLock,
+  cycleRef: cycleDimSide,
+});
+
+setupEditableTempDims();
+setupOptionsBar();
+
+export function applyDimensionalConstraints(): void { applyDimLocks(); }
+
+export function translateSelected(dx: number, dz: number): number {
+  const ids = [...selectedIds].map(String);
+  const beforeSnap = snapshotMepParams();
+  const follow = mepFollowPatches(ids, dx, dz);
+  let n = 0;
+  for (const id of ids) {
+    const el = elements.find((e) => e.id === id);
+    if (!el || el.properties?.pinned) continue;
+    const p = el.params;
+    if (p.start) p.start = [p.start[0] + dx, p.start[1] + dz];
+    if (p.end) p.end = [p.end[0] + dx, p.end[1] + dz];
+    if (p.point) p.point = [p.point[0] + dx, p.point[1] + dz];
+    if (p.polygon) p.polygon = p.polygon.map(([x, z]) => [x + dx, z + dz] as [number, number]);
+    n++;
+  }
+  for (const u of follow) { const fe = elements.find((e) => e.id === u.id); if (fe && !ids.includes(fe.id)) Object.assign(fe.params, u.patch); }
+  if (n) {
+    if (follow.length) pushMepParamsHistory(i18nT("counts.moveElements", { n }), beforeSnap, snapshotMepParams());
+    rebuild(); markDirty(); notifyAuthoringChange();
+  }
+  return n;
+}
+export function duplicateSelected(dx: number, dz: number): string[] {
+  const ids = [...selectedIds].map(String);
+  const newIds: string[] = [];
+  for (const id of ids) {
+    const el = elements.find((e) => String((e as any).id) === id);
+    if (!el) continue;
+    const srcId = (el as any).id;
+    const newId: any = typeof srcId === "number"
+      ? Date.now() + Math.floor(Math.random() * 100000) + newIds.length
+      : (typeof crypto !== "undefined" && (crypto as any).randomUUID
+          ? (crypto as any).randomUUID()
+          : `el-${Date.now()}-${newIds.length}-${Math.random().toString(36).slice(2, 8)}`);
+    const clonedParams: Record<string, any> = { ...(el as any).params };
+    if (Array.isArray(clonedParams.polygon)) {
+      clonedParams.polygon = clonedParams.polygon.map((q: any) => Array.isArray(q) ? [...q] : q);
+    }
+    const cloned: any = { ...(el as any), id: newId, params: clonedParams };
+    const p = cloned.params;
+    if (Array.isArray(p.start)) p.start = [p.start[0] + dx, p.start[1] + dz];
+    if (Array.isArray(p.end)) p.end = [p.end[0] + dx, p.end[1] + dz];
+    if (Array.isArray(p.point)) p.point = [p.point[0] + dx, p.point[1] + dz];
+    if (Array.isArray(p.polygon)) p.polygon = p.polygon.map(([x, z]: [number, number]) => [x + dx, z + dz] as [number, number]);
+    elements.push(cloned);
+    newIds.push(String(newId));
+  }
+  if (newIds.length) {
+    rebuild();
+    markDirty();
+    notifyAuthoringChange();
+  }
+  return newIds;
+}
+export function rotateSelected(px: number, pz: number, angleRadians: number): number {
+  const cos = Math.cos(angleRadians), sin = Math.sin(angleRadians);
+  const rot = (x: number, z: number): [number, number] => [
+    px + (x - px) * cos - (z - pz) * sin,
+    pz + (x - px) * sin + (z - pz) * cos,
+  ];
+  const ids = [...selectedIds].map(String);
+  let n = 0;
+  for (const id of ids) {
+    const el = elements.find((e) => String((e as any).id) === id);
+    if (!el) continue;
+    const p = (el as any).params;
+    if (Array.isArray(p.start) && p.start.length === 2) p.start = rot(p.start[0], p.start[1]);
+    if (Array.isArray(p.end) && p.end.length === 2) p.end = rot(p.end[0], p.end[1]);
+    if (Array.isArray(p.point) && p.point.length === 2) p.point = rot(p.point[0], p.point[1]);
+    if (Array.isArray(p.polygon)) p.polygon = p.polygon.map(([x, z]: [number, number]) => rot(x, z));
+    if (typeof p.rotation === "number") p.rotation += angleRadians;
+    n++;
+  }
+  if (n) { rebuild(); markDirty(); notifyAuthoringChange(); }
+  return n;
+}

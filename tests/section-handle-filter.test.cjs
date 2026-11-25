@@ -1,0 +1,30 @@
+const { execSync } = require("child_process");
+const fs = require("fs"), path = require("path"), assert = require("assert");
+const out = fs.mkdtempSync(path.join(require("os").tmpdir(), "sh-"));
+execSync(`npx tsc src/features/section-handle-filter.ts --outDir ${out} --module commonjs --target es2020 --skipLibCheck`, { stdio: "pipe" });
+const m = require(path.join(out, "section-handle-filter.js"));
+let n = 0; const ok = (c, s) => { assert.ok(c, s); n++; };
+const mesh = (geo, extra = {}) => ({ visible: true, geometry: { type: geo }, ...extra });
+ok(m.isGrabbableHandle(mesh("ConeGeometry")), "arrow is grabbable");
+ok(!m.isGrabbableHandle(mesh("PlaneGeometry")), "the plane quad is not a handle");
+ok(m.isGrabbableHandle(mesh("CylinderGeometry", { visible: false })), "invisible gizmo pickers stay grabbable");
+ok(m.isGrabbableHandle({ visible: true }), "plain object without geometry stays grabbable");
+// stuck-drag detection: button no longer down while we think we are dragging
+ok(m.isStaleDrag(0, true), "buttons=0 while dragging -> stale");
+ok(!m.isStaleDrag(1, true), "left button still down -> live drag");
+ok(!m.isStaleDrag(0, false), "not dragging -> nothing to release");
+ok(!m.isStaleDrag(undefined, true), "unknown buttons -> do not guess");
+// native gizmo drag detection / forced end
+let upCalls = 0;
+const tc = { dragging: true, axis: "X", pointerUp() { upCalls++; } };
+const idle = { dragging: false, axis: null, pointerUp() {} };
+const item = { three: { children: [], geometry: {} }, helper: { x: 1 }, _controls: tc, other: { nested: { controls: idle } } };
+let found = m.findDraggingControls(item);
+ok(found.length === 1 && found[0] === tc, "finds the dragging gizmo controls");
+ok(m.findDraggingControls({ a: { b: { c: { deep: tc } } } }).length === 0, "does not search unboundedly deep");
+ok(m.findDraggingControls({ controls: idle }).length === 0, "idle controls are ignored");
+m.endControlsDrag(tc);
+ok(upCalls === 1 && tc.dragging === false && tc.axis === null, "forced end calls pointerUp and clears the state");
+const cyc = { dragging: false, pointerUp() {} }; cyc.self = cyc; cyc.axis = null;
+ok(m.findDraggingControls({ c: cyc }).length === 0, "cyclic structures are safe");
+console.log(`section-handle-filter: ${n} checks OK`);

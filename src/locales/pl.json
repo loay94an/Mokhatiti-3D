@@ -1,0 +1,25 @@
+{
+  "standards": {
+    "title": "Normy"
+  },
+  "meta": {
+    "name": "Polish",
+    "nativeName": "Polski",
+    "dir": "ltr"
+  },
+  "app": {
+    "name": "Open BIM Studio",
+    "loading": "Ładowanie…",
+    "ready": "Gotowe",
+    "cancel": "Anuluj",
+    "close": "Zamknij",
+    "save": "Zapisz",
+    "delete": "Usuń"
+  },
+  "counts": {
+    "elements": "{n, plural, one{# element} few{# elementy} many{# elementów} other{# elementu}}",
+    "selected": "{n, plural, one{wybrano # element} few{wybrano # elementy} many{wybrano # elementów} other{wybrano # elementu}}",
+    "authoredSelected": "{n, plural, one{wybrano # utworzony element} few{wybrano # utworzone elementy} many{wybrano # utworzonych elementów} other{wybrano # utworzonego elementu}}",
+    "clashes": "{n, plural, one{Znaleziono # kolizję.} few{Znaleziono # kolizje.} many{Znaleziono # kolizji.} other{Znaleziono # kolizji.}}"
+  }
+}

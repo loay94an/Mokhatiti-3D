@@ -1,0 +1,2115 @@
+/**
+ * BIM-style Properties palette.
+ *
+ * Two modes:
+ *   • defaults — a tool is active; edits set the values applied to the next
+ *     element placed.
+ *   • edit    — one element is selected; edits apply live to that element.
+ *
+ * The palette is draggable, resizable, and dockable via the generic
+ * `dockable.ts` controller. Position and size persist per panel ID.
+ */
+import { ctx } from "../core/context";
+import { markDirty } from "../modules/projects/projects";
+import * as classificationModule from "../modules/classification";
+import {
+  getActiveTool,
+  getSelectedIds,
+  getElements,
+  getTypeDefaults,
+  setTypeDefault,
+  getPaletteTarget,
+  setPaletteTarget,
+  onAuthoringChange,
+  rebuildAuthored,
+  markAuthoringDirty,
+  applyElementParamChange,
+  isDrawToolActive,
+  refreshPreview,
+  resetTypeDefaults,
+  getWallLocationLine, setWallLocationLine,
+  getWallChain, setWallChain,
+  getWallOffset, setWallOffset,
+  getWallJoinStatus, setWallJoinStatus,
+  getBeamJustification, setBeamJustification,
+  getBeamZJustification, setBeamZJustification,
+  getMepJustification, setMepJustification,
+  getDrawSlope, setDrawSlope,
+} from "./authoring";
+import { getSchema, setLevelsProvider, type PropertyField, type FieldTarget } from "./property-schema";
+import { history } from "./history";
+import {
+  getToolPanel,
+  validatePanelNumber,
+  type ToolPanelDescriptor,
+  type ToolPanelField,
+} from "./tool-panels";
+import { coreThicknessFromLayers } from "../modules/justification";
+import { units } from "../core/units";
+import { svgIcon, type IconName } from "./icon-set";
+import { levels } from "../modules/levels";
+import { makeDockable, type DockHandle, type DockSide } from "./dockable";
+import {
+  resolveTypeSelector,
+  retypeElements,
+  type TypeSelectorDeps,
+} from "./type-selector";
+import { selection } from "./selection";
+import {
+  listWallTypePresets,
+  applyWallTypeToElement,
+  applyWallTypeToElements,
+  inferWallTypeId,
+} from "../modules/architecture-depth";
+import { linkEqualParam } from "../modules/parametric/wire-authoring";
+import { swapFamilyType } from "../modules/families/placement";
+import type { AuthoredElement } from "../modules/projects/types";
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Panel shell
+   ═════════════════════════════════════════════════════════════════════════ */
+const panel = document.createElement("div");
+panel.id = "obs-property-palette";
+panel.style.cssText =
+  "z-index:60;" +
+  "display:none;flex-direction:column;background:var(--bg-floating,#1c1e28);" +
+  "border:1px solid var(--border-default,#2a2e3a);border-radius:10px;" +
+  "box-shadow:0 12px 36px rgba(0,0,0,.55);font:12px system-ui,sans-serif;" +
+  "color:var(--text-primary,#e8eaf0);overflow:hidden";
+panel.addEventListener("mousedown", (e) => e.stopPropagation());
+
+const header = document.createElement("div");
+header.style.cssText =
+  "display:flex;align-items:center;gap:8px;padding:9px 10px;" +
+  "border-bottom:1px solid var(--border-subtle,#1e2029);" +
+  "background:var(--bg-elevated,#181a23);cursor:move;user-select:none";
+
+const body = document.createElement("div");
+body.style.cssText = "flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:4px 0;overscroll-behavior:contain;scrollbar-width:auto";
+
+panel.append(header, body);
+
+let expanded = true;
+let visible = false;
+let dockHandle: DockHandle | null = null;
+/** Last selection target the palette auto-opened for (G10, see below). */
+let lastSelectionTargetKey: string | null = null;
+/** Reserved flex column the palette lives in while docked left (G10), or null. */
+let dockColumn: HTMLElement | null = null;
+
+/**
+ * G5 — deferred auto-open. Selecting an element docks the palette left,
+ * which reserves a 320px flex column and shifts the whole viewport right:
+ * every element's screen position moves, so the second click of a
+ * double-click lands where the element USED to be, the raycast misses,
+ * and Type Properties never opens. The input router's double-click
+ * window is 320ms, so the auto-open waits 400ms after the selection and
+ * re-validates the target before opening: a double-click resolves first,
+ * a single click only sees the palette a beat later. Explicit opens
+ * (ribbon, toggle, API) stay immediate — only the automatic open on
+ * selection / tool activation is deferred.
+ */
+let autoOpenTimer: ReturnType<typeof setTimeout> | null = null;
+const AUTO_OPEN_DELAY_MS = 400;
+
+function cancelAutoOpen(): void {
+  if (autoOpenTimer) { clearTimeout(autoOpenTimer); autoOpenTimer = null; }
+}
+
+function scheduleAutoOpen(): void {
+  cancelAutoOpen();
+  autoOpenTimer = setTimeout(() => {
+    autoOpenTimer = null;
+    try {
+      if (visible) return;
+      const target = getPaletteTarget();
+      if (!target || (target.mode !== "edit" && target.mode !== "edit-multi")) return;
+      openPropertyPalette();
+    } catch (err) { console.warn("[property-palette] deferred auto-open failed", err); }
+  }, AUTO_OPEN_DELAY_MS);
+}
+
+/** Deps for the Type Selector engine: the live family service + wall catalog. */
+function typeSelectorDeps(): TypeSelectorDeps {
+  return {
+    familyService: ((ctx.features as any).family ?? null) as TypeSelectorDeps["familyService"],
+    wallPresets: listWallTypePresets(),
+  };
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   G10 — Type Selector (Revit: Type Selector at the top of the Properties
+   palette + "Edit Type" opening Type Properties)
+   ═════════════════════════════════════════════════════════════════════════ */
+function makeTypeSelectorBlock(elements: AuthoredElement[]): HTMLElement | null {
+  const deps = typeSelectorDeps();
+  const model = resolveTypeSelector(elements, deps);
+  if (model.kind === "none" || !model.options.length) return null;
+
+  const block = document.createElement("div");
+  block.dataset.g10TypeSelector = "1";
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+  const title = document.createElement("span");
+  title.textContent = "Type Selector";
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px";
+  const source = document.createElement("span");
+  source.textContent = model.sourceName;
+  source.style.cssText = "font-size:10.5px;color:var(--text-tertiary,#6b7280)";
+  headerRow.append(title, source);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:6px 12px 10px;display:grid;gap:6px";
+
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;gap:6px;align-items:center";
+
+  const sel = document.createElement("select");
+  sel.dataset.testid = "type-selector";
+  sel.setAttribute("aria-label", "Type Selector");
+  sel.style.cssText =
+    "flex:1;min-width:0;box-sizing:border-box;padding:4px 6px;" +
+    "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+    "border-radius:4px;color:var(--text-primary,#e8eaf0);font:12px system-ui;cursor:pointer";
+  const head = model.varies
+    ? `<option value="" selected>&lt;varies&gt;</option>`
+    : model.currentId == null
+      ? `<option value="">— select type —</option>`
+      : "";
+  sel.innerHTML =
+    head +
+    model.options
+      .map(
+        (o) =>
+          `<option value="${escapeHtml(o.id)}" ${o.id === model.currentId ? "selected" : ""}>${escapeHtml(o.name)}</option>`,
+      )
+      .join("");
+  sel.onchange = () => {
+    const newTypeId = sel.value || null;
+    if (!newTypeId || newTypeId === model.currentId) return;
+    const targets = elements.filter((e) => getElements().some((g) => g.id === e.id));
+    if (!targets.length) return;
+    const before = targets.map((e) => JSON.parse(JSON.stringify(e)));
+    const res = retypeElements(targets, newTypeId, deps);
+    if (!res.retyped.length) {
+      sel.value = model.currentId ?? "";
+      return;
+    }
+    const after = targets.map((e) => JSON.parse(JSON.stringify(e)));
+    rebuildAuthored();
+    markAuthoringDirty();
+    if (res.skipped.length > 0) {
+      window.dispatchEvent(new CustomEvent("obs-toast", {
+        detail: {
+          message: `Type → ${res.retyped.length} element(s); ${res.skipped.length} unchanged (different family)`,
+          kind: "success",
+        },
+      }));
+    }
+    const byId = new Map(targets.map((e, i) => [e.id, i] as const));
+    history.push({
+      label: "Type Selector · " + (targets.length === 1 ? targets[0].name || targets[0].id : `${targets.length} elements`),
+      apply: () => {
+        for (const [id, i] of byId) {
+          const live = getElements().find((g) => g.id === id);
+          if (live) Object.assign(live, JSON.parse(JSON.stringify(after[i])));
+        }
+        rebuildAuthored();
+        markAuthoringDirty();
+        render();
+      },
+      revert: () => {
+        for (const [id, i] of byId) {
+          const live = getElements().find((g) => g.id === id);
+          if (live) Object.assign(live, JSON.parse(JSON.stringify(before[i])));
+        }
+        rebuildAuthored();
+        markAuthoringDirty();
+        render();
+      },
+    });
+    render();
+  };
+
+  const editTypeBtn = document.createElement("button");
+  editTypeBtn.type = "button";
+  editTypeBtn.dataset.testid = "edit-type";
+  editTypeBtn.textContent = "Edit Type";
+  editTypeBtn.title = "Open Type Properties for the selected type";
+  editTypeBtn.style.cssText =
+    "flex:none;padding:4px 10px;background:var(--bg-inset,#0e1017);" +
+    "border:1px solid var(--border-default,#2a2e3a);border-radius:4px;" +
+    "color:var(--text-primary,#e8eaf0);font:12px system-ui;cursor:pointer;white-space:nowrap";
+  editTypeBtn.onclick = () => {
+    const exec = (window as any).__obsBIMExperience?.execute;
+    if (typeof exec === "function") {
+      exec("modify.typeProperties");
+    } else {
+      window.dispatchEvent(new CustomEvent("obs-toast", {
+        detail: { message: "Type Properties is not available yet", kind: "warn" },
+      }));
+    }
+  };
+
+  row.append(sel, editTypeBtn);
+  list.appendChild(row);
+
+  if (model.varies) {
+    const hint = document.createElement("div");
+    hint.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280)";
+    hint.textContent = "Mixed selection — picking a type re-types only the elements whose family offers it.";
+    list.appendChild(hint);
+  }
+
+  block.append(headerRow, list);
+  return block;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   G10 — Docking: dock-left reserves a flex column in the workspace
+   (the panel is reparented out of the viewport overlay into a column
+   inserted before the viewport, so the canvas shifts right instead of
+   being covered). Dock right / float keep the overlay positioning the
+   generic dockable controller provides.
+   ═════════════════════════════════════════════════════════════════════════ */
+function ensureDockColumn(): boolean {
+  const parent = ctx.rightHost?.parentElement;
+  if (!parent || !ctx.rightHost) return false;
+  if (!dockColumn) {
+    const col = document.createElement("div");
+    col.id = "obs-pp-dock-left";
+    col.style.cssText =
+      "display:flex;flex-direction:column;flex:0 0 320px;height:100%;" +
+      "background:var(--bg-floating,#1c1e28);border-inline-end:1px solid var(--border-default,#2a2e3a);" +
+      "overflow:hidden";
+    dockColumn = col;
+  }
+  // Re-assert placement on every layout pass: the ribbon re-parents
+  // rightHost into mainRow after palette setup, which would otherwise
+  // strand the column in #app (a column flex — the 320px basis would
+  // become its height and it would stretch full-width). insertBefore
+  // is a no-op move when the column is already correctly placed.
+  parent.insertBefore(dockColumn, ctx.rightHost);
+  return true;
+}
+
+function teardownDockColumn(): void {
+  if (!dockColumn) return;
+  if (panel.parentElement === dockColumn) ctx.rightHost.appendChild(panel);
+  panel.style.position = "";
+  panel.style.width = "";
+  panel.style.height = "";
+  panel.style.flex = "";
+  panel.style.borderRadius = "10px";
+  panel.style.border = "1px solid var(--border-default,#2a2e3a)";
+  panel.style.boxShadow = "0 12px 36px rgba(0,0,0,.55)";
+  dockColumn.remove();
+  dockColumn = null;
+}
+
+/** Dockable onLayout owner: left docks into the reserved column, anything else overlays. */
+function paletteDockLayout(
+  side: DockSide,
+  _panel: HTMLElement,
+  state: { width: number; height: number },
+): boolean {
+  if (side !== "left") {
+    teardownDockColumn();
+    return false;
+  }
+  if (!ensureDockColumn()) return false;
+  if (panel.parentElement !== dockColumn) dockColumn!.appendChild(panel);
+  dockColumn!.style.flex = `0 0 ${Math.max(260, state.width)}px`;
+  panel.style.position = "relative";
+  panel.style.left = "auto";
+  panel.style.right = "auto";
+  panel.style.top = "auto";
+  panel.style.width = "100%";
+  panel.style.height = "100%";
+  panel.style.flex = "1 1 auto";
+  panel.style.borderRadius = "0";
+  panel.style.border = "none";
+  panel.style.boxShadow = "none";
+  syncDockColumnVisibility();
+  return true;
+}
+
+/** The reserved column only takes space while the palette is actually shown. */
+function syncDockColumnVisibility(): void {
+  if (!dockColumn) return;
+  const dockedLeft = dockHandle?.side?.() === "left";
+  const shown = dockedLeft && panel.style.display !== "none";
+  dockColumn.style.display = shown ? "" : "none";
+}
+
+/** Header button cycling the dock side (left → right → floating). */
+function makeDockCycleButton(): HTMLButtonElement {
+  const b = document.createElement("button");
+  const side = dockHandle?.side?.() ?? "right";
+  b.textContent = side === "left" ? "⇤ Left" : side === "right" ? "⇥ Right" : "⧉ Float";
+  b.title = "Dock: click to cycle left → right → floating (right-click the title bar for all sides)";
+  b.style.cssText =
+    "padding:2px 6px;background:transparent;color:var(--text-secondary);" +
+    "border:1px solid var(--border-default);border-radius:4px;cursor:pointer;font-size:10px;white-space:nowrap";
+  b.onclick = () => {
+    const cur = dockHandle?.side?.() ?? "right";
+    const next: DockSide = cur === "left" ? "right" : cur === "right" ? "float" : "left";
+    dockHandle?.dock(next);
+    syncDockColumnVisibility();
+    render();
+  };
+  return b;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Field I/O
+   ═════════════════════════════════════════════════════════════════════════ */
+function readValue(
+  target: FieldTarget,
+  element: AuthoredElement | null,
+  typeKey: string,
+  key: string,
+): string | number | boolean {
+  if (target === "root") {
+    if (element) return (element as any)[key] ?? "";
+    const d = getTypeDefaults(typeKey);
+    return (d as any)[key] ?? "";
+  }
+  if (element) {
+    if (target === "params") {
+      const v = (element.params as any)[key];
+      return v ?? "";
+    }
+    return (element.properties?.[key] as any) ?? "";
+  }
+  const d = getTypeDefaults(typeKey);
+  if (target === "params") return (d.params as any)?.[key] ?? "";
+  return (d.properties as any)?.[key] ?? "";
+}
+
+import { isElementLocked, getLockOwner } from "../modules/collaboration/workshare-locks";
+import { uiAlert } from "../core/notify";
+import { escapeHtml } from "../core/html-escape";
+
+function writeValue(
+  target: FieldTarget,
+  element: AuthoredElement | null,
+  typeKey: string,
+  key: string,
+  value: string | number | boolean,
+): void {
+  if (element) {
+    if (isElementLocked(element.id)) {
+      uiAlert(`Cannot edit: this element is currently locked by ${getLockOwner(element.id)}.`);
+      return;
+    }
+    // Elbow bend radius re-trims connected runs through the authoring service.
+    if (key === "bendRadius" && element.type === "fitting") {
+      import("./authoring").then((m) => (m as any).setElbowBendRadius?.(element.id, Number(value)));
+      return;
+    }
+    // 1. Snapshot the "before" state for Undo
+    const before = JSON.parse(JSON.stringify(element));
+
+    // 2. Apply the new value — geometric params go through the authoritative
+    //    applyElementParamChange path so Native Twin / authored solids regenerate.
+    const geometricKeys = new Set([
+      "height", "thickness", "width", "depth", "elevation", "sillHeight",
+      "offsetAlongHost", "frameThickness", "length", "rotation",
+      "baseLevelId", "baseOffset", "topLevelId", "topOffset",
+    ]);
+    const constraintKeys = new Set(["baseLevelId", "topLevelId"]);
+    const isGeoWrite = target === "params" && geometricKeys.has(key) && (typeof value === "number" || (constraintKeys.has(key) && typeof value === "string"));
+    if (isGeoWrite) {
+      const res = applyElementParamChange(element.id, key, value);
+      if (!res?.ok) {
+        Object.assign(element, before);
+        window.dispatchEvent(new CustomEvent("obs-toast", {
+          detail: { message: res?.reason || "Could not apply parameter", kind: "error" },
+        }));
+        return;
+      }
+      // Parametric model: equal height/thickness groups follow the driver
+      try {
+        const vNum = typeof value === "number" ? value : Number(value);
+        if (Number.isFinite(vNum)) {
+          import("../modules/parametric/wire-authoring").then((m) => {
+            m.onParametricParamWritten?.(element.id, key, vNum);
+          }).catch(() => {});
+        }
+      } catch { /* */ }
+    } else if (target === "root") {
+      (element as any)[key] = value;
+    } else if (target === "params") {
+      (element.params as any)[key] = value;
+    } else {
+      element.properties = { ...(element.properties ?? {}), [key]: value };
+    }
+
+    // 3. Snapshot the "after" state for Redo
+    const after = JSON.parse(JSON.stringify(element));
+
+    // 4. Non-geometric fields still need an explicit rebuild
+    if (!isGeoWrite) {
+      try {
+        import("./authoring").then((m) => {
+          m.rebuildAuthored();
+          m.markAuthoringDirty();
+        });
+      } catch (e) { /* */ }
+    }
+
+    // 5. Push to History so Ctrl+Z works
+    try {
+      import("./history").then((m) => {
+        m.history.push({
+          label: `Edit ${key} · ${element.name || element.id}`,
+          apply: () => {
+            Object.assign(element, after);
+            import("./authoring").then(m => m.rebuildAuthored());
+          },
+          revert: () => {
+            Object.assign(element, before);
+            import("./authoring").then(m => m.rebuildAuthored());
+          }
+        });
+      });
+    } catch (e) { /* */ }
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Input builders
+   ═════════════════════════════════════════════════════════════════════════ */
+const INPUT_CSS =
+  "width:100%;box-sizing:border-box;padding:4px 6px;background:var(--bg-inset,#0e1017);" +
+  "border:1px solid var(--border-default,#2a2e3a);border-radius:4px;" +
+  "color:var(--text-primary,#e8eaf0);font:12px system-ui;outline:none";
+
+function fieldRow(
+  field: PropertyField,
+  getValue: () => any,
+  setValue: (v: any) => void,
+): HTMLElement {
+  const row = document.createElement("div");
+  row.style.cssText = "display:grid;grid-template-columns:110px 1fr;gap:8px;align-items:center;padding:3px 12px";
+
+  const label = document.createElement("label");
+  label.textContent = field.label;
+  label.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+  if (field.helpText) label.title = field.helpText;
+
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex;gap:4px;align-items:center";
+
+  let input: HTMLElement;
+
+  switch (field.type) {
+    case "number": {
+      const i = document.createElement("input");
+      i.type = "number";
+      i.step = String(field.step ?? 0.1);
+      if (field.min != null) i.min = String(field.min);
+      if (field.max != null) i.max = String(field.max);
+      i.value = String(getValue() ?? "");
+      i.style.cssText = INPUT_CSS + ";text-align:end";
+      i.onchange = () => {
+        let v = Number(i.value);
+        if (!Number.isFinite(v)) v = 0;
+        if (field.min != null) v = Math.max(field.min, v);
+        if (field.max != null) v = Math.min(field.max, v);
+        i.value = String(v);
+        setValue(v);
+      };
+      input = i;
+      break;
+    }
+    case "text": {
+      const i = document.createElement("input");
+      i.type = "text";
+      i.value = String(getValue() ?? "");
+      i.style.cssText = INPUT_CSS;
+      i.onchange = () => setValue(i.value);
+      input = i;
+      break;
+    }
+    case "select": {
+      const s = document.createElement("select");
+      s.style.cssText = INPUT_CSS + ";cursor:pointer";
+      const cur = String(getValue() ?? field.default ?? "");
+      s.innerHTML =
+        `<option value="">—</option>` +
+        ((field.optionsFn ? field.optionsFn() : field.options) ?? [])
+          .map(
+            (o) =>
+              `<option value="${o.value}" ${o.value === cur ? "selected" : ""}>${o.label}</option>`,
+          )
+          .join("");
+      s.onchange = () => setValue(s.value);
+      input = s;
+      break;
+    }
+    case "boolean": {
+      const c = document.createElement("input");
+      c.type = "checkbox";
+      c.checked = !!getValue();
+      c.style.cssText = "cursor:pointer";
+      c.onchange = () => setValue(c.checked);
+      input = c;
+      break;
+    }
+    case "color": {
+      const i = document.createElement("input");
+      i.type = "color";
+      i.value = String(getValue() || "#cccccc");
+      i.style.cssText = "width:100%;height:22px;background:none;border:1px solid var(--border-default,#2a2e3a);border-radius:4px;cursor:pointer";
+      i.oninput = () => setValue(i.value);
+      input = i;
+      break;
+    }
+  }
+
+  if (field.readOnly) {
+    try {
+      const inp2: any = input;
+      if (inp2.tagName === "INPUT" || inp2.tagName === "SELECT") {
+        inp2.disabled = true;
+        inp2.style.opacity = "0.65";
+        inp2.style.cursor = "not-allowed";
+        inp2.title = "Read-only (computed from geometry)";
+      }
+    } catch { /* */ }
+  }
+
+  wrap.appendChild(input);
+  if (field.unit) {
+    const u = document.createElement("span");
+    u.textContent = field.unit;
+    u.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280);min-width:16px";
+    wrap.appendChild(u);
+  }
+
+  row.append(label, wrap);
+  return row;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Collapsible sections
+   ═════════════════════════════════════════════════════════════════════════ */
+const sectionState = new Map<string, boolean>();
+
+function sectionBlock(
+  groupName: string,
+  fields: PropertyField[],
+  element: AuthoredElement | null,
+  typeKey: string,
+): HTMLElement {
+  const key = `${typeKey}:${groupName}`;
+  const open = sectionState.get(key) ?? true;
+
+  const block = document.createElement("div");
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;cursor:pointer;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+
+  const caret = document.createElement("span");
+  caret.textContent = open ? "▾" : "▸";
+  caret.style.cssText = "width:10px;font-size:9px;color:var(--text-tertiary,#6b7280)";
+
+  const title = document.createElement("span");
+  title.textContent = groupName;
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px";
+
+  headerRow.append(caret, title);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:4px 0;display:" + (open ? "block" : "none");
+
+  for (const f of fields) {
+    list.appendChild(
+      fieldRow(
+        f,
+        () => (typeof (f as any).compute === "function" && element)
+          ? (f as any).compute(element)
+          : readValue(f.target, element, typeKey, f.key),
+        (v) => writeValue(f.target, element, typeKey, f.key, v),
+      ),
+    );
+  }
+
+  headerRow.onclick = () => {
+    const now = !(sectionState.get(key) ?? true);
+    sectionState.set(key, now);
+    caret.textContent = now ? "▾" : "▸";
+    list.style.display = now ? "block" : "none";
+  };
+
+  block.append(headerRow, list);
+  return block;
+}
+
+// openbim-families:instance-wiring
+//
+// "Family identity" block. Shown when the selected element carries a
+// familyId. Lets the user switch the element's type; every instance of
+// the new type is re-synced from its parametric definition.
+//
+// Writes:
+//   element.familyTypeId = selected type id
+//   then placement.swapFamilyType captures every affected instance's
+//   overrides against the type it is leaving and re-syncs the new type,
+//   so a swap no longer wipes instance overrides (Slice 1 follow-up).
+function makeFamilyIdentityBlock(element: AuthoredElement): HTMLElement {
+  const block = document.createElement("div");
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+  const caret = document.createElement("span");
+  caret.textContent = "\u25BE";
+  caret.style.cssText = "width:10px;font-size:9px;color:var(--text-tertiary,#6b7280)";
+  const title = document.createElement("span");
+  title.textContent = "Family";
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px";
+  headerRow.append(caret, title);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:4px 0";
+
+  const familyService: any = (ctx.features as any).family;
+  const fam = familyService?.get?.(element.familyId);
+
+  if (!fam) {
+    const warn = document.createElement("div");
+    warn.textContent = "Family not found: " + element.familyId;
+    warn.style.cssText = "padding:4px 12px;font-size:11px;color:var(--obs-pp-warn-fg, #fca5a5)";
+    list.appendChild(warn);
+    block.append(headerRow, list);
+    return block;
+  }
+
+  const rowFam = document.createElement("div");
+  rowFam.style.cssText =
+    "display:grid;grid-template-columns:110px 1fr;gap:8px;align-items:center;padding:3px 12px";
+  const lblFam = document.createElement("label");
+  lblFam.textContent = "Family";
+  lblFam.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+  const valFam = document.createElement("span");
+  valFam.textContent = fam.name;
+  valFam.style.cssText = "font-size:12px;color:#e8eaf0";
+  rowFam.append(lblFam, valFam);
+  list.appendChild(rowFam);
+
+  const rowType = document.createElement("div");
+  rowType.style.cssText = rowFam.style.cssText;
+  const lblType = document.createElement("label");
+  lblType.textContent = "Type";
+  lblType.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+  const selType = document.createElement("select");
+  selType.style.cssText =
+    "width:100%;box-sizing:border-box;padding:4px 6px;" +
+    "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+    "border-radius:4px;color:var(--text-primary,#e8eaf0);font:12px system-ui;cursor:pointer";
+  selType.innerHTML = fam.types.map(
+    (t: any) =>
+      "<option value=\"" + t.id + "\">" + t.name + "</option>",
+  ).join("");
+  selType.value = element.familyTypeId ?? (fam.types[0]?.id ?? "");
+  selType.onchange = () => {
+    const newTypeId = selType.value || null;
+    const prevType = element.familyTypeId ?? null;
+    if (newTypeId === prevType) return;
+    // Deterministic command body: swapping the type and re-syncing its
+    // instances is one atomic unit, replayable in both directions so undo
+    // restores the exact previous type AND its instance assignments.
+    // swapFamilyType captures overrides against the type being left
+    // before the swap, so an instance override survives the swap (and
+    // its revert) instead of being wiped by the re-sync.
+    const applyType = (tid: string | null) => {
+      try {
+        swapFamilyType(element, tid);
+      } catch (err) {
+        console.warn("[property-palette] swap after type change failed", err);
+      }
+      markAuthoringDirty();
+      render();
+    };
+    applyType(newTypeId);
+    history.push({
+      label: "Family type · " + (element.name || element.id),
+      apply: () => applyType(newTypeId),
+      revert: () => applyType(prevType),
+    });
+  };
+  rowType.append(lblType, selType);
+  list.appendChild(rowType);
+
+  // openbim-family-placement: instance-scope parameters edit this element
+  // directly; type-scope parameters update the family type and re-sync
+  // every instance of that type. This is the BIM Type/Instance split.
+  try {
+    const resolvedNow = familyService.resolveParams(
+      fam.id,
+      element.familyTypeId ?? null,
+      undefined,
+    ) ?? {};
+
+    if (fam.parameters.length > 0) {
+      const paramHeader = document.createElement("div");
+      paramHeader.textContent = "Parameters";
+      paramHeader.style.cssText =
+        "font-weight:600;font-size:10.5px;color:var(--text-tertiary,#6b7280);" +
+        "padding:8px 12px 2px;letter-spacing:.4px;text-transform:uppercase";
+      list.appendChild(paramHeader);
+
+      for (const p of fam.parameters) {
+        const current = (resolvedNow as any)[p.name];
+        if (current === undefined) continue;
+
+        const row = document.createElement("div");
+        row.style.cssText =
+          "display:grid;grid-template-columns:110px 1fr 22px;gap:6px;align-items:center;padding:3px 12px";
+
+        const lbl = document.createElement("label");
+        lbl.textContent = p.label ?? p.name;
+        lbl.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+
+        const inp = document.createElement("input");
+        inp.type = typeof current === "number" ? "number" : "text";
+        if (typeof current === "number") inp.step = String(p.step ?? 0.01);
+        inp.value = String(current);
+        inp.style.cssText =
+          "width:100%;box-sizing:border-box;padding:4px 6px;text-align:end;" +
+          "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+          "border-radius:4px;color:var(--text-primary,#e8eaf0);font:12px system-ui";
+        inp.onchange = () => {
+          const isNum = typeof current === "number";
+          const v = isNum ? Number(inp.value) : inp.value;
+          if (isNum && !Number.isFinite(v)) { inp.value = String(current); return; }
+          void (async () => {
+            try {
+              const mod: any = await import("../modules/families/placement");
+              const res = mod.editFamilyParameter(element, p.name, v);
+              if (res.applied === "type" && res.instancesSynced > 0) {
+                window.dispatchEvent(new CustomEvent("obs-toast", {
+                  detail: {
+                    message: "Updated " + res.instancesSynced + " instance(s)",
+                    kind: "success",
+                  },
+                }));
+              }
+              // Deterministic command: replaying editFamilyParameter in both
+              // directions keeps type-scope re-syncs symmetric on undo/redo.
+              const before = current;
+              history.push({
+                label: "Family param " + p.name + " · " + (element.name || element.id),
+                apply: () => {
+                  try { mod.editFamilyParameter(element, p.name, v); } catch (err) { console.warn("[property-palette] redo failed", err); }
+                  markAuthoringDirty();
+                  render();
+                },
+                revert: () => {
+                  try { mod.editFamilyParameter(element, p.name, before); } catch (err) { console.warn("[property-palette] undo failed", err); }
+                  markAuthoringDirty();
+                  render();
+                },
+              });
+            } catch (err) {
+              console.warn("[property-palette] family param edit failed", err);
+            }
+            markAuthoringDirty();
+            render();
+          })();
+        };
+
+        const scope = document.createElement("span");
+        scope.textContent = p.scope === "type" ? "T" : "I";
+        scope.title = p.scope === "type" ? "Type parameter" : "Instance parameter";
+        scope.style.cssText =
+          "font:700 10px ui-monospace,monospace;text-align:center;" +
+          "border-radius:3px;padding:2px 0;" +
+          (p.scope === "type"
+            ? "background:var(--obs-pp-type-bg, rgba(56,189,248,.14));color:var(--obs-pp-type-fg, #7dd3fc)"
+            : "background:var(--obs-pp-inst-bg, rgba(168,85,247,.14));color:var(--obs-pp-inst-fg, #c4b5fd)");
+
+        row.append(lbl, inp, scope);
+        list.appendChild(row);
+      }
+    }
+  } catch (err) {
+    console.warn("[property-palette] family parameter table failed", err);
+  }
+
+  block.append(headerRow, list);
+  return block;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Header
+   ═════════════════════════════════════════════════════════════════════════ */
+function renderHeader(mode: "defaults" | "edit", typeLabel: string, elementName?: string) {
+  header.innerHTML = "";
+
+  const icon = document.createElement("span");
+  icon.style.cssText = "display:flex;color:var(--accent,#38bdf8)";
+  try {
+    icon.innerHTML = svgIcon("component" as IconName);
+  } catch {
+    icon.textContent = "◧";
+  }
+
+  const text = document.createElement("div");
+  text.style.cssText = "flex:1;min-width:0";
+
+  const title = document.createElement("div");
+  title.style.cssText = "font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+  title.textContent =
+    mode === "defaults"
+      ? `${typeLabel} — defaults`
+      : elementName
+        ? elementName
+        : `${typeLabel} — instance`;
+
+  const sub = document.createElement("div");
+  sub.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280);margin-top:1px";
+  sub.textContent =
+    mode === "defaults"
+      ? "Applied to the next element you place"
+      : "Edit the selected element";
+
+  text.append(title, sub);
+
+  const collapseBtn = document.createElement("button");
+  collapseBtn.textContent = expanded ? "▾" : "▸";
+  collapseBtn.title = "Collapse / expand";
+  collapseBtn.style.cssText =
+    "padding:2px 6px;background:transparent;color:var(--text-secondary);" +
+    "border:1px solid var(--border-default);border-radius:4px;cursor:pointer;font-size:10px";
+  collapseBtn.onclick = () => {
+    expanded = !expanded;
+    body.style.display = expanded ? "block" : "none";
+    render();
+  };
+
+  header.append(icon, text, makeDockCycleButton(), collapseBtn);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Modeling tool panel (Design spec §2) — contextual per-tool parameters
+   rendered from the declarative registry in tool-panels.ts. Values write
+   to the type defaults (what the NEXT placed element receives) or to live
+   authoring state (location line, chain, slope, justification…), and every
+   write refreshes the placement preview immediately.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/** Live authoring-state accessors used by "authoring"-bound fields. */
+const AUTHORING_STATE: Record<string, { get: () => any; set: (v: any) => void }> = {
+  wallLocationLine: { get: () => getWallLocationLine(), set: (v) => setWallLocationLine(v) },
+  wallChain: { get: () => getWallChain(), set: (v) => setWallChain(!!v) },
+  wallOffset: { get: () => getWallOffset(), set: (v) => setWallOffset(Number(v) || 0) },
+  wallJoinStatus: { get: () => getWallJoinStatus(), set: (v) => setWallJoinStatus(v) },
+  beamJustification: { get: () => getBeamJustification(), set: (v) => setBeamJustification(v) },
+  beamZJustification: { get: () => getBeamZJustification(), set: (v) => setBeamZJustification(v) },
+  mepJustification: { get: () => getMepJustification(), set: (v) => setMepJustification(v) },
+  drawSlope: { get: () => getDrawSlope(), set: (v) => setDrawSlope(Number(v) || 0) },
+};
+
+function readToolFieldValue(field: ToolPanelField, elementType: string): any {
+  if (!field.bind) return "";
+  if (field.bind.kind === "authoring") {
+    const s = AUTHORING_STATE[field.bind.stateKey];
+    return s ? s.get() : "";
+  }
+  const d = getTypeDefaults(elementType);
+  if (field.bind.target === "params") return (d.params as any)[field.bind.key] ?? "";
+  return (d.properties as any)[field.bind.key] ?? "";
+}
+
+function writeToolFieldValue(field: ToolPanelField, elementType: string, v: any): void {
+  if (!field.bind) return;
+  if (field.bind.kind === "authoring") {
+    const s = AUTHORING_STATE[field.bind.stateKey];
+    if (s) s.set(v);
+    return;
+  }
+  setTypeDefault(elementType, field.bind.target, field.bind.key, v);
+}
+
+/** §3.1 — core location-line options need a compound core in the type. */
+function coreLayersSupported(elementType: string): boolean {
+  try {
+    const d = getTypeDefaults(elementType);
+    const layers = d.properties?.layers as string | undefined;
+    const t = Number(d.params?.thickness) || 0.2;
+    return coreThicknessFromLayers(layers, t) != null;
+  } catch { return false; }
+}
+
+/** Numeric display in the app's configured unit system. */
+function formatPanelNumber(field: ToolPanelField, v: any): string {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return v == null ? "" : String(v);
+  if (field.unit === "m") {
+    try { return units.formatLength(n, { withUnit: false }); } catch { return String(n); }
+  }
+  return String(n);
+}
+
+/** Parse user input to SI using the app's unit grammar (§2.3). */
+function parsePanelNumber(field: ToolPanelField, raw: string): number | null {
+  const text = String(raw ?? "").trim();
+  if (!text) return null;
+  if (field.unit === "m") {
+    const parsed = units.parseLengthInput(text);
+    if (parsed != null && Number.isFinite(parsed)) return parsed;
+  }
+  const n = Number(text);
+  return Number.isFinite(n) ? n : null;
+}
+
+function renderToolField(field: ToolPanelField, elementType: string): HTMLElement {
+  const row = document.createElement("div");
+
+  if (field.kind === "info") {
+    row.style.cssText = "padding:4px 12px 6px";
+    const hint = document.createElement("div");
+    hint.textContent = field.text ?? "";
+    hint.style.cssText = "font-size:10.5px;color:var(--text-tertiary,#6b7280);line-height:1.45";
+    row.appendChild(hint);
+    return row;
+  }
+
+  row.style.cssText = "display:grid;grid-template-columns:110px 1fr;gap:8px;align-items:center;padding:3px 12px";
+
+  const label = document.createElement("label");
+  label.textContent = field.label;
+  label.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+  if (field.helpText) label.title = field.helpText;
+
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex;gap:4px;align-items:center;min-width:0";
+
+  const errRow = document.createElement("div");
+  errRow.style.cssText =
+    "display:none;grid-column:1 / -1;font-size:10px;color:var(--obs-pp-warn-fg,#fca5a5);padding:0 12px 2px";
+
+  const setErr = (msg: string | null) => {
+    if (msg) {
+      errRow.textContent = msg;
+      errRow.style.display = "block";
+    } else {
+      errRow.style.display = "none";
+    }
+  };
+
+  const commit = (v: any) => {
+    writeToolFieldValue(field, elementType, v);
+    // §2.3 — update the modeling preview immediately.
+    try { refreshPreview(); } catch { /* preview optional */ }
+  };
+
+  switch (field.kind) {
+    case "number": {
+      const i = document.createElement("input");
+      i.type = "text";
+      i.inputMode = "decimal";
+      i.value = formatPanelNumber(field, readToolFieldValue(field, elementType));
+      i.style.cssText = INPUT_CSS + ";text-align:end";
+      i.onchange = () => {
+        const raw = i.value.trim();
+        if (!raw) { setErr(null); return; }
+        const v = parsePanelNumber(field, raw);
+        if (v == null) {
+          setErr("Enter a valid number" + (field.unit ? ` (e.g. ${field.unit})` : ""));
+          i.style.borderColor = "var(--obs-pp-warn-fg,#fca5a5)";
+          return;
+        }
+        const problem = validatePanelNumber(field, v);
+        if (problem) {
+          setErr(problem);
+          i.style.borderColor = "var(--obs-pp-warn-fg,#fca5a5)";
+          return;
+        }
+        setErr(null);
+        i.style.borderColor = "";
+        i.value = formatPanelNumber(field, v);
+        commit(v);
+      };
+      i.oninput = () => { setErr(null); i.style.borderColor = ""; };
+      wrap.appendChild(i);
+      break;
+    }
+    case "select": {
+      const s = document.createElement("select");
+      s.style.cssText = INPUT_CSS + ";cursor:pointer";
+      const cur = String(readToolFieldValue(field, elementType) ?? "");
+      s.innerHTML = (field.options ?? [])
+        .map((o) => `<option value="${o.value}" ${o.value === cur ? "selected" : ""}>${o.label}</option>`)
+        .join("");
+      s.onchange = () => { commit(s.value); };
+      wrap.appendChild(s);
+      break;
+    }
+    case "boolean": {
+      const c = document.createElement("input");
+      c.type = "checkbox";
+      c.checked = !!readToolFieldValue(field, elementType);
+      c.style.cssText = "cursor:pointer";
+      c.onchange = () => { commit(c.checked); };
+      wrap.appendChild(c);
+      break;
+    }
+  }
+
+  if (field.unit) {
+    const u = document.createElement("span");
+    u.textContent = field.unit;
+    u.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280);min-width:16px";
+    wrap.appendChild(u);
+  }
+
+  row.append(label, wrap, errRow);
+  return row;
+}
+
+function renderToolPanel(desc: ToolPanelDescriptor): HTMLElement {
+  const block = document.createElement("div");
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;cursor:pointer;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+
+  const caret = document.createElement("span");
+  const openKey = `tool:${desc.tool}`;
+  const open = sectionState.get(openKey) ?? true;
+  caret.textContent = open ? "▾" : "▸";
+  caret.style.cssText = "width:10px;font-size:9px;color:var(--text-tertiary,#6b7280)";
+
+  const title = document.createElement("span");
+  title.textContent = "Tool Options";
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px;flex:1";
+
+  const resetBtn = document.createElement("button");
+  resetBtn.textContent = "Reset";
+  resetBtn.title = "Restore factory defaults for this tool";
+  resetBtn.style.cssText =
+    "padding:2px 8px;background:transparent;color:var(--text-secondary);" +
+    "border:1px solid var(--border-default);border-radius:4px;cursor:pointer;font-size:10px";
+  resetBtn.onclick = (ev) => {
+    ev.stopPropagation();
+    resetTypeDefaults(desc.elementType);
+    try { refreshPreview(); } catch { /* */ }
+    render();
+  };
+
+  headerRow.append(caret, title, resetBtn);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:4px 0;display:" + (open ? "block" : "none");
+
+  headerRow.onclick = () => {
+    const now = !(sectionState.get(openKey) ?? true);
+    sectionState.set(openKey, now);
+    caret.textContent = now ? "▾" : "▸";
+    list.style.display = now ? "block" : "none";
+  };
+
+  const coreOk = coreLayersSupported(desc.elementType);
+  for (const g of desc.groups) {
+    const gTitle = document.createElement("div");
+    gTitle.textContent = g.title;
+    gTitle.style.cssText =
+      "font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;" +
+      "color:var(--text-tertiary,#6b7280);padding:6px 12px 2px";
+    list.appendChild(gTitle);
+    for (const f of g.fields) {
+      // §3.1 — hide core-specific controls unless the data model supports
+      // a compound core; never show controls that do nothing.
+      if (f.requiresCoreLayers && !coreOk) continue;
+      list.appendChild(renderToolField(f, desc.elementType));
+    }
+  }
+
+  block.append(headerRow, list);
+  return block;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Render
+   ═════════════════════════════════════════════════════════════════════════ */
+function render(): void {
+  renderInner();
+  syncDockColumnVisibility();
+}
+
+function renderInner() {
+  const target = getPaletteTarget();
+
+  if (!target) {
+    // Keep open if user explicitly opened Properties — show view properties
+    if (visible) {
+      if (dockHandle) dockHandle.show();
+      else panel.style.display = "flex";
+      renderViewProperties();
+    } else {
+      if (dockHandle) dockHandle.hide();
+      else panel.style.display = "none";
+    }
+    return;
+  }
+
+  visible = true;
+  if (dockHandle) dockHandle.show();
+  else panel.style.display = "flex";
+
+  // Multi-select: Type Selector first (G10), then constraints (linears
+  // only) + wall type when all are walls/curtain walls.
+  if (target.mode === "edit-multi") {
+    header.innerHTML = "";
+    const ht = document.createElement("div");
+    ht.textContent = `${target.elementIds.length} elements selected`;
+    ht.style.cssText = "font-weight:600;flex:1";
+    header.appendChild(ht);
+    header.appendChild(makeDockCycleButton());
+    body.innerHTML = "";
+    const multiSelected = target.elementIds
+      .map((id) => getElements().find((e) => e.id === id))
+      .filter(Boolean) as AuthoredElement[];
+    try {
+      const ts = makeTypeSelectorBlock(multiSelected);
+      if (ts) body.appendChild(ts);
+    } catch (err) {
+      console.warn("[property-palette] type selector failed", err);
+    }
+    const constraintTypes = new Set([
+      "wall", "curtain-wall", "beam", "strip", "mline",
+      "duct", "pipe", "cable-tray", "conduit", "brace",
+    ]);
+    const allLinear = multiSelected.length > 0 &&
+      multiSelected.every((e) => constraintTypes.has(String(e.type)));
+    if (allLinear) {
+      try {
+        body.appendChild(makeConstraintMultiBlock(target.elementIds));
+      } catch (err) {
+        console.warn("[property-palette] multi constraints failed", err);
+      }
+    }
+    try {
+      const allWalls = multiSelected.length > 0 && multiSelected.every(
+        (e) => e.type === "wall" || e.type === "curtain-wall",
+      );
+      if (allWalls) body.appendChild(makeWallTypeMultiBlock(target.elementIds));
+    } catch (err) {
+      console.warn("[property-palette] multi wall type failed", err);
+    }
+    return;
+  }
+
+  const schema = getSchema(target.type);
+  // Design spec §2 — while a draw tool is active, its contextual panel
+  // renders even when the element type has no other schema yet.
+  const toolPanelDesc = target.mode === "defaults" ? getToolPanel(getActiveTool()) : null;
+  if (!schema && !toolPanelDesc) {
+    header.innerHTML = "";
+    const t = document.createElement("div");
+    t.textContent = `${target.type} — no editable properties`;
+    t.style.cssText = "font-weight:600;flex:1";
+    header.appendChild(t);
+    body.innerHTML = "";
+    return;
+  }
+
+  let element: AuthoredElement | null = null;
+  if (target.mode === "edit") {
+    element = getElements().find((e) => e.id === target.elementId) ?? null;
+    if (!element) {
+      // Element deleted underneath us — fall back to tool defaults.
+      setPaletteTarget(
+        getActiveTool() ? { mode: "defaults", type: getActiveTool() as any } : null,
+      );
+      return;
+    }
+  }
+
+  renderHeader(
+    target.mode,
+    schema ? schema.label : (toolPanelDesc?.title ?? target.type),
+    element ? element.name : undefined,
+  );
+
+  body.innerHTML = "";
+  body.style.display = expanded ? "block" : "none";
+
+  // G10 — Type Selector tops the palette whenever element(s) are selected.
+  if (element) {
+    try {
+      const ts = makeTypeSelectorBlock([element]);
+      if (ts) body.appendChild(ts);
+    } catch (err) {
+      console.warn("[property-palette] type selector failed", err);
+    }
+  }
+
+  // Contextual tool parameters come first while a tool is active.
+  if (toolPanelDesc) {
+    try { body.appendChild(renderToolPanel(toolPanelDesc)); }
+    catch (err) { console.warn("[property-palette] tool panel failed", err); }
+  }
+
+  if (schema) {
+    const byGroup = new Map<string, PropertyField[]>();
+    for (const f of schema.fields) {
+      const arr = byGroup.get(f.group) ?? [];
+      arr.push(f);
+      byGroup.set(f.group, arr);
+    }
+    for (const g of schema.groups) {
+      const fields = byGroup.get(g);
+      if (!fields || !fields.length) continue;
+      body.appendChild(sectionBlock(g, fields, element, schema.type));
+    }
+  }
+
+  // openbim-levels:ui-wired:property-palette
+  if (element && schema && LEVEL_CONSTRAINED_TYPES.has(schema.type)) {
+    try { body.appendChild(makeLevelConstraintsBlock(element)); }
+    catch (err) { console.warn("[property-palette] level constraints failed", err); }
+  }
+
+  // openbim-families:instance-wiring
+  if (element && element.familyId) {
+    try { body.appendChild(makeFamilyIdentityBlock(element)); }
+    catch (err) { console.warn("[property-palette] family identity failed", err); }
+  }
+
+  // Architectural wall / curtain type identity (catalog)
+  if (element && (element.type === "wall" || element.type === "curtain-wall")) {
+    try { body.appendChild(makeWallTypeIdentityBlock(element)); }
+    catch (err) { console.warn("[property-palette] wall type identity failed", err); }
+  }
+
+  // Classification — UniFormat II / Uniclass 2015 EF / OmniClass Table 21
+  if (element) {
+    try { body.appendChild(makeClassificationBlock(element)); }
+    catch (err) { console.warn("[property-palette] classification block failed", err); }
+  }
+}
+
+/** Element types that carry a BIM-style "Base Constraint" (level). */
+const LEVEL_CONSTRAINED_TYPES = new Set<string>([
+  "wall", "slab", "column", "beam", "brace", "truss",
+  "footing", "strip",
+  "door", "window",
+  "duct", "pipe", "cable-tray", "conduit", "equipment",
+]);
+
+/**
+ * Build a "Constraints" block bound to `element.levelId`.
+ *
+ * Writes:
+ *   element.levelId          = selected level id
+ *   element.params.elevation = level.elevation + baseOffset
+ *
+ * baseOffset is derived on read as
+ *   (element.params.elevation - level.elevation)
+ * so a user who edited elevation manually sees a stable offset.
+ */
+
+/** Type identity for walls / curtain walls — change catalog type on a placed instance. */
+
+/** Multi-select wall type: apply one catalog type to every selected wall. */
+
+/** Multi-select parametric constraints (Lock Distance, Parallel, …). */
+function makeConstraintMultiBlock(elementIds: string[]): HTMLElement {
+  const block = document.createElement("div");
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+  const title = document.createElement("span");
+  title.textContent = `Constraints (${elementIds.length} selected)`;
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px";
+  headerRow.append(title);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:6px 12px 10px;display:flex;flex-wrap:wrap;gap:6px";
+
+  const tools = () => ((ctx as any).features?.constraintTools ?? null);
+
+  const mk = (label: string, run: () => void, primary = false) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.style.cssText =
+      "font-size:11px;padding:5px 10px;border-radius:4px;cursor:pointer;" +
+      (primary
+        ? "background:#0ea5e9;border:1px solid #0284c7;color:#0b0e14;font-weight:600;"
+        : "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);color:var(--text-primary,#e8eaf0);");
+    b.onclick = () => {
+      try {
+        run();
+      } catch (err) {
+        console.warn("[property-palette] constraint action failed", err);
+      }
+    };
+    return b;
+  };
+
+  list.append(
+    mk("Lock Distance", () => tools()?.lockDistance?.(), true),
+    mk("Equal Length (solver)", () => tools()?.equalLength?.()),
+    mk("Parallel", () => tools()?.parallel?.()),
+    mk("Perpendicular", () => tools()?.perpendicular?.()),
+    mk("Align", () => tools()?.alignment?.()),
+    mk("Solve", () => tools()?.solve?.()),
+    mk("Manage…", () => tools()?.manage?.()),
+  );
+
+  const hint = document.createElement("div");
+  hint.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280);padding:0 12px 10px";
+  hint.textContent =
+    "Lock Distance freezes the nearest-endpoint gap; after you move a wall, Auto-Solve pulls neighbours back. Requires two linear elements selected.";
+
+  block.append(headerRow, list, hint);
+  return block;
+}
+
+function makeWallTypeMultiBlock(elementIds: string[]): HTMLElement {
+  const block = document.createElement("div");
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+  const title = document.createElement("span");
+  title.textContent = `Type (${elementIds.length} walls)`;
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px";
+  headerRow.append(title);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:6px 12px 10px;display:grid;gap:6px";
+
+  const els = elementIds
+    .map((id) => getElements().find((e) => e.id === id))
+    .filter(Boolean) as AuthoredElement[];
+  const inferred = els.map((e) => inferWallTypeId(e));
+  const same = inferred.length && inferred.every((id) => id === inferred[0]);
+  const current = same ? (inferred[0] || "") : "";
+
+  const row = document.createElement("div");
+  row.style.cssText =
+    "display:grid;grid-template-columns:90px 1fr;gap:8px;align-items:center";
+  const lbl = document.createElement("label");
+  lbl.textContent = "Wall Type";
+  lbl.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+
+  const sel = document.createElement("select");
+  sel.style.cssText =
+    "width:100%;box-sizing:border-box;padding:4px 6px;" +
+    "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+    "border-radius:4px;color:var(--text-primary,#e8eaf0);font:12px system-ui";
+  const allForSelect = listWallTypePresets();
+  const opts = [
+    !same ? `<option value="" selected>— mixed types —</option>` : "",
+    ...allForSelect.map(
+      (pr) =>
+        `<option value="${pr.id}" ${pr.id === current ? "selected" : ""}>${pr.name}</option>`,
+    ),
+  ];
+  sel.innerHTML = opts.join("");
+  sel.onchange = () => {
+    if (!sel.value) return;
+    const n = applyWallTypeToElements(elementIds, sel.value);
+    if (n > 0) {
+      try {
+        render();
+      } catch {
+        /* */
+      }
+    }
+  };
+
+  const hint = document.createElement("div");
+  hint.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280)";
+  hint.textContent = "Applies the same type to every selected wall in one step.";
+
+  const paramRow = document.createElement("div");
+  paramRow.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-top:4px";
+  const mkBtn = (label: string, key: string) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.title = `Keep ${key} equal across selection (parametric)`;
+    b.style.cssText =
+      "font-size:11px;padding:4px 8px;border-radius:4px;cursor:pointer;" +
+      "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+      "color:var(--text-primary,#e8eaf0)";
+    b.onclick = () => {
+      linkEqualParam(elementIds, key);
+      try { render(); } catch { /* */ }
+    };
+    return b;
+  };
+  paramRow.append(
+    mkBtn("Equal height", "height"),
+    mkBtn("Equal thickness", "thickness"),
+    mkBtn("Equal length", "length"),
+  );
+  const paramHint = document.createElement("div");
+  paramHint.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280)";
+  paramHint.textContent = "Parametric: changing height/thickness/length on one wall updates the linked set.";
+
+  row.append(lbl, sel);
+  list.append(row, hint, paramRow, paramHint);
+  block.append(headerRow, list);
+  return block;
+}
+
+function makeWallTypeIdentityBlock(element: AuthoredElement): HTMLElement {
+  const block = document.createElement("div");
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+  const caret = document.createElement("span");
+  caret.textContent = "▾";
+  caret.style.cssText = "width:10px;font-size:9px;color:var(--text-tertiary,#6b7280)";
+  const title = document.createElement("span");
+  title.textContent = "Type";
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px";
+  headerRow.append(caret, title);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:6px 12px 10px;display:grid;gap:6px";
+
+  const row = document.createElement("div");
+  row.style.cssText =
+    "display:grid;grid-template-columns:90px 1fr;gap:8px;align-items:center";
+  const lbl = document.createElement("label");
+  lbl.textContent = "Wall Type";
+  lbl.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+
+  const presets = listWallTypePresets().filter((pr) =>
+    element.type === "curtain-wall" ? pr.kind === "curtain" : pr.kind !== "curtain",
+  );
+  // When editing, offer both families if user wants to switch wall ↔ curtain
+  const allForSelect =
+    element.type === "wall" || element.type === "curtain-wall"
+      ? listWallTypePresets()
+      : presets;
+
+  const sel = document.createElement("select");
+  sel.style.cssText =
+    "width:100%;box-sizing:border-box;padding:4px 6px;" +
+    "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+    "border-radius:4px;color:var(--text-primary,#e8eaf0);font:12px system-ui";
+  const current = inferWallTypeId(element) || allForSelect[0]?.id || "";
+  sel.innerHTML = allForSelect
+    .map(
+      (pr) =>
+        `<option value="${pr.id}" ${pr.id === current ? "selected" : ""}>${pr.name}</option>`,
+    )
+    .join("");
+  sel.value = current;
+  sel.onchange = () => {
+    const ok = applyWallTypeToElement(String(element.id), sel.value);
+    if (ok) {
+      // Refresh palette for new thickness/layers
+      try {
+        render();
+      } catch {
+        /* */
+      }
+    }
+  };
+
+  const hint = document.createElement("div");
+  hint.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280);grid-column:1/-1";
+  hint.textContent =
+    "Changing type updates layers / system on this instance and rebuilds geometry.";
+
+  row.append(lbl, sel);
+  list.append(row, hint);
+  block.append(headerRow, list);
+  return block;
+}
+
+function makeLevelConstraintsBlock(element: AuthoredElement): HTMLElement {
+  const block = document.createElement("div");
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+  const caret = document.createElement("span");
+  caret.textContent = "\u25BE";
+  caret.style.cssText = "width:10px;font-size:9px;color:var(--text-tertiary,#6b7280)";
+  const title = document.createElement("span");
+  title.textContent = "Constraints";
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px";
+  headerRow.append(caret, title);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:4px 0";
+
+  const all = levels.list();
+
+  const rowBase = document.createElement("div");
+  rowBase.style.cssText =
+    "display:grid;grid-template-columns:110px 1fr;gap:8px;align-items:center;padding:3px 12px";
+  const lblBase = document.createElement("label");
+  lblBase.textContent = "Base Constraint";
+  lblBase.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+  const selBase = document.createElement("select");
+  selBase.style.cssText =
+    "width:100%;box-sizing:border-box;padding:4px 6px;" +
+    "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+    "border-radius:4px;color:var(--text-primary,#e8eaf0);font:12px system-ui;cursor:pointer";
+  selBase.innerHTML =
+    "<option value=\"\">-- none --</option>" +
+    all.map((l) =>
+      "<option value=\"" + escapeHtml(l.id) + "\">" + escapeHtml(l.name) + " (" + l.elevation.toFixed(2) + " m)</option>",
+    ).join("");
+  selBase.value = element.levelId ?? "";
+  selBase.onchange = () => {
+    const id = selBase.value || null;
+    const before = {
+      levelId: element.levelId,
+      elevation: element.params.elevation,
+    };
+    const target = id ? all.find((l) => l.id === id) ?? null : null;
+    element.levelId = id ?? undefined;
+    if (target) {
+      element.params.elevation = target.elevation;
+    } else {
+      element.params.elevation = before.elevation;
+    }
+    rebuildAuthored();
+    markAuthoringDirty();
+    const after = {
+      levelId: element.levelId,
+      elevation: element.params.elevation,
+    };
+    try {
+      const hist = (ctx.features as any).history;
+      hist?.push?.({
+        label: "Base Constraint - " + element.name,
+        apply: () => {
+          element.levelId = after.levelId;
+          element.params.elevation = after.elevation;
+          rebuildAuthored(); markAuthoringDirty();
+        },
+        revert: () => {
+          element.levelId = before.levelId;
+          element.params.elevation = before.elevation;
+          rebuildAuthored(); markAuthoringDirty();
+        },
+      });
+    } catch { /* history optional */ }
+    render();
+  };
+  rowBase.append(lblBase, selBase);
+  list.appendChild(rowBase);
+
+  const activeLevel = element.levelId
+    ? all.find((l) => l.id === element.levelId) ?? null
+    : null;
+  const offsetVal = activeLevel
+    ? element.params.elevation - activeLevel.elevation
+    : 0;
+
+  const rowOff = document.createElement("div");
+  rowOff.style.cssText = rowBase.style.cssText;
+  const lblOff = document.createElement("label");
+  lblOff.textContent = "Base Offset";
+  lblOff.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+  const offWrap = document.createElement("div");
+  offWrap.style.cssText = "display:flex;gap:4px;align-items:center";
+  const inpOff = document.createElement("input");
+  inpOff.type = "number";
+  inpOff.step = "0.05";
+  inpOff.value = offsetVal.toFixed(3);
+  inpOff.disabled = !activeLevel;
+  inpOff.style.cssText =
+    "flex:1;box-sizing:border-box;padding:4px 6px;text-align:end;" +
+    "background:var(--bg-inset,#0e1017);border:1px solid var(--border-default,#2a2e3a);" +
+    "border-radius:4px;color:var(--text-primary,#e8eaf0);font:12px system-ui";
+  if (!activeLevel) inpOff.style.opacity = "0.5";
+  inpOff.onchange = () => {
+    if (!activeLevel) return;
+    const v = Number(inpOff.value);
+    if (!Number.isFinite(v)) { inpOff.value = offsetVal.toFixed(3); return; }
+    const before = element.params.elevation;
+    const after = activeLevel.elevation + v;
+    element.params.elevation = after;
+    rebuildAuthored(); markAuthoringDirty();
+    try {
+      const hist = (ctx.features as any).history;
+      hist?.push?.({
+        label: "Base Offset - " + element.name,
+        apply: () => { element.params.elevation = after; rebuildAuthored(); markAuthoringDirty(); },
+        revert: () => { element.params.elevation = before; rebuildAuthored(); markAuthoringDirty(); },
+      });
+    } catch { /* */ }
+    render();
+  };
+  const unit = document.createElement("span");
+  unit.textContent = "m";
+  unit.style.cssText = "font-size:10px;color:var(--text-tertiary,#6b7280);min-width:16px";
+  offWrap.append(inpOff, unit);
+  rowOff.append(lblOff, offWrap);
+  list.appendChild(rowOff);
+
+  block.append(headerRow, list);
+  return block;
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Public
+   ═════════════════════════════════════════════════════════════════════════ */
+export function openPropertyPalette() {
+  cancelAutoOpen();
+  visible = true;
+  if (dockHandle) dockHandle.show();
+  else panel.style.display = "flex";
+  syncDockColumnVisibility();
+  if (!getPaletteTarget()) renderViewProperties();
+  else render();
+}
+export function closePropertyPalette() {
+  cancelAutoOpen();
+  visible = false;
+  if (dockHandle) dockHandle.hide();
+  else panel.style.display = "none";
+  syncDockColumnVisibility();
+}
+export function isPropertyPaletteVisible(): boolean {
+  return visible;
+}
+export function togglePropertyPalette() {
+  if (visible) closePropertyPalette();
+  else openPropertyPalette();
+}
+
+/** BIM-style view / graphics properties when no element is selected. */
+function renderViewProperties() {
+  try {
+    renderHeader("defaults", "3D View", "Project view");
+  } catch {
+    header.innerHTML = `<div style="font-weight:700;flex:1">3D View — Properties</div>`;
+  }
+  body.innerHTML = "";
+  body.style.display = "block";
+
+  const section = (title: string, rows: { label: string; value: string }[]) => {
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "padding:6px 10px 10px";
+    const h = document.createElement("div");
+    h.style.cssText =
+      "font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;" +
+      "color:#64748b;margin:4px 0 6px;padding-bottom:4px;border-bottom:1px solid #1e2029";
+    h.textContent = title;
+    wrap.appendChild(h);
+    for (const r of rows) {
+      const row = document.createElement("div");
+      row.style.cssText =
+        "display:flex;justify-content:space-between;align-items:center;padding:4px 0;gap:8px";
+      const lab = document.createElement("span");
+      lab.style.cssText = "color:#94a3b8";
+      lab.textContent = r.label;
+      const val = document.createElement("span");
+      val.style.cssText =
+        "color:#e2e8f0;background:#12141b;border:1px solid #2a2e3a;border-radius:4px;" +
+        "padding:2px 8px;min-width:72px;text-align:end;font-variant-numeric:tabular-nums";
+      val.textContent = r.value;
+      row.append(lab, val);
+      wrap.appendChild(row);
+    }
+    return wrap;
+  };
+
+  body.appendChild(section("Identity", [
+    { label: "View name", value: "3D View" },
+    { label: "View type", value: "3D" },
+    { label: "Discipline", value: "Coordination" },
+  ]));
+  body.appendChild(section("Graphics", [
+    { label: "View scale", value: "1 : 100" },
+    { label: "Scale value", value: "100" },
+    { label: "Detail level", value: "Medium" },
+    { label: "Parts visibility", value: "Show original" },
+    { label: "Show hidden lines", value: "By discipline" },
+  ]));
+  body.appendChild(section("Extents", [
+    { label: "Crop region", value: "Off" },
+    { label: "Annotation crop", value: "Off" },
+    { label: "Far clip", value: "No clip" },
+  ]));
+
+  const tip = document.createElement("div");
+  tip.style.cssText = "padding:8px 12px;font-size:11px;color:#64748b;line-height:1.4";
+  tip.textContent =
+    "Select an authored element or activate a modeling tool to edit instance / type properties.";
+  body.appendChild(tip);
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Setup
+   ═════════════════════════════════════════════════════════════════════════ */
+// openbim-fix:pp-theme
+//
+// Injects a small :root block mapping palette-local tokens to app
+// theme tokens. The palette's inline styles then use
+// var(--obs-pp-*, <fallback>) so a theme override anywhere in the app
+// (dark/light toggle, high-contrast, brand palette) automatically
+// reaches the Properties palette.
+//
+// The <style> element is added once (guard on its id). All fallbacks
+// are the previous hard-coded values, so visual output is unchanged
+// until a theme overrides one of the tokens.
+function installPaletteTheme(): void {
+  const STYLE_ID = "obs-pp-theme";
+  if (document.getElementById(STYLE_ID)) return;
+  const style = document.createElement("style");
+  style.id = STYLE_ID;
+  style.textContent = [
+    ":root {",
+    "  --obs-pp-warn-fg:       var(--danger-soft, #fca5a5);",
+    "  --obs-pp-type-bg:       var(--accent-dim, rgba(56,189,248,.14));",
+    "  --obs-pp-type-fg:       var(--accent-soft, #7dd3fc);",
+    "  --obs-pp-inst-bg:       var(--alt-dim, rgba(168,85,247,.14));",
+    "  --obs-pp-inst-fg:       var(--alt-soft, #c4b5fd);",
+    "  --obs-pp-active-border: var(--accent, #38bdf8);",
+    "  --obs-pp-row-bg:        var(--bg-base, #0b0d12);",
+    "  --obs-pp-row-border:    var(--border-subtle, #1e2029);",
+    "  --obs-pp-row-fg:        var(--text-secondary, #cbd5e1);",
+    "}",
+  ].join("\n");
+  document.head.appendChild(style);
+}
+/**
+ * Classification — assign published codes (UniFormat II / Uniclass 2015 EF /
+ * OmniClass Table 21) to the selected element, one code per system. Codes are
+ * validated against the module's tables, persist with the project and are
+ * emitted into IFC export as IfcClassificationReference.
+ */
+function makeClassificationBlock(element: AuthoredElement): HTMLElement {
+  const { listSystems, setAssignment, getElementAssignments } = classificationModule;
+
+  const block = document.createElement("div");
+  block.style.cssText = "border-bottom:1px solid var(--border-subtle,#1e2029)";
+
+  const headerRow = document.createElement("div");
+  headerRow.style.cssText =
+    "display:flex;align-items:center;gap:6px;padding:7px 12px;" +
+    "background:var(--bg-elevated,#181a23);user-select:none";
+  const caret = document.createElement("span");
+  caret.textContent = "▾";
+  caret.style.cssText = "width:10px;font-size:9px;color:var(--text-tertiary,#6b7280)";
+  const title = document.createElement("span");
+  title.textContent = "Classification";
+  title.style.cssText = "font-weight:600;font-size:11.5px;letter-spacing:.2px";
+  headerRow.append(caret, title);
+
+  const list = document.createElement("div");
+  list.style.cssText = "padding:6px 12px 10px;display:grid;gap:8px";
+
+  const INP =
+    "width:100%;box-sizing:border-box;padding:4px 6px;background:var(--bg-inset,#0e1017);" +
+    "border:1px solid var(--border-default,#2a2e3a);border-radius:4px;" +
+    "color:var(--text-primary,#e8eaf0);font:12px system-ui";
+  const BTN =
+    "padding:4px 8px;border:1px solid var(--border-default,#2a2e3a);border-radius:4px;" +
+    "background:var(--bg-elevated,#181a23);color:var(--text-primary,#e8eaf0);" +
+    "font:11px system-ui;cursor:pointer;white-space:nowrap";
+
+  const render = () => {
+    list.innerHTML = "";
+    const assigned = new Map(
+      getElementAssignments(element.id).map((a) => [a.systemId, a.code] as const),
+    );
+
+    for (const sys of listSystems()) {
+      const sysBox = document.createElement("div");
+      sysBox.style.cssText = "display:grid;gap:4px";
+
+      const top = document.createElement("div");
+      top.style.cssText = "display:grid;grid-template-columns:1fr auto;gap:6px;align-items:baseline";
+      const name = document.createElement("span");
+      name.textContent = sys.name;
+      name.style.cssText = "font-size:11px;color:var(--text-secondary,#a0a6b5)";
+      const cur = assigned.get(sys.id);
+      const value = document.createElement("span");
+      const hit = cur ? sys.codes.find((c) => c.code === cur) : null;
+      value.textContent = hit ? `${hit.code} — ${hit.title}` : "Not assigned";
+      value.style.cssText =
+        "font-size:10.5px;text-align:end;" +
+        (hit ? "color:#7dd3fc" : "color:var(--text-tertiary,#6b7280)");
+      top.append(name, value);
+      sysBox.appendChild(top);
+
+      const pick = document.createElement("div");
+      pick.style.cssText = "display:grid;grid-template-columns:1fr auto auto;gap:4px";
+      const dlId = `obs-classif-dl-${sys.id}`;
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.value = cur ?? "";
+      inp.placeholder = `search ${sys.codes.length} codes…`;
+      inp.style.cssText = INP;
+      inp.setAttribute("list", dlId);
+      const dl = document.createElement("datalist");
+      dl.id = dlId;
+      for (const c of sys.codes) {
+        const opt = document.createElement("option");
+        opt.value = c.code;
+        opt.label = `${c.title} (L${c.level})`;
+        dl.appendChild(opt);
+      }
+      const setBtn = document.createElement("button");
+      setBtn.textContent = "Set";
+      setBtn.style.cssText = BTN;
+      const rmBtn = document.createElement("button");
+      rmBtn.textContent = "×";
+      rmBtn.title = "Remove this assignment";
+      rmBtn.style.cssText = BTN;
+      const err = document.createElement("div");
+      err.style.cssText = "font-size:10px;color:var(--obs-pp-warn-fg,#fca5a5);display:none";
+
+      setBtn.onclick = () => {
+        const r = setAssignment(element.id, sys.id, inp.value);
+        if (!r.ok) {
+          err.textContent = r.reason ?? "Assignment rejected";
+          err.style.display = "block";
+          return;
+        }
+        err.style.display = "none";
+        // Assignments travel with the project document — flag the change so
+        // the next save flushes them (they used to be browser-storage-only).
+        try { markDirty(); } catch { /* */ }
+        render();
+      };
+      rmBtn.onclick = () => {
+        setAssignment(element.id, sys.id, null);
+        try { markDirty(); } catch { /* */ }
+        render();
+      };
+
+      pick.append(inp, setBtn, rmBtn, dl);
+      sysBox.append(pick, err);
+      list.appendChild(sysBox);
+    }
+
+    const hint = document.createElement("div");
+    hint.textContent = "One code per system · validated against the table · exported to IFC as IfcClassificationReference";
+    hint.style.cssText = "font-size:9.5px;color:var(--text-tertiary,#6b7280)";
+    list.appendChild(hint);
+  };
+  render();
+
+  block.append(headerRow, list);
+  return block;
+}
+
+export function setupPropertyPalette(): void {
+  setLevelsProvider(() => ((ctx.features as any).authoring?.getLevels?.() ?? []) as any);
+  installPaletteTheme();
+  // Classification service — assign published classification codes to the
+  // selected element (UniFormat II / Uniclass 2015 EF / OmniClass Table 21);
+  // assignments travel with the model into IFC export.
+  try {
+    const { listSystems, setAssignment, getElementAssignments, searchCodes, importCodesFromCsv, buildIfcClassifications } =
+      classificationModule;
+    (ctx.features as any).classification = {
+      listSystems, setAssignment, getElementAssignments, searchCodes, importCodesFromCsv, buildIfcClassifications,
+    };
+    console.log("[property-palette] classification service + palette section ready");
+  } catch (err) { console.warn("[property-palette] classification service failed", err); }
+  ctx.rightHost.appendChild(panel);
+
+  dockHandle = makeDockable(panel, {
+    id: "property-palette",
+    host: ctx.rightHost,
+    header,
+    minWidth: 260,
+    minHeight: 280,
+    // G10 — Revit docks the Properties palette left by default; the
+    // onLayout owner reserves a flex column for it (see paletteDockLayout).
+    // A stored dock side (localStorage) still wins for returning users.
+    defaultDock: "left",
+    onLayout: paletteDockLayout,
+    defaultWidth: 320,
+    defaultHeight: 520,
+    margin: 8,
+    snapThreshold: 28,
+  });
+
+  // openbim-fix:property-palette-closed-by-default
+  // Refresh the palette contents when authoring changes, but DO NOT
+  // force it open. The palette stays closed unless the user opened it
+  // via the ribbon, User Interface menu, Ctrl+1, the command palette,
+  // or openPropertyPalette().
+  // Design spec §2.1 — selecting a modeling tool opens its contextual
+  // properties panel automatically. (Supersedes the earlier
+  // closed-by-default behaviour for tool activation only: selection and
+  // manual open/close still behave exactly as before.)
+  //
+  // G10 — auto-open on selection, through the notification that actually
+  // fires. The selection.onChange handler below intends this, but 3D
+  // clicks never emit through the `selection` manager: authoring's
+  // applySelection() only recolors meshes, and setSelectedAuthored()
+  // reports through notifyAuthoringChange() instead. So an edit target
+  // arriving here opens the palette (once per target — closing it
+  // manually while the same element stays selected does not re-open it).
+  // setSelectedAuthored() also clears the target for multi-selection,
+  // so the edit-multi target (and the Type Selector's varies state) is
+  // built here too, with the same classification as the onChange handler.
+  onAuthoringChange(() => {
+    try {
+      if (isDrawToolActive() && !visible) {
+        // G5: deferred — the dock shifts the viewport, which must not
+        // land between the two clicks of a double-click (see scheduleAutoOpen).
+        scheduleAutoOpen();
+        return;
+      }
+    } catch (err) { console.warn("[property-palette] auto-open failed", err); }
+    try {
+      const target = getPaletteTarget();
+      if (!target) {
+        lastSelectionTargetKey = null;
+      } else if (target.mode === "edit" || target.mode === "edit-multi") {
+        const key = target.mode === "edit"
+          ? `edit:${target.elementId}`
+          : `edit-multi:${target.elementIds.join(",")}`;
+        if (key !== lastSelectionTargetKey) {
+          lastSelectionTargetKey = key;
+          if (!visible) {
+            scheduleAutoOpen();
+            return;
+          }
+        }
+      } else {
+        lastSelectionTargetKey = null;
+      }
+    } catch (err) { console.warn("[property-palette] auto-open failed", err); }
+    try {
+      if (!getPaletteTarget()) {
+        const ids = getSelectedIds();
+        if (ids.length > 1) {
+          const selected = ids
+            .map((id) => getElements().find((e) => e.id === id))
+            .filter(Boolean) as AuthoredElement[];
+          if (selected.length >= 2) {
+            lastSelectionTargetKey = `edit-multi:${selected.map((e) => e.id).join(",")}`;
+            setPaletteTarget({
+              mode: "edit-multi",
+              elementIds: selected.map((e) => e.id),
+              type: selected[0].type as any,
+            });
+            if (!visible) {
+              scheduleAutoOpen();
+              return;
+            }
+          }
+        }
+      }
+    } catch (err) { console.warn("[property-palette] auto-open failed", err); }
+    if (!visible) return;
+    render();
+  });
+
+  // BIM-style auto-open: when a single element is selected, open the
+  // palette and switch it to edit mode for that element.
+  try {
+    selection.onChange(() => {
+      try {
+        const auth: any = (ctx.features as any).authoring;
+        const selIds: string[] = auth?.getSelectedIds?.() ?? [];
+        if (selIds.length === 1) {
+          const el = getElements().find((x) => x.id === selIds[0]);
+          if (el) {
+            setPaletteTarget({ mode: "edit", type: el.type as any, elementId: el.id });
+            if (!visible) scheduleAutoOpen(); else render();
+            return;
+          }
+        }
+        if (selIds.length > 1) {
+          const selected = selIds
+            .map((id) => getElements().find((x) => x.id === id))
+            .filter(Boolean) as AuthoredElement[];
+          const constraintTypes = new Set([
+            "wall", "curtain-wall", "beam", "strip", "mline",
+            "duct", "pipe", "cable-tray", "conduit", "brace",
+          ]);
+          const linears = selected.filter((e) => constraintTypes.has(String(e.type)));
+          // Pure wall multi → type + constraints
+          const walls = selected.filter((e) => e.type === "wall" || e.type === "curtain-wall");
+          if (walls.length >= 2 && walls.length === selected.length) {
+            setPaletteTarget({
+              mode: "edit-multi",
+              elementIds: walls.map((w) => w.id),
+              type: "wall" as any,
+            });
+            if (!visible) scheduleAutoOpen(); else render();
+            return;
+          }
+          // 2+ linear elements (mixed types) → constraints panel
+          if (linears.length >= 2 && linears.length === selected.length) {
+            setPaletteTarget({
+              mode: "edit-multi",
+              elementIds: linears.map((w) => w.id),
+              type: (linears[0].type as any) || "wall",
+            });
+            if (!visible) scheduleAutoOpen(); else render();
+            return;
+          }
+          // G10 — any other multi-selection of authored elements still
+          // gets an edit-multi target, so the Type Selector (varies
+          // state) is available for mixed-type selections too.
+          if (selected.length >= 2) {
+            setPaletteTarget({
+              mode: "edit-multi",
+              elementIds: selected.map((w) => w.id),
+              type: (selected[0].type as any) || "wall",
+            });
+            if (!visible) scheduleAutoOpen(); else render();
+            return;
+          }
+        }
+      } catch (err) { console.warn("[property-palette] auto-open failed", err); }
+      if (visible) render();
+    });
+  } catch { /* */ }
+
+  // G10 — the palette starts docked left (Revit default) but closed;
+  // it opens on selection / tool activation / explicit open.
+  closePropertyPalette();
+  try { dockHandle.dock("left"); } catch { /* */ }
+  render();
+
+  ctx.features.propertyPalette = {
+    open: openPropertyPalette,
+    close: closePropertyPalette,
+    isVisible: isPropertyPaletteVisible,
+    rerender: render,
+    dock: (side: "left" | "right" | "float") => dockHandle?.dock(side),
+    dockSide: () => dockHandle?.side?.() ?? null,
+    resetLayout: () => dockHandle?.reset(),
+  };
+}

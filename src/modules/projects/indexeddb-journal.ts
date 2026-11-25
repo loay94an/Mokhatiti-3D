@@ -1,0 +1,291 @@
+import { Journal, type JournalStore, type Op } from "../../core/journal";
+import type { ProjectDoc } from "./types";
+import { normalizeProjectDoc } from "./project-schema";
+import { scopedDbName } from "../../core/account-scope";
+
+const DB_NAME = "open-bim-studio";
+const DB_VERSION = 4;
+const S_OPS = "projectOps";
+const S_SNAPSHOTS = "projectOperationSnapshots";
+/** Quarantined journal entries: the tail replay stopped at, kept as evidence — never silently dropped. */
+const S_QUARANTINE = "projectJournalQuarantine";
+export const PROJECT_JOURNAL_QUARANTINE_KEEP = 50;
+
+type StoredOp = Op & { key: string; projectId: string };
+type StoredSnapshot = { key: string; projectId: string; seq: number; state: string; createdAt: number; formatVersion: 1 };
+
+function requestResult<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB journal request failed."));
+  });
+}
+
+function transactionDone(tx: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error("IndexedDB journal transaction failed."));
+    tx.onabort = () => reject(tx.error ?? new Error("IndexedDB journal transaction aborted."));
+  });
+}
+
+function openJournalDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(scopedDbName(DB_NAME), DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(S_OPS)) {
+        const ops = db.createObjectStore(S_OPS, { keyPath: "key" });
+        ops.createIndex("projectId", "projectId", { unique: false });
+      }
+      if (!db.objectStoreNames.contains(S_SNAPSHOTS)) {
+        const snapshots = db.createObjectStore(S_SNAPSHOTS, { keyPath: "key" });
+        snapshots.createIndex("projectId", "projectId", { unique: false });
+      }
+      if (!db.objectStoreNames.contains(S_QUARANTINE)) {
+        const quarantine = db.createObjectStore(S_QUARANTINE, { keyPath: "key" });
+        quarantine.createIndex("projectId", "projectId", { unique: false });
+      }
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => db.close();
+      resolve(db);
+    };
+    request.onerror = () => reject(request.error ?? new Error("Unable to open the IndexedDB journal."));
+    request.onblocked = () => reject(new Error("IndexedDB journal upgrade is blocked by another tab."));
+  });
+}
+
+class ProjectJournalStore implements JournalStore {
+  constructor(private readonly projectId: string) {}
+
+  private async records<T>(storeName: string): Promise<T[]> {
+    const db = await openJournalDb();
+    const tx = db.transaction(storeName, "readonly");
+    const result = await requestResult(tx.objectStore(storeName).index("projectId").getAll(this.projectId));
+    await transactionDone(tx);
+    db.close();
+    return result as T[];
+  }
+
+  async loadNewestSnapshot(): Promise<{ seq: number; state: string } | null> {
+    const snapshots = await this.records<StoredSnapshot>(S_SNAPSHOTS);
+    snapshots.sort((a, b) => b.seq - a.seq);
+    const latest = snapshots[0];
+    return latest ? { seq: latest.seq, state: latest.state } : null;
+  }
+
+  async opsAfter(seq: number): Promise<Op[]> {
+    const ops = await this.records<StoredOp>(S_OPS);
+    return ops.filter((op) => op.seq > seq).sort((a, b) => a.seq - b.seq).map(({ key: _key, projectId: _projectId, ...op }) => op);
+  }
+
+  async latestSeq(): Promise<number> {
+    const ops = await this.records<StoredOp>(S_OPS);
+    return ops.reduce((max, op) => Math.max(max, op.seq), 0);
+  }
+
+  /** Every stored op for this project, unsorted, with its storage key (for validated replay + quarantine). */
+  async allOpsRaw(): Promise<StoredOp[]> {
+    return this.records<StoredOp>(S_OPS);
+  }
+
+  async appendLine(line: string): Promise<void> {
+    let op: Op;
+    try {
+      op = JSON.parse(line) as Op;
+    } catch (e) {
+      // A corrupt journal line is the app's own stored data gone bad, not a
+      // caller bug — fail with a typed error instead of crashing the caller
+      // (issue #90: recovery paths must not throw raw parse errors).
+      throw new Error(`Corrupt journal entry (not valid JSON): ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const db = await openJournalDb();
+    const tx = db.transaction(S_OPS, "readwrite");
+    tx.objectStore(S_OPS).put({ ...op, projectId: this.projectId, key: `${this.projectId}:${op.seq}` } satisfies StoredOp);
+    await transactionDone(tx);
+    db.close();
+  }
+
+  async writeSnapshot(seq: number, state: string): Promise<void> {
+    const db = await openJournalDb();
+    const tx = db.transaction(S_SNAPSHOTS, "readwrite");
+    tx.objectStore(S_SNAPSHOTS).put({ key: `${this.projectId}:${seq}`, projectId: this.projectId, seq, state, createdAt: Date.now(), formatVersion: 1 } satisfies StoredSnapshot);
+    await transactionDone(tx);
+    db.close();
+  }
+
+  async compactJournalBefore(seq: number): Promise<void> {
+    const db = await openJournalDb();
+    const tx = db.transaction(S_OPS, "readwrite");
+    const store = tx.objectStore(S_OPS);
+    const ops = await requestResult(store.index("projectId").getAll(this.projectId)) as StoredOp[];
+    for (const op of ops) if (op.seq <= seq) store.delete(op.key);
+    await transactionDone(tx);
+    db.close();
+  }
+}
+
+/** Append the complete project state before the primary project write. */
+export async function appendProjectState(doc: ProjectDoc): Promise<void> {
+  await withProjectJournalLock(doc.id, async () => {
+    let latest: ProjectDoc | null = null;
+    const journal = await openProjectJournal(doc.id, (value) => { latest = value; });
+    await journal.append("replace-state", structuredClone(doc));
+  });
+}
+
+/** Record an intentional deletion so recovery never resurrects a deleted project. */
+export async function appendProjectDeletion(projectId: string): Promise<void> {
+  await withProjectJournalLock(projectId, async () => {
+    const journal = await openProjectJournal(projectId, () => undefined);
+    await journal.append("delete", null);
+  });
+}
+
+/**
+ * Parse a stored operation-journal snapshot state tolerantly. The snapshot
+ * is the base the append path replays onto, and it is written by an
+ * earlier run — a torn or schema-invalid snapshot must fall back to
+ * replaying the ops from empty, never throw: a throw here would break
+ * every subsequent save (`putProject` appends first, then writes the
+ * primary record). The caller logs the fallback loudly; the validated
+ * crash-replay core reports the same condition as `snapshotCorrupt`.
+ * Returns the normalized document, or null when nothing usable is there.
+ */
+export function parseJournalSnapshotState(state: string): ProjectDoc | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(state);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const normalized = normalizeProjectDoc(parsed);
+  return normalized.ok ? normalized.doc : null;
+}
+
+async function withProjectJournalLock<T>(projectId: string, task: () => Promise<T>): Promise<T> {
+  const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+  if (locks) return locks.request(`obs:project-journal:${projectId}`, { mode: "exclusive" }, task);
+  return task();
+}
+
+async function openProjectJournal(projectId: string, setLatest: (value: ProjectDoc | null) => void): Promise<Journal> {
+  let latest: ProjectDoc | null = null;
+  const journal = await Journal.open(
+    new ProjectJournalStore(projectId),
+    (op) => {
+      // Append-path only: a torn op payload must never poison the base
+      // state a later snapshot serializes. Only object payloads count.
+      if (op.kind === "replace-state" && op.payload && typeof op.payload === "object") latest = op.payload as ProjectDoc;
+      else if (op.kind === "delete") latest = null;
+      setLatest(latest);
+    },
+    () => JSON.stringify(latest),
+    (state) => {
+      const restored = parseJournalSnapshotState(state);
+      if (restored === null) {
+        // The snapshot is corrupt (or empty): replay the ops from empty
+        // instead of throwing and breaking every future save. The
+        // validated crash-replay core reports this as `snapshotCorrupt`.
+        console.error("[project-journal] stored journal snapshot is corrupt; replaying ops from empty", projectId);
+      }
+      latest = restored;
+      setLatest(latest);
+    },
+  );
+  return journal;
+}
+
+/* ── validated crash replay (#101) ────────────────────────────────────────
+ * There is deliberately NO blind `recoverProjectState()` helper any more:
+ * it replayed through `Journal.open` with no payload validation (a
+ * corrupt snapshot threw), had no callers, and crash recovery must use
+ * the validated core in `journal-replay.ts` instead. The raw journal
+ * below is what that core validates, and the quarantine below is where
+ * the tail it refuses goes — preserved as evidence, removed from the
+ * live op store so the next crash boot does not stop at the same entry
+ * again. `Journal.open` above is append-only (writes), and its restore
+ * callback is the tolerant `parseJournalSnapshotState`, never a bare
+ * `JSON.parse`.
+ */
+
+export interface RawJournalOp { seq: number; kind: string; payload: unknown; key: string }
+export interface RawJournal { snapshot: { seq: number; state: string } | null; ops: RawJournalOp[] }
+export interface QuarantinedJournalRecord {
+  key: string;
+  projectId: string;
+  seq: number;
+  kind: string;
+  reason: string;
+  raw: unknown;
+  quarantinedAt: number;
+}
+
+/** Read the whole journal for a project: newest snapshot + every op, in seq order. */
+export async function loadProjectJournalRaw(projectId: string): Promise<RawJournal> {
+  const store = new ProjectJournalStore(projectId);
+  const snapshot = await store.loadNewestSnapshot();
+  const ops = await store.allOpsRaw();
+  ops.sort((a, b) => a.seq - b.seq);
+  return {
+    snapshot,
+    ops: ops.map(({ seq, kind, payload, key }) => ({ seq, kind, payload, key })),
+  };
+}
+
+/** Which quarantine record keys to delete so at most `keep` newest remain (after a pending add). */
+export function selectQuarantinePruneKeys(
+  existing: Array<{ key: string; seq: number }>,
+  keep: number = PROJECT_JOURNAL_QUARANTINE_KEEP,
+): string[] {
+  if (keep < 1) return [];
+  const sorted = [...existing].sort((a, b) => (b.seq - a.seq) || (b.key < a.key ? 1 : -1));
+  return sorted.slice(Math.max(0, keep - 1)).map((r) => r.key);
+}
+
+/**
+ * Move the quarantined tail out of the live op store into the quarantine
+ * store, preserving each entry's raw payload and the reason replay
+ * refused it. Best-effort: a quarantine failure is logged and rethrown
+ * so the caller can report it — the entries stay in the op store, so a
+ * later boot retries the quarantine instead of losing the evidence.
+ */
+export async function quarantineProjectJournalOps(
+  projectId: string,
+  tail: Array<{ seq: number; kind: string; reason: string; raw: unknown }>,
+): Promise<void> {
+  if (!tail.length) return;
+  const db = await openJournalDb();
+  const tx = db.transaction([S_OPS, S_QUARANTINE], "readwrite");
+  const quarantine = tx.objectStore(S_QUARANTINE);
+  const existing = await requestResult(quarantine.index("projectId").getAll(projectId)) as QuarantinedJournalRecord[];
+  for (const entry of tail) {
+    quarantine.put({
+      key: `${projectId}:${entry.seq}`,
+      projectId,
+      seq: entry.seq,
+      kind: entry.kind,
+      reason: entry.reason,
+      raw: entry.raw,
+      quarantinedAt: Date.now(),
+    } satisfies QuarantinedJournalRecord);
+  }
+  for (const key of selectQuarantinePruneKeys(existing, PROJECT_JOURNAL_QUARANTINE_KEEP)) quarantine.delete(key);
+  const ops = tx.objectStore(S_OPS);
+  for (const entry of tail) ops.delete(`${projectId}:${entry.seq}`);
+  await transactionDone(tx);
+  db.close();
+}
+
+/** Quarantined entries for a project, newest first — the evidence of what replay refused. */
+export async function listQuarantinedJournalOps(projectId: string): Promise<QuarantinedJournalRecord[]> {
+  const db = await openJournalDb();
+  const tx = db.transaction(S_QUARANTINE, "readonly");
+  const result = await requestResult(tx.objectStore(S_QUARANTINE).index("projectId").getAll(projectId)) as QuarantinedJournalRecord[];
+  await transactionDone(tx);
+  db.close();
+  return result.sort((a, b) => b.seq - a.seq);
+}

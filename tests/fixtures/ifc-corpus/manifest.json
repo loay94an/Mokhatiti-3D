@@ -1,0 +1,857 @@
+{
+  "version": 1,
+  "note": "Every *.ifc under tests/fixtures/ifc-corpus must be listed. 'independent:false' = produced by this project's own writer; 'independent:true' = real third-party model (the two Duplex files and Gymzaal Amersfoort, CC BY 4.0 — see third-party/README.md). '.ifczip' archives are not listed here (the manifest test walks *.ifc only) and are covered by test:step-preflight.",
+  "files": [
+    {
+      "file": "arch-2x3.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "architecture under IFC2X3: walls, hosted door + window, slab, column, one IfcSpace",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 13037,
+      "sha256": "d0eeef83a2a20455170b6ded93798b8dc37e0e07202a32d1215a9b0e31ece5c7",
+      "entities": 242,
+      "coverage": [
+        "ifc2x3",
+        "architecture",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "arch-classified.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "classification references",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 8406,
+      "sha256": "29a4060983cc0ea2a32ba9eddbad82625a902de01b2775afcb9b240f39c57488",
+      "entities": 149,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "property-sets",
+        "relationships"
+      ]
+    },
+    {
+      "file": "extended/ifc2x3-classified.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "IfcClassification on IFC2X3",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 4691,
+      "sha256": "26341b1892dcbe7a456417020b258d9f80c6da6ffa6b3f360247eaa7110b8873",
+      "entities": 84,
+      "coverage": [
+        "ifc2x3",
+        "architecture",
+        "property-sets"
+      ]
+    },
+    {
+      "file": "extended/ifc2x3-mep-systems.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "duct/pipe/tray/conduit/equipment",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 10402,
+      "sha256": "66202ee1d29ae31cd188020ff79ab547d7f4c250477b4ac04c3053086e486765",
+      "entities": 188,
+      "coverage": [
+        "ifc2x3",
+        "mep",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "extended/ifc2x3-multi-storey.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "4 storeys, walls+slabs per level",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 16893,
+      "sha256": "4d853b47be51f05721c8b03e0cff671de6a5ca3d8dd679d3d41eddf90fdbef39",
+      "entities": 307,
+      "coverage": [
+        "ifc2x3",
+        "architecture",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "extended/ifc2x3-single-room.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "closed room: 4 walls + slab",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 8282,
+      "sha256": "04a5d2a6cb4a39e2ac5aeef92e68779718c120e821e33abd6f162148bc4d2e4e",
+      "entities": 153,
+      "coverage": [
+        "ifc2x3",
+        "architecture",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "extended/ifc2x3-structural-frame.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "columns, beams, footing grid",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 12052,
+      "sha256": "843d7f63411dc7f87eeedbf5ab9381ada5d56afbab60da4bf3e106ec96981767",
+      "entities": 216,
+      "coverage": [
+        "ifc2x3",
+        "structural"
+      ]
+    },
+    {
+      "file": "extended/ifc4-envelope-roof-curtain.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "curtain wall, roof, ceiling covering",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 15279,
+      "sha256": "36f5856c80a7987a6f304fac0df31da267cd683e9674f65554d033b060b7327d",
+      "entities": 107,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "geometry-complexity"
+      ]
+    },
+    {
+      "file": "extended/ifc4-mep-systems.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "duct/pipe/tray/conduit/equipment",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 11065,
+      "sha256": "408860f57fe3a78858f256e91d207baafc06e8bc2b1e58c1bf19066230bc794b",
+      "entities": 191,
+      "coverage": [
+        "ifc4",
+        "mep",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "extended/ifc4-multi-storey.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "4 storeys, walls+slabs per level",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 16965,
+      "sha256": "16e5e0bc81fc91286e6a54e92491b3a8f6f5d676051ff28a7feae0e2cf7ea2b4",
+      "entities": 306,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "extended/ifc4-openings-doors-windows.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "hosted doors/windows with openings",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 7727,
+      "sha256": "b7d15697c23cb7f30337ded0d2aa68db09ccfb4841a402fb4a650108b4ad8639",
+      "entities": 141,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "relationships"
+      ]
+    },
+    {
+      "file": "extended/ifc4-single-room.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "closed room: 4 walls + slab",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 8308,
+      "sha256": "2cd07aa6a030e36115ae698a5a0a0065e130f57b3bd001b879fea7af30671c21",
+      "entities": 152,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "extended/ifc4-spaces-rooms.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "IfcSpace with numbers",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 6730,
+      "sha256": "0b8bfc4f85e99fae728ead450d22e5488aa334379dd97e08775befccf28a8c77",
+      "entities": 123,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "extended/ifc4-stress-400-walls.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "400 walls over 2 storeys (size/perf)",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 480632,
+      "sha256": "3bc818927c6fc60b92c97b885e446d58a2d9f9c42038985caef5245f24f30e4b",
+      "entities": 8440,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "scale"
+      ]
+    },
+    {
+      "file": "extended/ifc4-structural-frame.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "columns, beams, footing grid",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 12099,
+      "sha256": "8821a6b2182000521c4931a9d850d2bf0f93171391f4564871f2c22e44ceb3e6",
+      "entities": 214,
+      "coverage": [
+        "ifc4",
+        "structural"
+      ]
+    },
+    {
+      "file": "extended/ifc4-unicode-and-quotes.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "STEP string encoding (apostrophe, backslash, \\X2\\ unicode)",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 3324,
+      "sha256": "e2396ab60cde06722ddc0c3b18c5f0c92f67377d823e31b029385ef27566cd57",
+      "entities": 56,
+      "coverage": [
+        "ifc4",
+        "architecture"
+      ]
+    },
+    {
+      "file": "extended/ifc4-vertical-circulation.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "stair, railing, ramp",
+      "source": "project-authored (scripts/generate-ifc-corpus-extended.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 22282,
+      "sha256": "5cc88fe10eee8166970fe119811c46acebd9d956bdb8abd4cec87b2f45df5ce0",
+      "entities": 97,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "geometry-complexity"
+      ]
+    },
+    {
+      "file": "generated-2x3.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "same model under IFC2X3",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 7347,
+      "sha256": "3a98dc8a4c3e006279dd7cf1898d8e2cb6d48603e7095c6e69dc0aa328169b52",
+      "entities": 138,
+      "coverage": [
+        "ifc2x3",
+        "architecture"
+      ]
+    },
+    {
+      "file": "generated-small.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "walls + hosted door + slab, golden snapshot",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 7353,
+      "sha256": "d3f170260c72ad8147415c97a89370e9ccbbdf3a23039b7bb402e5831617b01f",
+      "entities": 136,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "spatial-hierarchy",
+        "relationships",
+        "property-sets"
+      ]
+    },
+    {
+      "file": "generated-structural.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "beam + column",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 2985,
+      "sha256": "62ac3dc91e7f485d11f5db3f98ff94b9647a4bd61f1d3c0ec119dfb8f968fa0e",
+      "entities": 52,
+      "coverage": [
+        "ifc4",
+        "structural"
+      ]
+    },
+    {
+      "file": "geometry-complex.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "geometry variety: L-stair, ramp, railing, curtain wall, gable roof (IfcSlab .ROOF.), baseboard sweep (IfcCovering), vertical opening voiding a slab",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 88414,
+      "sha256": "fbc7d7bd7a7a65e84a5d51ec10a03bbf7b37ab2fa10a7427f95b315b1a99147b",
+      "entities": 253,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "geometry-complexity",
+        "relationships"
+      ]
+    },
+    {
+      "file": "invalid/bad-guid.ifc",
+      "kind": "invalid",
+      "schema": "IFC4",
+      "purpose": "GlobalId outside the base64 alphabet",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "finding": "IFC-E-BAD-GUID"
+      },
+      "bytes": 3298,
+      "sha256": "b45a6725f40e16d405e6c1c2b0e3c5cdc7554b4b45c65f1302530e595b8bf51a",
+      "entities": 58,
+      "coverage": [
+        "invalid"
+      ]
+    },
+    {
+      "file": "invalid/dangling-ref.ifc",
+      "kind": "invalid",
+      "schema": "IFC4",
+      "purpose": "relationship to a missing entity",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "finding": "IFC-E-DANGLING-REF"
+      },
+      "bytes": 3301,
+      "sha256": "07b6859155d3af3e95be74339f4d92717320da36bb55ed8ec16f61b14d991a71",
+      "entities": 58,
+      "coverage": [
+        "invalid"
+      ]
+    },
+    {
+      "file": "invalid/duplicate-guid.ifc",
+      "kind": "invalid",
+      "schema": "IFC4",
+      "purpose": "two walls share one GlobalId: flagged IFC-W-DUP-GUID; identity joins must not trust it",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "finding": "IFC-W-DUP-GUID"
+      },
+      "bytes": 5997,
+      "sha256": "974345de19bd8d0fb60e78738134f81e31c3d4b1f32e820a3b1fa5cc7f549412",
+      "entities": 111,
+      "coverage": [
+        "invalid"
+      ]
+    },
+    {
+      "file": "invalid/missing-units.ifc",
+      "kind": "invalid",
+      "schema": "IFC4",
+      "purpose": "no unit assignment",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "finding": "IFC-W-UNITS-MISSING"
+      },
+      "bytes": 3082,
+      "sha256": "0cd72eaeb074802747e4090b6b2294c3dd8b2b9cad5e430313dec5e2177e70df",
+      "entities": 53,
+      "coverage": [
+        "invalid"
+      ]
+    },
+    {
+      "file": "invalid/truncated.ifc",
+      "kind": "invalid",
+      "schema": "IFC4",
+      "purpose": "file cut mid-DATA",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "reject"
+      },
+      "bytes": 1978,
+      "sha256": "4b0e37ac838d65cc4c5cee5c9d2b0d121a769dcf73805cc50741f599fd1f613a",
+      "entities": 34,
+      "coverage": [
+        "invalid"
+      ],
+      "expectedResult": "graceful-prefix"
+    },
+    {
+      "file": "malformed/broken-enum-min.ifc",
+      "kind": "malformed",
+      "schema": "IFC4",
+      "purpose": "enumeration .MODEL_VIEW. with its leading dot flipped to '/': hangs raw web-ifc OpenModel; pre-flight must reject as a malformed enumeration",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "reject"
+      },
+      "bytes": 514,
+      "sha256": "c6afd2ef0bb8497ab3138b414cf7069d726cf17e7cba94e5a955fe6843fd3d42",
+      "entities": 3,
+      "coverage": [
+        "invalid",
+        "malformed"
+      ],
+      "expectedReason": "not an enumeration"
+    },
+    {
+      "file": "malformed/broken-enum-shift-min.ifc",
+      "kind": "malformed",
+      "schema": "IFC4",
+      "purpose": "same broken enumeration plus quote flips shifting string boundaries (minimised fuzz failure-0463, seed 42 iter 463): pre-flight must reject",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "reject"
+      },
+      "bytes": 514,
+      "sha256": "0284a0d4c56c054f5719947156fe7e3bed9de1500fdc4d1335feeb61f31b0ba4",
+      "entities": 3,
+      "coverage": [
+        "invalid",
+        "malformed"
+      ],
+      "expectedReason": "not an enumeration"
+    },
+    {
+      "file": "malformed/truncated-in-string-min.ifc",
+      "kind": "malformed",
+      "schema": "IFC4",
+      "purpose": "file ends inside a string: raw web-ifc OpenModel never returns (#231)",
+      "source": "hand-minimised from a fuzz/hang probe (see malformed/README.md)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "reject"
+      },
+      "bytes": 250,
+      "sha256": "6fdb858abff8e060e661e2b68372d66d7bcd382c57e5012ef0c19254d0cf5c2b",
+      "entities": 1,
+      "coverage": [
+        "invalid",
+        "malformed"
+      ],
+      "expectedReason": "Unterminated 'string'"
+    },
+    {
+      "file": "malformed/unterminated-string-min.ifc",
+      "kind": "malformed",
+      "schema": "IFC4",
+      "purpose": "unterminated STEP string: raw web-ifc OpenModel never returns (#231)",
+      "source": "hand-minimised from a fuzz/hang probe (see malformed/README.md)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "reject"
+      },
+      "bytes": 344,
+      "sha256": "cee1219a469f333b47b3b6bdd689a36b1905c281d671425ca0b7acf9bf2ec853",
+      "entities": 2,
+      "coverage": [
+        "invalid",
+        "malformed"
+      ],
+      "expectedReason": "Unterminated 'string'"
+    },
+    {
+      "file": "mep-model.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "duct/pipe/tray/conduit + equipment, 2 storeys",
+      "source": "project-authored (scripts/generate-ifc-corpus.mjs, platform writer)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 11556,
+      "sha256": "ff469ffafd8300eb621ac81e9db6ee58c426a9154580ed2921d64066f71b2166",
+      "entities": 207,
+      "coverage": [
+        "ifc4",
+        "mep",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "mep-systems.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "extended MEP: 3 ducts, 2 pipes, tray + conduit, 2 AHUs across 2 storeys, grouped into two IfcSystem systems ('Supply Air': 3 ducts + 2 AHUs; 'Chilled Water': 2 pipes + 2 AHUs) via IfcRelAssignsToGroup — MEP system membership is covered here (see tests/ifc-corpus-manifest.test.mjs)",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs §5) + deterministic STEP transform (§5a) appending the IfcSystem groups",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 13781,
+      "sha256": "996e9436d56111e56a86ede3d9b0e8d6e8e0c2408012aa9d64a44acba69083f8",
+      "entities": 242,
+      "coverage": [
+        "ifc4",
+        "mep",
+        "spatial-hierarchy",
+        "mep-system-membership"
+      ]
+    },
+    {
+      "file": "property-sets.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "rich property sets on every element (incl. typed values: label, number, boolean), material associations, element quantities",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 10054,
+      "sha256": "12de7fef8d4485db2f7ef3965745dcc3730462468ad0e0c97e4ded57ae696557",
+      "entities": 182,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "property-sets",
+        "relationships"
+      ]
+    },
+    {
+      "file": "relationships.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "relationship coverage in one file: voids/fills (door + window), space aggregate, material associations, Uniclass classification",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 11517,
+      "sha256": "1e9c2a5ed195d830135da912dcf43a3c8cb0871a9cebab1a23f4990a5ceeb436",
+      "entities": 204,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "relationships",
+        "spatial-hierarchy",
+        "property-sets"
+      ]
+    },
+    {
+      "file": "scale-grid.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "scale: 4 storeys x 8 bays, 100 elements (walls, columns, beams, slabs); the corpus's largest fixture by element count",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 109606,
+      "sha256": "2e08906b4b9bec6ed4a417b69144465858a182bc94c9509ed9feb1eb789c1769",
+      "entities": 1922,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "structural",
+        "scale",
+        "geometry-complexity"
+      ]
+    },
+    {
+      "file": "spatial-hierarchy.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "spatial tree depth: site→building→3 storeys→4 IfcSpace rooms with departments",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 15046,
+      "sha256": "bf371fe69ffd28f8681527c7bb830a9e35cf849facab991e7307065feb7cf99a",
+      "entities": 266,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "spatial-hierarchy"
+      ]
+    },
+    {
+      "file": "structural-2x3.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "structural model under IFC2X3: columns, beams, pad + strip footings, diagonal brace",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 11482,
+      "sha256": "6f16bb042dc7297d72d2096bf641fa1e479cde57d13f35dfb29f6f88f85510ae",
+      "entities": 209,
+      "coverage": [
+        "ifc2x3",
+        "structural"
+      ]
+    },
+    {
+      "file": "third-party/duplex-a.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "real-world Revit Architecture 2011 export, 2-storey duplex, 21 spaces",
+      "source": "buildingSMART Community Sample Test Files, Duplex Apartment — https://github.com/buildingsmart-community/Community-Sample-Test-Files (IFC 2.3.0.1 (IFC 2x3)/Duplex Apartment/Duplex_A_20110907.ifc); vendored verbatim, attribution: BSI (2020) \"Duplex Apartment Test Files,\" buildingSMART International",
+      "licence": "CC BY 4.0",
+      "independent": true,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 2380763,
+      "sha256": "b347a2c8aa8fff6db896a4417a9c50c22ac0ccd7c5cfc22b99b8d29336c606ed",
+      "entities": 38898,
+      "coverage": [
+        "ifc2x3",
+        "architecture",
+        "spatial-hierarchy",
+        "real-world"
+      ]
+    },
+    {
+      "file": "third-party/duplex-mep.ifc",
+      "kind": "valid",
+      "schema": "IFC2X3",
+      "purpose": "real-world Revit MEP 2011 export, same building, 42 spaces, 311k records (largest corpus fixture)",
+      "source": "buildingSMART Community Sample Test Files, Duplex Apartment — https://github.com/buildingsmart-community/Community-Sample-Test-Files (IFC 2.3.0.1 (IFC 2x3)/Duplex Apartment/Duplex_MEP_20110907.ifc); vendored verbatim, attribution: BSI (2020) \"Duplex Apartment Test Files,\" buildingSMART International",
+      "licence": "CC BY 4.0",
+      "independent": true,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 17871432,
+      "sha256": "13976a8e223f177a6d7123679e4b02e750cd90c13f7bb20c593be125d9407119",
+      "entities": 311480,
+      "coverage": [
+        "ifc2x3",
+        "mep",
+        "spatial-hierarchy",
+        "real-world",
+        "scale"
+      ]
+    },
+    {
+      "file": "third-party/gymzaal-amersfoort.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "real-world Revit 2020 export (ReferenceView V1.2): sports hall in Amersfoort, NL — 48 IfcSpace, 78 walls, 69 windows, 3 storeys, 3 IfcGroup area schedules (BVO/GO/VVO) via IfcRelAssignsToGroup, IFC4 georeferencing (EPSG:28992); the corpus's first independent IFC4 model",
+      "source": "buildingSMART Community Sample Test Files — https://github.com/buildingsmart-community/Community-Sample-Test-Files (IFC 4.0.2.1 (IFC 4)/Example project location/example project location.ifc); vendored verbatim, attribution: Gymzaal Amersfoort example, buildingSMART Community Sample Test Files (CC BY 4.0); IFC exported from Revit 2020 by Hans Hendriks (deBIMspecialist)",
+      "licence": "CC BY 4.0",
+      "independent": true,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 2959580,
+      "sha256": "2c12c00c675e43fb872af8bec583c29e887e75a40c614d8585abcc2baf7590ed",
+      "entities": 32183,
+      "coverage": [
+        "ifc4",
+        "architecture",
+        "spatial-hierarchy",
+        "real-world",
+        "georeferencing"
+      ]
+    },
+    {
+      "file": "units-imperial.ifc",
+      "kind": "valid",
+      "schema": "IFC4",
+      "purpose": "non-SI units: conversion-based FOOT length unit (0.3048 m); the independent reader must report factor 0.3048 and validation must stay error-free",
+      "source": "project writer (scripts/generate-ifc-corpus.mjs)",
+      "licence": "MIT",
+      "independent": false,
+      "expect": {
+        "preflight": "ok",
+        "semanticErrors": 0
+      },
+      "bytes": 6097,
+      "sha256": "6419e00d96b3a68cc94e621333ed7afac40a8042679e43657a2ac2dbc41f3a64",
+      "entities": 113,
+      "coverage": [
+        "ifc4",
+        "units"
+      ]
+    }
+  ]
+}

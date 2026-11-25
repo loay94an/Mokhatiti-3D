@@ -1,0 +1,1240 @@
+/**
+ * acad-engine — TypeScript bridge to the acadrust WASM CAD engine
+ * (public/cad-engine/obim-cad-engine.wasm, built from cad-engine-rust/).
+ *
+ * acadrust is a native-grade DXF (ASCII + binary) and DWG (R12–R2018+) reader
+ * (MPL-2.0). The engine returns a framed JSON envelope; this module maps it
+ * onto the platform's DxfDocument model with the same fidelity rules as
+ * dwg-convert (block expansion, bulge flattening, hatch loops, layouts), plus
+ * extras the old readers never had: full hatch pattern definitions, dimension
+ * style values for every record, real text-style fonts and per-file dash
+ * patterns for every version the old libredwg path could not read.
+ *
+ * The module is isomorphic: in the browser the engine is fetched from
+ * /cad-engine/, in Node tests callers can instantiate from a file path.
+ */
+import type {
+  DxfAttDef,
+  DxfBlockDef,
+  DxfDocument,
+  DxfEntity,
+  DxfHatch,
+  DxfLayer,
+  DxfLayout,
+  DxfPoint,
+  DxfTextStyle,
+  DxfUnits,
+  DxfViewport,
+} from "./dxf-types";
+import {
+  arcPoints,
+  ellipsePoints,
+  evalBSpline,
+  expandBulges,
+  insUnitsToUnits,
+  robustExtents,
+  transformEntity,
+  type InsertXform,
+} from "./dxf-geometry";
+import { cleanText, mtextFont, mtextWidthFactor, mtextExtras } from "./mtext";
+import { convertMleader, convertTable, convertMline, convertImage, convertTolerance, convertWipeout } from "./acad-extra-entities";
+import { aciToRgb } from "./aci";
+import type { MlineStyle } from "./acad-extra-entities";
+import { convertHelix, convertMesh, convertPolyface, convertPolygonMesh, convertSolidWire } from "./acad-solid-entities";
+import { attachNative } from "./native-curves";
+import { bindDocumentBlocks } from "./block-refs";
+
+type Any = Record<string, any>;
+
+const DEG = 180 / Math.PI;
+const INF = 1e9;
+
+/** Where the engine artifact is served from (mirrors public/cad-engine/). */
+export const CAD_ENGINE_URL = "/cad-engine/obim-cad-engine.wasm";
+
+/** Read statistics reported by the engine. */
+export interface AcadStats {
+  sourceVersion?: string;
+  recoveryMode?: boolean;
+  streamCompleted?: boolean;
+  sourceSections?: number;
+  sourceRecords?: number;
+  decodedRecords?: number;
+  skippedRecords?: number;
+  entities?: number;
+  objects?: number;
+  tableRecords?: number;
+  recoveredErrors?: number;
+}
+
+export interface AcadParseResult {
+  doc: DxfDocument;
+  summary: string;
+  /** Source version stamp, e.g. "AC1032". */
+  version: string;
+  entityCount: number;
+  format: "dwg" | "dxf";
+  stats: AcadStats | null;
+}
+
+interface AcadInstance {
+  exports: {
+    memory: WebAssembly.Memory;
+    obim_engine_version(): number;
+    obim_alloc(len: number): number;
+    obim_read(ptr: number, len: number): number;
+    obim_write_dwg?: (ptr: number, len: number) => number;
+    obim_free(ptr: number, len: number): void;
+  };
+}
+
+let instancePromise: Promise<AcadInstance | null> | null = null;
+
+/** True when the engine module is available (or fetch already succeeded). */
+export async function acadEngineAvailable(): Promise<boolean> {
+  return (await loadAcadEngine()) !== null;
+}
+
+/** Engine identity string for diagnostics, enriched with the wasm staleness
+ * attestation when the manifest is available (PE-12): the raw wasm identity
+ * plus rustSourceHash, builtAt and the wasm sha256, e.g.
+ * {"engine":"acadrust","bridge":"0.1.0","dwgRead":"failsafe",
+ *  "rustSourceHash":"…","builtAt":"…","wasmSha256":"…",
+ *  "manifestWasmSha256":"…","wasmMatchesManifest":true}.
+ * Falls back to the raw wasm identity when no manifest can be loaded
+ * (Node tests, offline) — never nulls the diagnostics because of it. */
+export async function acadEngineVersion(): Promise<string | null> {
+  const inst = await loadAcadEngine();
+  if (!inst) return null;
+  try {
+    return engineIdentity(inst, await loadCadEngineManifest());
+  } catch {
+    return null;
+  }
+}
+
+/** Where the wasm staleness manifest is served from (mirrors public/cad-engine/). */
+export const CAD_ENGINE_MANIFEST_URL = "/cad-engine/obim-cad-engine.manifest.json";
+
+/** The manifest attestation for the checked-in wasm (see scripts/generate-cad-engine-manifest.mjs). */
+export interface CadEngineManifest {
+  format: string;
+  wasmFile: string;
+  wasmSha256: string;
+  rustSourceHash: string;
+  bridgeVersion: string;
+  builtAt: string;
+}
+
+let manifestPromise: Promise<CadEngineManifest | null> | null = null;
+
+/**
+ * Best-effort load of the manifest attestation. Browser only: Node has no
+ * fetch base for a root-relative URL, so this returns null outside a browser
+ * (callers pass the manifest explicitly there). Never throws — a missing
+ * manifest must not break engine loading; it only means the identity string
+ * carries no source hash / build stamp.
+ */
+export function loadCadEngineManifest(): Promise<CadEngineManifest | null> {
+  if (!manifestPromise) {
+    manifestPromise = (async () => {
+      try {
+        if (typeof globalThis.location?.href !== "string") return null;
+        const res = await fetch(CAD_ENGINE_MANIFEST_URL, { cache: "no-cache" });
+        if (!res.ok) return null;
+        const m = (await res.json()) as CadEngineManifest;
+        if (typeof m?.rustSourceHash !== "string" || typeof m?.builtAt !== "string") return null;
+        return m;
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return manifestPromise;
+}
+
+/**
+ * Enrich a raw wasm identity JSON string with the manifest attestation.
+ * `actualWasmSha256` is the sha256 of the wasm bytes actually loaded, when
+ * the caller computed it (Node tests do; the browser loader does not hash
+ * fetched bytes, so there it stays null = "not verified at runtime" and
+ * wasmSha256 reports the manifest's attested hash). Never throws: on any
+ * malformed input the raw identity is returned unchanged.
+ */
+export function enrichEngineIdentity(
+  rawIdentity: string,
+  manifest: CadEngineManifest | null,
+  actualWasmSha256?: string,
+): string {
+  if (!manifest) return rawIdentity;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(rawIdentity) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return rawIdentity;
+  } catch {
+    return rawIdentity;
+  }
+  return JSON.stringify({
+    ...parsed,
+    rustSourceHash: manifest.rustSourceHash,
+    builtAt: manifest.builtAt,
+    wasmSha256: actualWasmSha256 ?? manifest.wasmSha256,
+    manifestWasmSha256: manifest.wasmSha256,
+    wasmMatchesManifest: actualWasmSha256 ? actualWasmSha256 === manifest.wasmSha256 : null,
+  });
+}
+
+/**
+ * Load and instantiate the engine once. Returns null when the artifact is
+ * unavailable (dev server without the wasm, offline), so callers can fall
+ * back to the legacy readers instead of failing.
+ */
+export async function loadAcadEngine(): Promise<AcadInstance | null> {
+  if (!instancePromise) {
+    instancePromise = (async () => {
+      const first = await instantiateEngine(await fetchEngineBytes(false));
+      if (first && engineIsCurrent(first)) return first;
+      // Older engine than this app expects (a cached copy from before a redeploy): fetch it again, bypassing every cache.
+      const fresh = await instantiateEngine(await fetchEngineBytes(true));
+      if (fresh && (engineIsCurrent(fresh) || !first)) return fresh;
+      if (first) console.warn(`[acad-engine] loaded engine lacks the expected capabilities even after a cache-busting reload (reports ${engineIdentity(first, await loadCadEngineManifest())}; need dwgRead=${REQUIRED_ENGINE_DWG_READ})`);
+      return first ?? fresh;
+    })();
+    instancePromise.catch(() => {
+      instancePromise = null;
+    });
+  }
+  return instancePromise;
+}
+
+/** The engine must report the capabilities this app relies on (DWG reads in failsafe mode). */
+export const REQUIRED_ENGINE_DWG_READ = "failsafe";
+
+/**
+ * The engine's self-reported identity JSON (for diagnostics), or why it could
+ * not be read. With a manifest (and, when known, the sha256 of the wasm bytes
+ * actually loaded) the returned string is enriched with the PE-12 staleness
+ * attestation: rustSourceHash, builtAt, wasmSha256, manifestWasmSha256 and
+ * wasmMatchesManifest. Without a manifest the raw wasm identity is returned.
+ */
+export function engineIdentity(
+  inst: AcadInstance,
+  manifest?: CadEngineManifest | null,
+  actualWasmSha256?: string,
+): string {
+  try { return enrichEngineIdentity(readFrame(inst, inst.exports.obim_engine_version()), manifest ?? null, actualWasmSha256); } catch (e) { return `unreadable: ${(e as Error)?.message ?? e}`; }
+}
+
+function engineIsCurrent(inst: AcadInstance): boolean {
+  try {
+    const id = JSON.parse(readFrame(inst, inst.exports.obim_engine_version())) as Any;
+    return id?.dwgRead === REQUIRED_ENGINE_DWG_READ;
+  } catch {
+    return false;
+  }
+}
+
+async function instantiateEngine(bytes: ArrayBuffer | null): Promise<AcadInstance | null> {
+  if (!bytes) return null;
+  try {
+    const { instance } = await WebAssembly.instantiate(bytes, {});
+    const ex = instance.exports as AcadInstance["exports"];
+    // Smoke-test the ABI so a truncated artifact falls back cleanly.
+    ex.obim_engine_version();
+    return { exports: ex };
+  } catch (e) {
+    console.warn("[acad-engine] wasm instantiation failed:", e);
+    return null;
+  }
+}
+
+/**
+ * Test hook: inject an engine instance compiled from bytes the caller
+ * already has (Node regression tests read the artifact from disk — the
+ * browser path fetches it from /cad-engine/).
+ */
+export async function setAcadEngineForTests(bytes: ArrayBuffer): Promise<boolean> {
+  try {
+    const { instance } = await WebAssembly.instantiate(bytes, {});
+    const ex = instance.exports as AcadInstance["exports"];
+    ex.obim_engine_version();
+    instancePromise = Promise.resolve({ exports: ex });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchEngineBytes(bust: boolean): Promise<ArrayBuffer | null> {
+  const q = bust ? `?cb=${Date.now()}` : "";
+  const urls = [CAD_ENGINE_URL + q, "./cad-engine/obim-cad-engine.wasm" + q];
+  for (const url of urls) {
+    try {
+      // no-cache = always revalidate with the server (a cheap 304 when unchanged), so a redeployed engine is never shadowed by a stale copy
+      const res = await fetch(url, { cache: bust ? "reload" : "no-cache" });
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength > 4) return buf;
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+function readFrame(inst: AcadInstance, ptr: number): string {
+  const dv = new DataView(inst.exports.memory.buffer);
+  const len = dv.getUint32(ptr, true);
+  const bytes = new Uint8Array(inst.exports.memory.buffer, ptr + 4, len);
+  return new TextDecoder().decode(bytes);
+}
+
+/**
+ * Re-read the intermediate DXF before DWG conversion. The CAD editor's DXF
+ * serializer intentionally supports a bounded entity set; checking only the
+ * final DWG would miss entities already omitted by that serializer.
+ */
+export async function validateDxfForDwgExport(
+  dxf: string,
+  expectedEntityCount: number,
+  expectedLayerNames: string[],
+): Promise<void> {
+  if (!dxf.trim()) throw new Error("DWG export preflight failed: the intermediate DXF is empty.");
+  // Best-effort preflight. Do not hard-block on minor mismatches (hatches,
+  // styles, or records the round-trip parser classifies as skipped) — those
+  // used to show "DWG Export Blocked - unsupported content" on ordinary files.
+  const parsed = await parseWithAcadEngine(new TextEncoder().encode(dxf), "DWG export preflight.dxf");
+  if (!parsed) {
+    // Engine unavailable: still allow exportDxfToDwg to try.
+    console.warn("[dwg-export] preflight parse unavailable — continuing");
+    return;
+  }
+  if (parsed.format !== "dxf" && parsed.format !== "dwg") {
+    console.warn("[dwg-export] preflight unexpected format", parsed.format);
+  }
+  if (expectedEntityCount > 0 && parsed.entityCount === 0) {
+    throw new Error(
+      "DWG export preflight failed: the intermediate DXF has no drawable entities.",
+    );
+  }
+  if (parsed.entityCount !== expectedEntityCount) {
+    console.warn(
+      `[dwg-export] preflight entity count ${parsed.entityCount} vs editor ${expectedEntityCount} — continuing`,
+    );
+  }
+  const skipped = Object.values(parsed.doc.skipped ?? {}).reduce((sum, count) => sum + count, 0);
+  if (skipped > 0) {
+    console.warn(`[dwg-export] preflight noted ${skipped} skipped record(s) — continuing`);
+  }
+  const actualLayers = new Set(parsed.doc.layers.map((layer) => layer.name.trim().toUpperCase()));
+  const missingLayers = expectedLayerNames.filter((name) => name && !actualLayers.has(name.trim().toUpperCase()));
+  if (missingLayers.length) {
+    console.warn(`[dwg-export] preflight missing layer name(s): ${missingLayers.join(", ")} — continuing`);
+  }
+}
+
+/** Convert an editor-generated ASCII DXF into native binary DWG. */
+export async function exportDxfToDwg(dxf: string): Promise<Uint8Array> {
+  if (!dxf.trim()) throw new Error("The drawing is empty.");
+  const inst = await loadAcadEngine();
+  if (!inst) throw new Error("CAD WASM engine unavailable; reload after rebuilding the CAD engine.");
+  const write = inst.exports.obim_write_dwg;
+  if (typeof write !== "function") throw new Error("DWG writer is missing from the loaded CAD WASM. Rebuild cad-engine-rust and reload.");
+  const input = new TextEncoder().encode(dxf);
+  let ptr = 0, resultPtr = 0;
+  try {
+    ptr = inst.exports.obim_alloc(input.length);
+    if (!ptr) throw new Error("Unable to allocate export buffer.");
+    new Uint8Array(inst.exports.memory.buffer, ptr, input.length).set(input);
+    resultPtr = write(ptr, input.length);
+    if (!resultPtr) throw new Error("DWG writer returned no result.");
+    const view = new DataView(inst.exports.memory.buffer);
+    const len = view.getUint32(resultPtr, true);
+    if (len < 1) throw new Error("DWG writer returned an invalid frame.");
+    const payload = new Uint8Array(inst.exports.memory.buffer, resultPtr + 4, len);
+    if (payload[0] !== 0) throw new Error(new TextDecoder().decode(payload.subarray(1)) || "DWG conversion failed.");
+    const bytes = payload.slice(1);
+    const signature = new TextDecoder().decode(bytes.subarray(0, 6));
+    if (bytes.length < 6 || !/^AC10(?:09|12|14|15|18|21|24|27|32)$/.test(signature)) {
+      throw new Error("DWG writer output failed signature validation; no file was saved.");
+    }
+    return bytes;
+  } finally {
+    try {
+      if (resultPtr) inst.exports.obim_free(resultPtr, 4 + new DataView(inst.exports.memory.buffer).getUint32(resultPtr, true));
+      if (ptr) inst.exports.obim_free(ptr, input.length);
+    } catch { /* best-effort release after wasm memory growth */ }
+  }
+}
+
+/**
+ * Read a drawing buffer (DWG or DXF, ASCII or binary) with the acadrust
+ * engine. Returns null when the engine is unavailable; throws nothing —
+ * engine failures come back as { ok: false } and are surfaced via the
+ * summary, so callers can fall back to the legacy readers.
+ */
+export async function parseWithAcadEngine(
+  bytes: Uint8Array,
+  fileName: string,
+  opts: { nativeBlocks?: boolean } = {},
+): Promise<AcadParseResult | null> {
+  const inst = await loadAcadEngine();
+  if (!inst) return null;
+  const ex = inst.exports;
+  let ptr = 0;
+  let resPtr = 0;
+  try {
+    ptr = ex.obim_alloc(bytes.length);
+    if (!ptr) throw new Error("engine scratch alloc failed");
+    new Uint8Array(ex.memory.buffer, ptr, bytes.length).set(bytes);
+    resPtr = ex.obim_read(ptr, bytes.length);
+    const json = JSON.parse(readFrame(inst, resPtr)) as Any;
+    if (!json || json.ok !== true) {
+      const err = String(json?.error ?? "unknown engine failure");
+      return {
+        doc: { layers: [], entities: [] },
+        summary: `${fileName}: the acadrust engine could not read this drawing (${err})`,
+        version: "",
+        entityCount: 0,
+        format: "dwg",
+        stats: null,
+      };
+    }
+    const doc = mapDocument(json.document ?? {}, json.format === "dwg" ? "dwg" : "dxf", opts);
+    const stats = (json.stats ?? null) as AcadStats | null;
+    const entityCount = doc.entities.length;
+    const ver = String(stats?.sourceVersion ?? json.document?.version ?? "");
+    const extra = stats?.recoveredErrors
+      ? `, ${stats.recoveredErrors} recovered error(s)`
+      : "";
+    return {
+      doc,
+      summary: `${fileName}: ${entityCount} entit${entityCount === 1 ? "y" : "ies"} read natively by acadrust (${ver})${extra}`,
+      version: ver,
+      entityCount,
+      format: json.format === "dwg" ? "dwg" : "dxf",
+      stats,
+    };
+  } catch (e) {
+    // A wasm trap (panic=abort) or malformed envelope — degrade, don't crash.
+    console.warn("[acad-engine] read failed:", e);
+    return {
+      doc: { layers: [], entities: [] },
+      summary: `${fileName}: the acadrust engine hit an unexpected failure (${e instanceof Error ? e.message : String(e)})`,
+      version: "",
+      entityCount: 0,
+      format: "dwg",
+      stats: null,
+    };
+  } finally {
+    try {
+      if (resPtr) ex.obim_free(resPtr, 4 + new DataView(ex.memory.buffer).getUint32(resPtr, true));
+      if (ptr) ex.obim_free(ptr, bytes.length);
+    } catch {
+      /* memory may have grown; frees are best-effort */
+    }
+  }
+}
+
+// ----------------------------------------------------------------- mapping
+
+interface JsonColor {
+  t: "byLayer" | "byBlock" | "none" | "index" | "rgb";
+  v?: number;
+  r?: number;
+  g?: number;
+  b?: number;
+}
+
+/** Properties of the INSERT currently being expanded, used to resolve ByBlock inside its block. */
+/** Append `src` to `dst` without spreading it into call arguments (a spread of ~100k+ items overflows the JS stack). */
+function pushAll<T>(dst: T[], src: ArrayLike<T>): void {
+  for (let i = 0; i < src.length; i++) dst.push(src[i]);
+}
+
+export interface BlockInherit { color?: number; rgb?: number; lineType?: string; lineweight?: number; transparency?: number }
+
+function colorOf(c: JsonColor | undefined, inh?: BlockInherit): { color?: number; rgb?: number } {
+  if (!c) return {};
+  if (c.t === "byBlock") return inh ? (inh.rgb !== undefined ? { rgb: inh.rgb } : inh.color !== undefined ? { color: inh.color } : {}) : {};
+  if (c.t === "rgb") return { rgb: ((c.r! << 16) | (c.g! << 8) | c.b!) & 0xffffff };
+  if (c.t === "index") {
+    const v = c.v ?? 7;
+    if (v >= 1 && v <= 255) return { color: v };
+  }
+  return {};
+}
+
+function lineWeightMm(v: Any): number | undefined {
+  if (typeof v === "number" && v >= 0) return v / 100; // 1/100 mm -> mm
+  return undefined;
+}
+
+function transparencyPct(v: Any): number | undefined {
+  if (typeof v === "number" && v > 0) return Math.round((v / 255) * 90);
+  return undefined;
+}
+
+function pt(a: Any): DxfPoint {
+  const arr = Array.isArray(a) ? a : [];
+  return { x: Number(arr[0] ?? 0), y: Number(arr[1] ?? 0), z: Number(arr[2] ?? 0) };
+}
+
+interface CommonOut {
+  layer: string;
+  color?: number;
+  rgb?: number;
+  lineType?: string;
+  lineweight?: number;
+  ltScale?: number;
+  transparency?: number;
+}
+
+export function commonOf(e: Any, inh?: BlockInherit): CommonOut {
+  const { color, rgb } = colorOf(e.color as JsonColor | undefined, inh);
+  const out: CommonOut = { layer: String(e.layer ?? "0") };
+  if (color !== undefined) out.color = color;
+  if (rgb !== undefined) out.rgb = rgb;
+  if (typeof e.lineType === "string" && e.lineType && e.lineType.toLowerCase() !== "bylayer") {
+    if (e.lineType.toLowerCase() === "byblock") {
+      if (inh?.lineType) out.lineType = inh.lineType; // inside a block: the INSERT's linetype; otherwise continuous
+    } else out.lineType = e.lineType;
+  }
+  const lw = e.lineWeight === "byBlock" ? inh?.lineweight : lineWeightMm(e.lineWeight);
+  if (lw !== undefined) out.lineweight = lw;
+  if (typeof e.ltScale === "number" && e.ltScale !== 1) out.ltScale = e.ltScale;
+  const tr = transparencyPct(e.transparency);
+  if (tr !== undefined) out.transparency = tr;
+  return out;
+}
+
+function textAlign(h: number, v: number, alignPoint?: DxfPoint) {
+  const align = h === 1 || h === 4 ? "center" : h === 2 ? "right" : "left";
+  const vertical = h === 4 ? "middle" : v === 1 ? "bottom" : v === 2 ? "middle" : v === 3 ? "top" : "baseline";
+  return { align, valign: vertical, useAlignPoint: (h !== 0 || v !== 0) && !!alignPoint };
+}
+
+interface Ctx {
+  byHandle: Map<string, Any>;
+  blocks: Map<string, { base: DxfPoint; entities: Any[] }>;
+  skip: (t: string) => void;
+  mlineStyles?: Map<string, MlineStyle>;
+  /** ByBlock resolution for the INSERT being expanded (innermost last). */
+  inherit?: BlockInherit;
+  /** Native block mode: INSERT stays a reference to a definition in `DxfDocument.blocks` instead of being expanded. */
+  native?: boolean;
+  /** Block names referenced by native INSERTs (drives which definitions are emitted). */
+  usedBlocks?: Set<string>;
+}
+
+/** Expand a block's entities with ByBlock colour / linetype / lineweight taken from the INSERT's own (resolved) properties. */
+function expandBlock(cx: Ctx, ents: Any[], c: CommonOut, depth: number, insertLayer: string | null): DxfEntity[] {
+  const prev = cx.inherit;
+  cx.inherit = { color: c.color, rgb: c.rgb, lineType: c.lineType, lineweight: c.lineweight, transparency: c.transparency };
+  try {
+    return ents.flatMap((ent) => convertEntity(ent, cx, depth + 1, insertLayer ?? (c.layer === "0" ? null : c.layer)));
+  } finally { cx.inherit = prev; }
+}
+
+const extraCtx = (cx: Ctx) => ({
+  pt, clean: cleanText, deg: DEG, note: cx.skip,
+  mlineStyle: (h?: string, nm?: string) => cx.mlineStyles?.get(String(h ?? "").toLowerCase()) ?? cx.mlineStyles?.get(`n:${String(nm ?? "").toLowerCase()}`),
+});
+
+/** Convert one engine entity into platform entities (may expand blocks). */
+function convertEntity(e: Any, cx: Ctx, depth: number, insertLayer: string | null): DxfEntity[] {
+  if (!e || typeof e !== "object") return [];
+  if (e.invisible) return [];
+  const c = commonOf(e, cx.inherit);
+  if (insertLayer && depth > 0 && c.layer === "0") c.layer = insertLayer;
+  const type = String(e.type ?? "");
+  switch (type) {
+    case "LINE":
+      return [{ ...c, type: "LINE", start: pt(e.start), end: pt(e.end) }];
+    case "CIRCLE":
+      return [{ ...c, type: "CIRCLE", center: pt(e.center), radius: Number(e.radius ?? 0) }];
+    case "ARC":
+      return [
+        {
+          ...c,
+          type: "ARC",
+          center: pt(e.center),
+          radius: Number(e.radius ?? 0),
+          startAngle: Number(e.startAngle ?? 0) * DEG,
+          endAngle: Number(e.endAngle ?? 0) * DEG,
+        },
+      ];
+    case "POINT":
+      return [{ ...c, type: "POINT", position: pt(e.position) }];
+    case "LWPOLYLINE":
+    case "POLYLINE2D":
+    case "POLYLINE3D":
+    case "POLYLINE": {
+      const verts = (e.vertices ?? []) as Any[];
+      if (verts.length < 2) {
+        cx.skip(`${type} (<2 vertices)`);
+        return [];
+      }
+      const points = expandBulges(
+        verts.map((v) => {
+          const p = pt(v);
+          return { ...p, bulge: Number(Array.isArray(v) ? v[2] : v.bulge) || undefined };
+        }),
+        e.closed === true,
+      );
+      return [{ ...c, type: "LWPOLYLINE", points, closed: e.closed === true }];
+    }
+    case "SPLINE": {
+      const deg = Math.max(1, Math.round(Number(e.degree ?? 3)));
+      const ctrl = (e.controlPoints ?? []).map(pt);
+      const knots = (e.knots ?? []).map(Number);
+      const fit = (e.fitPoints ?? []).map(pt);
+      const pts =
+        ctrl.length >= deg + 1
+          ? evalBSpline(ctrl, knots, deg)
+          : fit.length >= 2
+            ? fit
+            : ctrl;
+      if (pts.length < 2) {
+        cx.skip("SPLINE (no usable points)");
+        return [];
+      }
+      const spl: any = { ...c, type: "LWPOLYLINE", points: pts, closed: e.closed === true };
+      const w = Array.isArray(e.weights) ? e.weights.map(Number) : [];
+      if (ctrl.length >= 2 && knots.length === ctrl.length + deg + 1 && knots.every(Number.isFinite)) {
+        attachNative(spl, {
+          kind: "SPLINE", degree: deg, closed: e.closed === true, controlPoints: ctrl, knots,
+          ...(w.length === ctrl.length && w.every(Number.isFinite) ? { weights: w } : {}),
+          ...(fit.length ? { fitPoints: fit } : {}),
+        });
+      }
+      return [spl];
+    }
+    case "ELLIPSE": {
+      const center = pt(e.center);
+      const maj = pt(e.majorAxis);
+      const ratio = Number(e.axisRatio ?? 1);
+      const a0 = Number(e.startParam ?? 0);
+      const a1raw = Number(e.endParam ?? Math.PI * 2);
+      const closed = Math.abs(a1raw - a0 - Math.PI * 2) < 1e-9;
+      const pts = ellipsePoints(center, maj, ratio, a0, closed ? a0 + Math.PI * 2 : a1raw);
+      const ell: any = { ...c, type: "LWPOLYLINE", points: pts, closed };
+      if (Number.isFinite(center.x + center.y + maj.x + maj.y + ratio + a0 + a1raw) && ratio > 0) {
+        attachNative(ell, { kind: "ELLIPSE", center, majorAxis: maj, ratio, startParam: a0, endParam: closed ? a0 + Math.PI * 2 : a1raw });
+      }
+      return [ell];
+    }
+    case "TEXT":
+    case "ATTRIB":
+    case "MTEXT": {
+      const isMtext = type === "MTEXT";
+      const value = isMtext ? cleanText(String(e.value ?? "")) : String(e.value ?? "");
+      if (!value.trim()) return [];
+      const position = pt(e.position);
+      const alignPoint = e.alignPoint ? pt(e.alignPoint) : undefined;
+      const base: DxfEntity = {
+        ...c,
+        type: "TEXT",
+        position,
+        height: Number(e.height ?? 0) || (isMtext ? 2.5 : 2.5),
+        value,
+        rotation: Number(e.rotation ?? 0) * DEG,
+      };
+      if (type === "TEXT") {
+        const h = Number(e.halign ?? 0);
+        const v = Number(e.valign ?? 0);
+        const al = textAlign(h, v, alignPoint);
+        if (al.align !== "left") base.align = al.align as "center" | "right";
+        if (al.valign !== "baseline") base.valign = al.valign as "top" | "middle" | "bottom";
+        if (al.useAlignPoint && alignPoint) base.position = alignPoint;
+        const wf = Number(e.widthFactor ?? 0);
+        if (wf > 0 && Math.abs(wf - 1) > 1e-6) base.widthFactor = wf;
+        const ob = Number(e.oblique ?? 0) * DEG;
+        if (Math.abs(ob) > 1e-6) base.oblique = ob;
+        const gf = Number(e.genFlags ?? 0);
+        if (gf & 0x2) base.backwards = true;
+        if (gf & 0x4) base.upsideDown = true;
+      }
+      if (isMtext) {
+        const ap = Number(e.attachment ?? 1);
+        const idx = Math.max(0, Math.min(8, ap - 1));
+        const mAlign = (["left", "center", "right"] as const)[idx % 3];
+        const mValign = (["top", "middle", "bottom"] as const)[Math.floor(idx / 3)];
+        if (mAlign !== "left") base.align = mAlign;
+        if (mValign !== "top") base.valign = mValign;
+        const f = mtextFont(String(e.value ?? ""));
+        if (f.font) base.font = f.font;
+        if (f.bold) base.bold = true;
+        if (f.italic) base.italic = true;
+        const wf = mtextWidthFactor(String(e.value ?? ""));
+        if (wf) base.widthFactor = wf;
+        // Native column wrap, line spacing and inline colour/weight runs, when the
+        // engine artifact carries the MTEXT width and spacing at all.
+        const raw = e as Any;
+        Object.assign(base, mtextExtras(
+          String(e.value ?? ""),
+          raw.rectWidth ?? raw.columnWidth ?? raw.definedWidth,
+          raw.lineSpacingFactor ?? raw.lineSpacing,
+        ));
+      }
+      if (typeof e.style === "string" && e.style) base.style = e.style;
+      return [base];
+    }
+    case "SOLID":
+    case "TRACE":
+    case "3DFACE": {
+      const p1 = pt(e.c1), p2 = pt(e.c2), p3 = pt(e.c3), p4 = pt(e.c4);
+      const ring = type === "3DFACE" ? [p1, p2, p3, p4] : [p1, p2, p4, p3];
+      return [{ ...c, type: "LWPOLYLINE", points: ring, closed: true }];
+    }
+    case "HATCH": {
+      const hatch = hatchOf(e, cx);
+      if (!hatch || !hatch.loops.length) {
+        cx.skip("HATCH (no boundary)");
+        return [];
+      }
+      return [
+        {
+          ...c,
+          type: "LWPOLYLINE",
+          points: hatch.loops[0],
+          closed: true,
+          hatch: { ...hatch, loops: hatch.loops },
+        },
+      ];
+    }
+    case "LEADER": {
+      const pts = (e.vertices ?? []).map(pt);
+      if (pts.length < 2) {
+        cx.skip("LEADER (<2 vertices)");
+        return [];
+      }
+      return [{ ...c, type: "LWPOLYLINE", points: pts, closed: false }];
+    }
+    case "RAY": {
+      const s = pt(e.start);
+      const d = pt(e.direction);
+      return [
+        { ...c, type: "LINE", start: s, end: { x: s.x + d.x * INF, y: s.y + d.y * INF, z: (s.z ?? 0) + (d.z ?? 0) * INF } },
+      ];
+    }
+    case "XLINE": {
+      const s = pt(e.start);
+      const d = pt(e.direction);
+      return [
+        {
+          ...c,
+          type: "LINE",
+          start: { x: s.x - d.x * INF, y: s.y - d.y * INF, z: (s.z ?? 0) - (d.z ?? 0) * INF },
+          end: { x: s.x + d.x * INF, y: s.y + d.y * INF, z: (s.z ?? 0) + (d.z ?? 0) * INF },
+        },
+      ];
+    }
+    case "INSERT":
+      return convertInsert(e, c, cx, depth, insertLayer);
+    case "DIMENSION":
+      return convertDimension(e, c, cx, depth, insertLayer);
+    case "MLEADER":
+      return convertMleader(e, c, extraCtx(cx));
+    case "TABLE":
+      return convertTable(e, c, extraCtx(cx));
+    case "MLINE":
+      return convertMline(e, c, extraCtx(cx));
+    case "IMAGE":
+      return convertImage(e, c, extraCtx(cx));
+    case "WIPEOUT":
+      return convertWipeout(e, c, extraCtx(cx));
+    case "TOLERANCE":
+      return convertTolerance(e, c, extraCtx(cx));
+    case "SOLIDWIRE":
+      return convertSolidWire(e, c, extraCtx(cx));
+    case "MESH":
+      return convertMesh(e, c, extraCtx(cx));
+    case "POLYGONMESH":
+      return convertPolygonMesh(e, c, extraCtx(cx));
+    case "POLYFACE":
+      return convertPolyface(e, c, extraCtx(cx));
+    case "HELIX":
+      return convertHelix(e, c, extraCtx(cx));
+    case "ATTRIB_ATTACHED":
+      return [];
+    default:
+      cx.skip(type === "UNSUPPORTED" ? `${type} (engine)`.trim() : type || "UNKNOWN");
+      return [];
+  }
+}
+
+function convertInsert(
+  e: Any,
+  c: CommonOut,
+  cx: Ctx,
+  depth: number,
+  insertLayer: string | null,
+): DxfEntity[] {
+  const name = String(e.block ?? "");
+  const blk = cx.blocks.get(name);
+  if (cx.native && blk) {
+    cx.usedBlocks?.add(name);
+    const sx = Number(e.xScale ?? 1), sy = Number(e.yScale ?? 1);
+    const ref: DxfEntity = { ...c, type: "INSERT", name, position: pt(e.position) };
+    if (sx !== 1 || sy !== 1) ref.scale = { x: sx || 1, y: sy || 1, z: Number(e.zScale ?? 1) || 1 };
+    const rot = Number(e.rotation ?? 0) * DEG;
+    if (rot) ref.rotation = rot;
+    const cols = Math.max(1, Math.round(Number(e.colCount ?? 1))), rows = Math.max(1, Math.round(Number(e.rowCount ?? 1)));
+    if (cols > 1 || rows > 1) {
+      ref.columns = cols; ref.rows = rows;
+      ref.columnSpacing = Number(e.colSpacing ?? 0); ref.rowSpacing = Number(e.rowSpacing ?? 0);
+    }
+    const atts = ((e.attributes ?? []) as Any[]).map((a) => ({
+      tag: String(a.tag ?? ""), value: String(a.value ?? ""), position: pt(a.position),
+      height: Number(a.height ?? 2.5) || 2.5, rotation: Number(a.rotation ?? 0) * DEG,
+      ...(a.invisible ? { invisible: true } : {}),
+    }));
+    if (atts.length) ref.attributes = atts;
+    return [ref];
+  }
+  if (!blk || depth >= 8) {
+    cx.skip(blk ? "INSERT (too deeply nested)" : `INSERT (missing block ${name})`);
+    return [];
+  }
+  const inner = expandBlock(cx, blk.entities, c, depth, insertLayer);
+  let rows = Math.max(1, Math.round(Number(e.rowCount ?? 1)));
+  let cols = Math.max(1, Math.round(Number(e.colCount ?? 1)));
+  if (rows * cols > 64) {
+    cx.skip(`INSERT (MINSERT grid ${rows}×${cols} exceeds 64 cells — placed once)`);
+    rows = 1;
+    cols = 1;
+  }
+  const ins = pt(e.position);
+  const rotDeg = Number(e.rotation ?? 0) * DEG;
+  const a = rotDeg * (Math.PI / 180);
+  const dc = Number(e.colSpacing ?? 0);
+  const dr = Number(e.rowSpacing ?? 0);
+  const out: DxfEntity[] = [];
+  for (let rr = 0; rr < rows; rr++) {
+    for (let cc = 0; cc < cols; cc++) {
+      const ox = cc * dc, oy = rr * dr;
+      const xf: InsertXform = {
+        sx: Number(e.xScale ?? 1),
+        sy: Number(e.yScale ?? 1),
+        sz: Number(e.zScale ?? 1),
+        rot: rotDeg,
+        base: blk.base,
+        ins: {
+          x: ins.x + ox * Math.cos(a) - oy * Math.sin(a),
+          y: ins.y + ox * Math.sin(a) + oy * Math.cos(a),
+          z: ins.z,
+        },
+      };
+      for (const ent of inner) pushAll(out, transformEntity(ent, xf));
+    }
+  }
+  // Attribute values attached to this insert render as absolute text.
+  for (const att of (e.attributes ?? []) as Any[]) {
+    const value = String(att.value ?? "");
+    if (!value.trim()) continue;
+    out.push({
+      layer: c.layer,
+      color: c.color,
+      rgb: c.rgb,
+      type: "TEXT",
+      position: pt(att.position),
+      height: Number(att.height ?? 2.5) || 2.5,
+      value,
+      rotation: Number(att.rotation ?? 0) * DEG,
+    });
+  }
+  return out;
+}
+
+function convertDimension(
+  e: Any,
+  c: CommonOut,
+  cx: Ctx,
+  depth: number,
+  insertLayer: string | null,
+): DxfEntity[] {
+  const blkName = String(e.block ?? "");
+  const blk = blkName ? cx.blocks.get(blkName) : undefined;
+  if (blk && depth < 8) {
+    const inner = expandBlock(cx, blk.entities, c, depth, insertLayer);
+    if (inner.length) return inner;
+  }
+  cx.skip("DIMENSION (no geometry block)");
+  return [];
+}
+
+/** HATCH path edges → boundary loops, plus the real pattern definition. */
+function hatchOf(e: Any, cx: Ctx): DxfHatch | null {
+  const loops: DxfPoint[][] = [];
+  for (const path of (e.paths ?? []) as Any[]) {
+    const pts: DxfPoint[] = [];
+    for (const ed of (path.edges ?? []) as Any[]) {
+      const kind = String(ed.e ?? "");
+      if (kind === "line") {
+        const a = pt(ed.s), b = pt(ed.v);
+        if (!pts.length) pts.push(a);
+        pts.push(b);
+      } else if (kind === "arc") {
+        const ctr = pt(ed.c);
+        const r = Number(ed.r ?? 0);
+        const a0 = Number(ed.sa ?? 0);
+        const a1raw = Number(ed.ea ?? Math.PI * 2);
+        const ccw = ed.ccw !== false;
+        const full = Math.PI * 2;
+        const arc = ccw
+          ? arcPoints(ctr.x, ctr.y, r, a0, a1raw <= a0 ? a1raw + full : a1raw, 0)
+          : arcPoints(ctr.x, ctr.y, r, a1raw, a0 <= a1raw ? a0 + full : a0, 0).reverse();
+        pushAll(pts, arc);
+      } else if (kind === "ellipse") {
+        const ctr = pt(ed.c);
+        const maj = pt(ed.maj);
+        const ratio = Number(ed.ratio ?? 1);
+        const a0 = Number(ed.sa ?? 0);
+        const a1raw = Number(ed.ea ?? Math.PI * 2);
+        const ccw = ed.ccw !== false;
+        const full = Math.PI * 2;
+        const s = ccw ? a0 : a1raw;
+        const t = ccw ? (a1raw <= a0 ? a1raw + full : a1raw) : a0 <= a1raw ? a0 + full : a0;
+        pushAll(pts, ellipsePoints(ctr, maj, ratio, s, t));
+      } else if (kind === "spline") {
+        const deg = Math.max(1, Math.round(Number(ed.degree ?? 3)));
+        const ctrl = (ed.ctrl ?? []).map(pt);
+        const knots = (ed.knots ?? []).map(Number);
+        const fit = (ed.fit ?? []).map(pt);
+        pushAll(pts, ctrl.length >= deg + 1 ? evalBSpline(ctrl, knots, deg) : fit.length ? fit : ctrl);
+      } else if (kind === "poly") {
+        const raw = (ed.pts ?? []).map((p: Any, i: number) => ({
+          ...pt(p),
+          bulge: Number(((ed.bulges ?? [])[i] as number) ?? 0) || undefined,
+        }));
+        const closed = ed.closed !== false;
+        pushAll(pts, raw.some((p: Any) => p.bulge) ? expandBulges(raw, closed) : raw);
+      }
+    }
+    const clean = pts.filter((p, i) => i === 0 || Math.hypot(p.x - pts[i - 1].x, p.y - pts[i - 1].y) > 1e-12);
+    if (clean.length > 2 && Math.hypot(clean[0].x - clean[clean.length - 1].x, clean[0].y - clean[clean.length - 1].y) < 1e-9) clean.pop();
+    if (clean.length >= 3) loops.push(clean);
+  }
+  if (!loops.length) return null;
+  const name = String(e.patternName ?? "").trim();
+  const solid = e.isSolid === true || name.toUpperCase() === "SOLID";
+  const out: DxfHatch = {
+    solid,
+    pattern: name || undefined,
+    angle: Number(e.patternAngle ?? 0) * DEG,
+    scale: Number(e.patternScale ?? 1) || 1,
+    loops,
+  };
+  const g = e.gradient as Any | undefined;
+  if (g && Array.isArray(g.colors) && g.colors.length) {
+    const stops: Array<{ pos: number; rgb: number }> = [];
+    for (const ce of g.colors as Any[]) {
+      const cc = colorOf(ce.color as JsonColor | undefined);
+      const rgb = cc.rgb !== undefined ? cc.rgb : cc.color !== undefined ? aciToRgb(cc.color) : undefined;
+      if (rgb !== undefined) stops.push({ pos: Math.min(1, Math.max(0, Number(ce.value ?? 0))), rgb });
+    }
+    if (stops.length) {
+      out.solid = true;
+      out.gradient = { name: String(g.name ?? "LINEAR").toUpperCase(), angle: Number(g.angle ?? 0), shift: Number(g.shift ?? 0), single: g.single === true, tint: Number(g.tint ?? 1), stops };
+    } else cx.skip("HATCH gradient (colours by layer/block, drawn solid)");
+  }
+  // Real pattern definition lines — lets the renderer draw the actual
+  // ANSI/ISO pattern instead of a placeholder. The file stores the definition
+  // in pattern space; apply the hatch's pattern angle and scale here so the
+  // renderer receives drawing-space families (same transform DWG applies).
+  const lines = (e.patternLines ?? []) as Any[];
+  if (!solid && lines.length) {
+    const sc = Number(e.patternScale ?? 1) || 1;
+    const pa = Number(e.patternAngle ?? 0);
+    const cos = Math.cos(pa), sin = Math.sin(pa);
+    out.patternLines = lines.map((l) => {
+      const angle = Number(l.angle ?? 0) + pa;
+      const b0 = Number((l.base ?? [])[0] ?? 0), b1 = Number((l.base ?? [])[1] ?? 0);
+      const o0 = Number((l.offset ?? [])[0] ?? 0), o1 = Number((l.offset ?? [])[1] ?? 0);
+      return {
+        angle,
+        base: [(b0 * cos - b1 * sin) * sc, (b0 * sin + b1 * cos) * sc] as [number, number],
+        offset: [(o0 * cos - o1 * sin) * sc, (o0 * sin + o1 * cos) * sc] as [number, number],
+        dashes: (l.dashes ?? []).map((d: number) => Number(d) * sc),
+      };
+    });
+  }
+  return out;
+}
+
+/** Map the whole engine document onto the platform model. */
+export function mapDocument(raw: Any, format: "dwg" | "dxf", opts: { nativeBlocks?: boolean } = {}): DxfDocument {
+  const cx: Ctx = {
+    byHandle: new Map(),
+    blocks: new Map(),
+    skip: () => {},
+    native: opts.nativeBlocks === true,
+    usedBlocks: new Set(),
+  };
+  cx.mlineStyles = new Map();
+  for (const ms of (Array.isArray(raw.mlineStyles) ? raw.mlineStyles : []) as Any[]) {
+    const st: MlineStyle = { offsets: (ms.offsets ?? []).map(Number), startCap: !!ms.startCap, endCap: !!ms.endCap, fill: !!ms.fill };
+    cx.mlineStyles.set(String(ms.handle ?? "").toLowerCase(), st);
+    cx.mlineStyles.set(`n:${String(ms.name ?? "").toLowerCase()}`, st);
+  }
+  const skipped: Record<string, number> = {};
+  cx.skip = (t: string) => {
+    skipped[t] = (skipped[t] ?? 0) + 1;
+  };
+
+  const all: Any[] = Array.isArray(raw.entities) ? raw.entities : [];
+  for (const e of all) {
+    const h = String(e?.handle ?? "");
+    if (h) cx.byHandle.set(h, e);
+  }
+
+  // Block definitions from the block-record table.
+  const layoutBlockNames = new Set<string>();
+  for (const br of (raw.blockRecords ?? []) as Any[]) {
+    const name = String(br?.name ?? "");
+    if (!name) continue;
+    if (/^\*(model|paper)_space/i.test(name)) {
+      layoutBlockNames.add(name);
+      continue;
+    }
+    const entities = ((br.entityHandles ?? []) as string[])
+      .map((h) => cx.byHandle.get(h))
+      .filter(Boolean) as Any[];
+    let base: DxfPoint = { x: 0, y: 0, z: 0 };
+    const blockEntity = cx.byHandle.get(String(br.blockHandle ?? ""));
+    if (blockEntity?.type === "BLOCK" && blockEntity.basePoint) base = pt(blockEntity.basePoint);
+    cx.blocks.set(name, { base, entities });
+  }
+
+  // Model space: prefer the *Model_Space block, else unclaimed entities.
+  const claimed = new Set<string>();
+  for (const [name, blk] of cx.blocks) {
+    for (const ent of blk.entities) claimed.add(String(ent.handle));
+  }
+  // Entities owned by a paper-space block belong to that sheet, never to model space.
+  const paperOwned = new Set<string>();
+  for (const br of (raw.blockRecords ?? []) as Any[]) {
+    if (/^\*paper_space/i.test(String(br?.name ?? ""))) for (const h of (br.entityHandles ?? []) as string[]) paperOwned.add(String(h));
+  }
+  const modelBlock = cx.blocks.get("*Model_Space") ?? cx.blocks.get("*MODEL_SPACE");
+  let model: Any[];
+  if (modelBlock) {
+    model = modelBlock.entities;
+    cx.blocks.delete("*Model_Space");
+    cx.blocks.delete("*MODEL_SPACE");
+  } else {
+    model = all.filter((e) => !claimed.has(String(e.handle)) && !e.paperSpace && !paperOwned.has(String(e.handle)));
+  }
+
+  // Paper space layouts: flagged entities, or the paper-space blocks.
+  const layouts: DxfLayout[] = [];
+  const paperNames = [...layoutBlockNames]
+    .filter((n) => /paper/i.test(n))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  // An entity can be both flagged as paper space and listed in a *Paper_Space block
+  // record. Count it once, in the block, or every sheet shows up twice.
+  const inPaperBlock = new Set<string>();
+  for (const n of paperNames) {
+    const br = (raw.blockRecords ?? []).find((b: Any) => b.name === n);
+    for (const h of (br?.entityHandles ?? []) as string[]) inPaperBlock.add(String(h));
+  }
+  const paperFlagged = all.filter((e) => e.paperSpace && !claimed.has(String(e.handle)) && !inPaperBlock.has(String(e.handle)));
+  const viewportsOf = (list: Any[]): DxfViewport[] =>
+    list
+      .filter((e) => e.type === "VIEWPORT" && Number(e.viewHeight ?? 0) > 0)
+      .map((e) => ({
+        center: pt(e.center),
+        width: Number(e.width ?? 0),
+        height: Number(e.height ?? 0),
+        viewCenter: pt(e.viewCenter),
+        viewHeight: Number(e.viewHeight ?? 0),
+        twist: Number(e.twist ?? 0) * DEG || undefined,
+      }));
+  if (paperFlagged.length) {
+    layouts.push({
+      name: "Paper Space",
+      entities: convertList(paperFlagged.filter((e) => e.type !== "VIEWPORT"), cx),
+      viewports: viewportsOf(paperFlagged),
+    });
+  }
+  for (const n of paperNames) {
+    const br = (raw.blockRecords ?? []).find((b: Any) => b.name === n);
+    const entities = ((br?.entityHandles ?? []) as string[])
+      .map((h) => cx.byHandle.get(h))
+      .filter(Boolean) as Any[];
+    if (!entities.length) continue;
+    layouts.push({
+      name: n.replace(/^\*/i, "").replace(/_/g, " ").toLowerCase().replace(/\b\w/g, (m) => m.toUpperCase()),
+      entities: convertList(entities.filter((e) => e.type !== "VIEWPORT"), cx),
+      viewports: viewportsOf(entities),
+    });
+  }
+
+  const entities = convertList(model, cx);
+
+  const doc: DxfDocument = {
+    layers: mapLayers(raw.layers),
+    entities,
+    sourceFormat: format === "dwg" ? "dwg" : "dxf",
+  };
+  if (cx.native) {
+    // Definitions once, in the block table: every named block plus anonymous ones that a reference uses.
+    // (Done after layouts + model space so every referenced anonymous block is known.)
+    const blockTable: Record<string, DxfBlockDef> = {};
+    const emitted = new Set<string>();
+    const emit = (name: string): void => {
+      if (emitted.has(name)) return;
+      emitted.add(name);
+      const blk = cx.blocks.get(name);
+      if (!blk) return;
+      const attdefs: DxfAttDef[] = [];
+      const body: DxfEntity[] = [];
+      for (const ent of blk.entities) {
+        if (ent?.type === "ATTDEF") {
+          attdefs.push({
+            tag: String(ent.tag ?? ""), prompt: String(ent.prompt ?? ent.tag ?? ""), defaultValue: String(ent.value ?? ""),
+            position: pt(ent.position), height: Number(ent.height ?? 2.5) || 2.5, rotation: Number(ent.rotation ?? 0) * DEG,
+            ...(ent.layer ? { layer: String(ent.layer) } : {}), ...(ent.invisible ? { invisible: true } : {}), ...(ent.constant ? { constant: true } : {}),
+          });
+          continue;
+        }
+        const before = new Set(cx.usedBlocks);
+        for (const o of convertEntity(ent, cx, 1, null)) body.push(o);
+        for (const n of cx.usedBlocks ?? []) if (!before.has(n)) emit(n);
+      }
+      blockTable[name] = { name, base: blk.base, entities: body, attdefs };
+    };
+    for (const l of layouts) for (const e of l.entities) if (e.type === "INSERT") cx.usedBlocks?.add(e.name);
+    for (const name of cx.blocks.keys()) if (!name.startsWith("*")) emit(name);
+    for (const name of [...(cx.usedBlocks ?? [])]) emit(name);
+    if (Object.keys(blockTable).length) { doc.blocks = blockTable; bindDocumentBlocks(doc); }
+  }
+
+  const linetypes: Record<string, number[]> = {};
+  for (const lt of (raw.linetypes ?? []) as Any[]) {
+    const name = String(lt.name ?? "").toUpperCase();
+    if (!name || name === "BYBLOCK" || name === "BYLAYER") continue;
+    const dashes = ((lt.elements ?? []) as Any[]).map((el) => Number(el.length ?? 0));
+    if (dashes.length) linetypes[name] = dashes;
+  }
+  if (Object.keys(linetypes).length) doc.linetypes = linetypes;
+  if (typeof raw.header?.ltscale === "number" && raw.header.ltscale !== 1) {
+    doc.ltscale = raw.header.ltscale;
+  }
+
+  const textStyles: Record<string, DxfTextStyle> = {};
+  for (const st of (raw.textStyles ?? []) as Any[]) {
+    const name = String(st.name ?? "").toUpperCase();
+    if (!name) continue;
+    const s: DxfTextStyle = {};
+    const font = String(st.fontFile ?? "").trim();
+    const ttf = String(st.trueTypeFont ?? "").trim();
+    if (font) s.font = font;
+    else if (ttf) s.font = ttf;
+    if (typeof st.bigFontFile === "string" && st.bigFontFile) s.bigFont = st.bigFontFile;
+    if (Number(st.height) > 0) s.height = Number(st.height);
+    if (Number(st.widthFactor) > 0 && Math.abs(Number(st.widthFactor) - 1) > 1e-6) {
+      s.width = Number(st.widthFactor);
+    }
+    if (Number(st.oblique)) s.oblique = Number(st.oblique) * DEG;
+    if (st.backwards) s.backwards = true;
+    if (st.upsideDown) s.upsideDown = true;
+    textStyles[name] = s;
+  }
+  if (Object.keys(textStyles).length) doc.textStyles = textStyles;
+
+  const dimStyles: string[] = [];
+  const dimStyleTable: Record<string, Any> = {};
+  for (const ds of (raw.dimStyles ?? []) as Any[]) {
+    const name = String(ds.name ?? "");
+    if (!name) continue;
+    dimStyles.push(name);
+    dimStyleTable[name.toUpperCase()] = {
+      scale: Number(ds.dimscale ?? 1) || 1,
+      textHeight: Number(ds.dimtxt ?? 0) || undefined,
+      arrowSize: Number(ds.dimasz ?? 0) || undefined,
+      extOffset: Number(ds.dimexo ?? 0) || undefined,
+      extExtend: Number(ds.dimexe ?? 0) || undefined,
+      textGap: Number(ds.dimgap ?? 0) || undefined,
+    };
+  }
+  if (dimStyles.length) {
+    doc.dimStyles = dimStyles;
+    doc.dimStyleTable = dimStyleTable as DxfDocument["dimStyleTable"];
+  }
+
+  {
+    // Active viewport -> saved view (plan views only; the converter in the viewer sanity-checks it).
+    const sv = raw.savedView;
+    const dir = sv?.dir ? pt(sv.dir) : null;
+    if (sv && Array.isArray(sv.center) && Number(sv.height) > 0 && (!dir || (Math.abs(dir.x) < 1e-6 && Math.abs(dir.y) < 1e-6))) {
+      const tw = Number(sv.twist ?? 0);
+      doc.savedView = { cx: Number(sv.center[0]), cy: Number(sv.center[1]), height: Number(sv.height), ...(tw ? { twist: tw * (tw > 6.3 ? 1 : 180 / Math.PI) } : {}) };
+    }
+  }
+  const units: DxfUnits = insUnitsToUnits(Number(raw.header?.insunits ?? 0));
+  if (units !== "unitless") doc.units = units;
+
+  const extmin = raw.header?.extmin ? pt(raw.header.extmin) : null;
+  const extmax = raw.header?.extmax ? pt(raw.header.extmax) : null;
+  if (extmin && extmax && extmax.x - extmin.x > 0 && extmax.y - extmin.y > 0) {
+    doc.extents = { min: extmin, max: extmax };
+  } else {
+    doc.extents = robustExtents(entities);
+  }
+
+  if (Object.keys(skipped).length) doc.skipped = skipped;
+  if (layouts.length) doc.layouts = layouts;
+  return doc;
+}
+
+function mapLayers(rawLayers: Any[]): DxfLayer[] {
+  const out: DxfLayer[] = [];
+  for (const l of (rawLayers ?? []) as Any[]) {
+    const name = String(l.name ?? "");
+    if (!name) continue;
+    const { color, rgb } = colorOf(l.color as JsonColor | undefined);
+    const layer: DxfLayer = {
+      name,
+      color: color ?? (rgb !== undefined ? 7 : 7),
+    };
+    if (rgb !== undefined) layer.rgb = rgb;
+    if (typeof l.lineType === "string" && l.lineType && l.lineType !== "ByLayer") {
+      layer.lineType = l.lineType;
+    }
+    const lw = lineWeightMm(l.lineWeight);
+    if (lw !== undefined) layer.lineweight = lw;
+    const tr = transparencyPct(l.transparency);
+    if (tr !== undefined) layer.transparency = tr;
+    if (l.isPlottable === false) layer.plot = false;
+    if (l.frozen) layer.frozen = true;
+    if (l.off) layer.off = true;
+    if (l.locked) layer.locked = true;
+    out.push(layer);
+  }
+  return out;
+}
+
+function convertList(list: Any[], cx: Ctx): DxfEntity[] {
+  const out: DxfEntity[] = [];
+  for (const e of list) {
+    try {
+      pushAll(out, convertEntity(e, cx, 0, null));
+    } catch (err) {
+      cx.skip(`${e?.type ?? "?"} (unreadable)`);
+      if (err instanceof RangeError) throw err; // stack exhaustion is real
+    }
+  }
+  return out;
+}
+
+/** Version stamp helper for tests: sniff DWG/DXF from the first bytes. */
+export function looksLikeDrawing(bytes: Uint8Array): boolean {
+  if (bytes.length < 8) return false;
+  const head = String.fromCharCode(...bytes.slice(0, 6));
+  if (/^A[CD]10\d{2}$/.test(head)) return true;
+  const text = new TextDecoder().decode(bytes.slice(0, 64));
+  return /^\s*0\r?\n|DWG Binary DXF/.test(text);
+}
