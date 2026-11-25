@@ -1632,4 +1632,23 @@ export const ar: Partial<Record<TranslationKey, string>> = {
   "renderLab.errorEmbeddedAssets": "استخدم ملف GLB مستقلاً يحتوي على خامات مضمّنة.",
   "renderLab.errorVertexLimit": "يدعم هذا العارض مليوني رأس شبكة كحد أقصى.",
   "renderLab.errorJson": "بيانات GLB الوصفية ليست JSON صالحاً."
+
+  "provider.errorAbsoluteUrl": "أدخل عنوان URL مطلقاً للمزوّد، مثل https://api.openai.com/v1.",
+  "provider.errorHttps": "استخدم HTTPS للمزوّدات البعيدة. يُسمح بـ HTTP فقط مع localhost أو 127.0.0.1 أو [::1].",
+  "provider.errorCredentials": "يجب ألا يحتوي عنوان URL للمزوّد على بيانات اعتماد أو استعلام أو جزء إضافي. أدخل المفتاح بشكل منفصل.",
+  "provider.errorNoProxy": "اختر عنوان URL لمزوّد الذكاء الاصطناعي. لا يستضيف هذا التطبيق وسيطاً للذكاء الاصطناعي.",
+  "provider.errorApiKey": "أضف مفتاح OpenAI API من الإعدادات ← الذكاء الاصطناعي أولاً. يمكن استخدام المزوّدات المخصصة دون مفتاح.",
+  "provider.errorResponsesModel": "اختر نموذج Responses مثل gpt-4.1. لا يمكن استخدام نماذج GPT Image وDALL·E كنموذج Responses.",
+  "provider.errorModelList": "أعاد المزوّد قائمة نماذج غير مدعومة. أدخل معرّف النموذج يدوياً.",
+  "provider.errorTooLarge": "استجابة المزوّد كبيرة جداً. جرّب مخرجات أصغر.",
+  "provider.errorEmpty": "أعاد المزوّد استجابة فارغة.",
+  "provider.errorMalformedJson": "أعاد المزوّد بيانات JSON غير سليمة. تحقق من توافق واجهة API.",
+  "provider.errorUnauthorized": "تحقق من مفتاح المزوّد وصلاحية الوصول إلى الحساب.",
+  "provider.errorRateLimit": "تم بلوغ حد الطلبات أو الإنفاق لدى المزوّد. حاول مجدداً لاحقاً.",
+  "provider.errorBadRequest": "تحقق من عنوان URL الأساسي والنموذج. يتطلب التصيير POST /responses مع أداة image_generation.",
+  "provider.errorStatus": "تحقق من حالة المزوّد وحاول مجدداً.",
+  "provider.errorTimeout": "انتهت مهلة طلب المزوّد. لم تتم إعادة المحاولة؛ تحقق من المزوّد قبل إنشاء طلب جديد.",
+  "provider.errorCancelled": "تم إلغاء الطلب. قد يستمر المزوّد في التنفيذ ويفرض رسوماً على العمل الذي بدأ بالفعل.",
+  "provider.errorConnection": "تعذر الاتصال بالمزوّد مباشرة. تحقق من عنوان URL وHTTPS وأذونات CORS أو الشبكة المحلية في المتصفح. لم يُستخدم وسيط أو إعادة محاولة تلقائية.",
+  "provider.errorNoImage": "لم يتم إرجاع صورة. يجب أن يدعم المزوّد والنموذج POST /responses مع أداة image_generation. جرّب نموذجاً آخر."
 };
