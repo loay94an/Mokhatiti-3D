@@ -99,7 +99,7 @@ export type CatalogNode = CatalogLeaf | { [key: string]: CatalogNode };
 /* -------------------------------------------------------------------- */
 
 const STORAGE_KEY = "obs.locale";
-const FALLBACK_LOCALE: Locale = "en";
+const FALLBACK_LOCALE: Locale = "ar";
 const MISSING_MARKER = "\u2400";
 
 type ChangeListener = (locale: Locale) => void;
@@ -143,7 +143,11 @@ class I18nService {
       if (raw) saved = raw as Locale;
     } catch { /* */ }
 
-    const detected = saved ?? this.detectBrowserLocale();
+    const browserLocale = this.detectBrowserLocale();
+    // Arabic is the product's default interface for Mokhatiti-3D. Respect an
+    // explicit saved choice and other supported browser languages, but do
+    // not silently open the first-run experience in English on English phones.
+    const detected = saved ?? (browserLocale === "en" ? FALLBACK_LOCALE : browserLocale);
     this.setLocale(detected, { silent: !saved });
   }
 
