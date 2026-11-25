@@ -1,0 +1,49 @@
+name: Import OpenBIMStudio upstream
+
+on:
+  push:
+    branches:
+      - migration/openbimstudio-import
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch exact upstream source
+        env:
+          UPSTREAM_SHA: f68369659b027ab22dcda98bc62cf7b62a5bcc63
+        run: |
+          git clone --filter=blob:none https://github.com/amdghedy/openBIMstudio.git /tmp/openBIMstudio
+          git -C /tmp/openBIMstudio checkout "$UPSTREAM_SHA"
+
+      - name: Replace target contents with upstream project
+        env:
+          UPSTREAM_SHA: f68369659b027ab22dcda98bc62cf7b62a5bcc63
+        run: |
+          rsync -a --delete --exclude='.git' /tmp/openBIMstudio/ "$GITHUB_WORKSPACE/"
+          cat > UPSTREAM_IMPORT.md <<EOF
+          # Upstream source import
+
+          This repository contains the upstream OpenBIMStudio source tree.
+
+          - Upstream: https://github.com/amdghedy/openBIMstudio
+          - Imported commit: `$UPSTREAM_SHA`
+          - License: MIT (see the upstream `LICENSE` file)
+          - Import method: source-tree snapshot; upstream Git history is not rewritten into this repository.
+          EOF
+
+      - name: Commit imported source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import OpenBIMStudio upstream source at f683696"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
