@@ -1194,6 +1194,7 @@ export const pt = {
   "aiRenderMessage.failed": "Falha na renderização.",
   "aiRenderMessage.key": "Adicione sua chave de API do Gemini em Configurações → IA primeiro.",
   "aiRenderMessage.noImage": "Nenhuma imagem foi retornada. Tente outro modelo ou prompt.",
+  "aiRenderMessage.apiError": "O provedor de imagens retornou um erro (HTTP {status}). Verifique a conta do provedor e tente novamente.",
   "canvasStatus.roomsOne": "{count} ambiente",
   "canvasStatus.roomsMany": "{count} ambientes",
   "canvasStatus.wallsOne": "{count} parede",
