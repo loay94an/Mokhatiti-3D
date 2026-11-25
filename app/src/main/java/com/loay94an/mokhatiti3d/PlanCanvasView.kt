@@ -278,7 +278,7 @@ class PlanCanvasView(context: Context) : View(context) {
                 sillHeightMetres = sill
             )
         )
-        rooms.clear()
+        rooms.removeAll { it.levelId == activeLevelId }
         savePlan()
         invalidate()
         return true
