@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { locale } from '../src/lib/i18n';
 import { fetchOpenAIModels, generateOpenAIRenderImage, getEffectiveModel, normalizeBaseUrl, parseModelsResponse } from '../src/lib/utils/openaiClient';
 
 const config = { baseUrl: 'https://provider.example/v1', apiKey: 'test-secret', model: 'custom-image-tool-model' };
 const png = 'iVBORw0KGgo=';
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
+beforeEach(() => locale.set('en'));
 afterEach(() => vi.useRealTimers());
 
 describe('direct AI providers', () => {
