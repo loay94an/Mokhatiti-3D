@@ -42,4 +42,18 @@ class PlanRoomDetectorTest {
         assertTrue(rooms.single().areaSquareMetres > 11.9f)
     }
 
+    @Test fun splitsCrossingWallsAtTheirInteriorIntersection() {
+        val walls = listOf(
+            PlanWall(0f, 0f, 4f, 0f),
+            PlanWall(4f, 0f, 4f, 4f),
+            PlanWall(4f, 4f, 0f, 4f),
+            PlanWall(0f, 4f, 0f, 0f),
+            PlanWall(0f, 0f, 4f, 4f),
+            PlanWall(0f, 4f, 4f, 0f)
+        )
+        val rooms = PlanRoomDetector.detectRooms(walls)
+        assertEquals(4, rooms.size)
+        assertEquals(16f, rooms.sumOf { it.areaSquareMetres.toDouble() }.toFloat(), 0.001f)
+    }
+
 }
