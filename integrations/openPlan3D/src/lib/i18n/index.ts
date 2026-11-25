@@ -10,8 +10,7 @@ const preference = writable<Locale>('ar');
 const isLocale = (value: unknown): value is Locale => value === 'en' || value === 'pt' || value === 'ar';
 
 export function translate(language: Locale, key: TranslationKey, variables: Record<string, string | number> = {}): string {
-  // Arabic is completed in reviewed batches; untranslated keys retain the source wording.
-  const message = language === 'ar' ? (ar[key] ?? en[key]) : dictionaries[language][key];
+  const message = language === 'ar' ? ar[key] : dictionaries[language][key];
   // Single-pass substitution preserves literal braces in user-provided values.
   return message.replace(/\{(\w+)\}/g, (token, name) =>
     Object.hasOwn(variables, name) ? String(variables[name]) : token);
