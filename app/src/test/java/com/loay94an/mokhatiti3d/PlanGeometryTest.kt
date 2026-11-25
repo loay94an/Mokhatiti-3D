@@ -87,6 +87,22 @@ class PlanGeometryTest {
         assertThrows(IllegalArgumentException::class.java) { PlanProject(furniture = listOf(item)) }
     }
     @Test
+    fun rejectsOpeningWithoutHostWall() {
+        val opening = PlanOpening(wallId = "missing-wall", type = PlanOpeningType.DOOR, offsetMetres = 0f, widthMetres = 0.9f, heightMetres = 2.1f)
+        assertThrows(IllegalArgumentException::class.java) {
+            PlanProject(openings = listOf(opening))
+        }
+    }
+
+    @Test
+    fun rejectsDuplicateLevelIdentifiers() {
+        val duplicate = PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "طابق مكرر")
+        assertThrows(IllegalArgumentException::class.java) {
+            PlanProject(levels = listOf(PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "الأرضي"), duplicate))
+        }
+    }
+
+    @Test
     fun validatesWallsAndFurnitureAcrossMultipleLevels() {
         val ground = PlanLevel(PlanWall.DEFAULT_LEVEL_ID, "الأرضي", elevationMetres = 0f)
         val upper = PlanLevel("level-upper", "الأول", elevationMetres = 3f)
