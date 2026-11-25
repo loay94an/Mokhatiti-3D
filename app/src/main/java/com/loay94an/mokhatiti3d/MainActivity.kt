@@ -79,6 +79,7 @@ class MainActivity : Activity() {
         tool("طابق جديد") { addLevelDialog() }
         tool("تبديل الطابق") { hint.text = "الطابق الحالي: " + workspace.switchNextLevel(); preview.refresh() }
         tool("تراجع") { workspace.undo(); preview.refresh() }
+        tool("إعادة") { workspace.redo(); preview.refresh() }
         tool("غرف") { val count = workspace.detectRooms(); preview.refresh(); hint.text = if (count > 0) "تم اكتشاف $count غرفة من الجدران المغلقة" else "لم تُكتشف غرف مغلقة؛ تأكد من اتصال الجدران" }
         tool("مسح") { workspace.clearPlan(); preview.refresh() }
         tool("حفظ") { workspace.savePlan(); Toast.makeText(this, "تم حفظ المشروع محلياً", Toast.LENGTH_SHORT).show() }
