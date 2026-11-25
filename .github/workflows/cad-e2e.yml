@@ -33,7 +33,7 @@ jobs:
       - run: npx playwright test --project=chromium tests/e2e/cad-native-blocks.spec.ts tests/e2e/cad-xref.spec.ts tests/e2e/cad-constraints.spec.ts tests/e2e/cad-ribbon.spec.ts
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cad-e2e-report
           path: |

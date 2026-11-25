@@ -42,9 +42,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -69,7 +69,7 @@ jobs:
             if ($_.Length -lt 50MB) { throw "Installer is unexpectedly small; verify the packaged assets." }
           }
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OpenBIMStudio-Windows-x64-Installer
           path: release/*.exe
@@ -77,7 +77,7 @@ jobs:
           retention-days: 30
       - name: Publish installer to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release/*.exe
           generate_release_notes: true

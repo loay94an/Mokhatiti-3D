@@ -54,7 +54,7 @@ jobs:
         run: ${{ matrix.browser == 'firefox' && 'PW_HEADED=1 xvfb-run -a -s "-screen 0 1280x1024x24"' || '' }} npx playwright test --project=${{ matrix.browser }} tests/e2e/smoke.spec.ts tests/e2e/orbit-rtl.spec.ts tests/e2e/native-ifc-roundtrip.spec.ts tests/e2e/edit-undo-save.spec.ts tests/e2e/document-chain.spec.ts --reporter=list
       - name: Upload report and screenshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: browser-smoke-results-${{ matrix.browser }}
           path: test-results/
