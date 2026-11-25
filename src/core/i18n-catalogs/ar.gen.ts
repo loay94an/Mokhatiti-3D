@@ -3,10 +3,11 @@
  * hand; regenerate with scripts/gen-catalogs.mjs (source:
  * scripts/i18n-work/ar.json). Keyed by the exact English source string.
  * Loaded lazily per language by i18n-dicts.ts (ensureGenDicts).
- * Provenance: frozen translation snapshot with manually reviewed terminology
- * corrections; see scripts/i18n-work/MANIFEST.json. Remaining entries are
- * unreviewed machine translation. Missing keys are filled with the English
- * source string and reported by scripts/i18n-audit.mjs.
+ * Provenance: frozen machine-translation snapshot, reverse-extracted from
+ * the previously checked-in catalogues on 2026-11-20; see
+ * scripts/i18n-work/MANIFEST.json. Unreviewed — do not treat as human
+ * translation. Missing keys are filled with the English source string
+ * and reported by scripts/i18n-audit.mjs.
  */
 
 export type Dict = Record<string, string>;
