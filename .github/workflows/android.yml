@@ -115,6 +115,9 @@ jobs:
           p.write_text(s, encoding="utf-8")
           PY
 
+      - name: Audit Arabic translation coverage
+        run: python3 scripts/audit-arabic-properties.py
+
       - name: Generate the Sweet Home 3D JS editor libraries
         working-directory: third_party/SweetHome3D/SweetHome3DJS
         run: ant applicationLibraries
