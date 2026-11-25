@@ -1607,4 +1607,11 @@ export const pt = {
   "renderLab.invalidBounds": "O modelo possui limites inválidos ou vazios.",
   "renderLab.pathTracingUnavailable": "Traçado de caminhos indisponível: {error}. A prévia interativa está disponível.",
   "renderLab.pathTracingStopped": "O traçado de caminhos foi interrompido: {error}"
+
+  "renderLab.errorIncompleteGlb": "Este arquivo GLB está incompleto.",
+  "renderLab.errorValidGlb": "Escolha um arquivo binário glTF 2.0 (.glb) válido.",
+  "renderLab.errorMetadata": "Metadados GLB inválidos ou muito grandes.",
+  "renderLab.errorEmbeddedAssets": "Use um GLB independente com texturas incorporadas.",
+  "renderLab.errorVertexLimit": "Este visualizador aceita até dois milhões de vértices de malha.",
+  "renderLab.errorJson": "Os metadados GLB não são um JSON válido."
 } as const;
