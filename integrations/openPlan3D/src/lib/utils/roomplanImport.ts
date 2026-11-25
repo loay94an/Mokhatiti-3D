@@ -7,6 +7,8 @@
  */
 
 import { defaultFloorName } from './floors';
+import { get } from 'svelte/store';
+import { t } from '$lib/i18n';
 import type { Floor, Wall, Door, Window, FurnitureItem, Room, Point, Project, InterchangeState } from '$lib/models/types';
 import { INTERCHANGE_BLOCK_KEYS } from '$lib/models/types';
 import { createDefaultProject, createDefaultFloor } from '$lib/stores/project';
@@ -959,7 +961,7 @@ export function createProjectFromRoomPlan(
   options: RoomPlanImportOptions = roomPlanImportOptions(jsonData)
 ): Project {
   const floors = importRoomPlanFloors(jsonData, options);
-  const project = createDefaultProject(name || 'RoomPlan Import');
+  const project = createDefaultProject(name || get(t)('roomPlanDialog.importedProjectName'));
 
   // Build each storey from a fresh default floor. Spreading one template
   // would alias its guides/annotations/groups arrays across every floor.
