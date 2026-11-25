@@ -53,7 +53,18 @@ class PlanCanvasView(context: Context) : View(context) {
     private var lastFocusY = 0f
     private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
         override fun onScale(detector: ScaleGestureDetector): Boolean {
-            pixelsPerMetre = (pixelsPerMetre * detector.scaleFactor).coerceIn(20f, 300f)
+            val oldScale = pixelsPerMetre
+            val newScale = (oldScale * detector.scaleFactor).coerceIn(20f, 300f)
+            if (newScale != oldScale) {
+                // Keep the world point beneath the pinch centroid stationary while zooming.
+                val focusX = detector.focusX
+                val focusY = detector.focusY
+                val worldAtFocusX = (focusX - originX()) / oldScale
+                val worldAtFocusY = (originY() - focusY) / oldScale
+                pixelsPerMetre = newScale
+                panX = focusX - width * 0.5f - worldAtFocusX * newScale
+                panY = focusY - height * 0.55f + worldAtFocusY * newScale
+            }
             invalidate()
             return true
         }
