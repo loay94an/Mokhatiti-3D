@@ -52,6 +52,8 @@ class PlanCanvasView(context: Context) : View(context) {
     private var endY = 0f
     private var lastFocusX = 0f
     private var lastFocusY = 0f
+    // Once a gesture becomes multi-touch, never reinterpret the remaining finger as a draw/select gesture.
+    private var multiTouchGesture = false
     private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
         override fun onScale(detector: ScaleGestureDetector): Boolean {
             val oldScale = pixelsPerMetre
@@ -326,6 +328,16 @@ class PlanCanvasView(context: Context) : View(context) {
                 lastFocusX = focusX
                 lastFocusY = focusY
                 invalidate()
+            }
+            return true
+        }
+        if (multiTouchGesture) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    multiTouchGesture = false
+                    drawing = false
+                    invalidate()
+                }
             }
             return true
         }
