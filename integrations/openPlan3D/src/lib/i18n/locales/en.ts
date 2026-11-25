@@ -1567,6 +1567,8 @@ export const en = {
   "customModelValidation.unsupportedExtension": "Unsupported GLB extension: {name} is not supported by local model import yet.",
   "customModelValidation.undeclaredExtension": "Unsupported GLB extension: {name} is missing from extensionsUsed.",
   "renderLab.title": "Render lab",
+  "renderLab.localFloorplan": "Local floorplan",
+  "renderLab.viewerCanvas": "Interactive floorplan render",
   "renderLab.browserRendering": "Browser rendering",
   "renderLab.localWorkspace": "Local workspace",
   "renderLab.eyebrow": "RENDER STUDY / 01",
