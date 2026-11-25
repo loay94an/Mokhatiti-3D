@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Audit Arabic Sweet Home 3D UI bundles against the pinned English source."""
 from pathlib import Path
+import os
 import re
 import sys
 
@@ -17,7 +18,7 @@ def property_keys(path: Path) -> set[str]:
     pending = ""
     for line in physical:
         line = pending + line.lstrip() if pending else line
-        if line.endswith("\\\\"):
+        if line.endswith("\\"):
             pending = line[:-1]
             continue
         logical.append(line)
@@ -29,28 +30,23 @@ def property_keys(path: Path) -> set[str]:
         stripped = line.lstrip()
         if not stripped or stripped.startswith(("#", "!")):
             continue
-        match = re.match(r"([^:=\\s]+)\\s*[:=]", stripped)
+        match = re.match(r"([^:=\s]+)\s*[:=]", stripped)
         if match:
             keys.add(match.group(1))
         else:
-            match = re.match(r"([^\\s]+)\\s+", stripped)
+            match = re.match(r"([^\s]+)\s+", stripped)
             if match:
                 keys.add(match.group(1))
     return keys
 
 total = translated = missing_files = missing_keys = 0
 failures = []
-seen = set()
 for root in ROOTS:
     if not root.exists():
         continue
     for english in root.rglob("*.properties"):
-        if re.search(r"_[a-z]{2}\\.properties$", english.name):
+        if re.search(r"_[a-z]{2}\.properties$", english.name):
             continue
-        rel = (root, english)
-        if rel in seen:
-            continue
-        seen.add(rel)
         total += 1
         arabic = english.with_name(english.stem + "_ar.properties")
         if not arabic.is_file():
@@ -58,9 +54,7 @@ for root in ROOTS:
             failures.append(f"Missing Arabic bundle: {english}")
             continue
         translated += 1
-        en_keys = property_keys(english)
-        ar_keys = property_keys(arabic)
-        absent = sorted(en_keys - ar_keys)
+        absent = sorted(property_keys(english) - property_keys(arabic))
         missing_keys += len(absent)
         if absent:
             failures.append(f"{arabic}: {len(absent)} missing keys: {', '.join(absent[:12])}")
@@ -72,8 +66,8 @@ summary = (
     f"{missing_files} missing bundles."
 )
 print(summary)
-github_summary = Path(__import__("os").environ.get("GITHUB_STEP_SUMMARY", "/tmp/mokhatiti-arabic-summary.md"))
-github_summary.write_text("# Arabic translation audit\\n\\n" + summary + "\\n", encoding="utf-8")
+summary_path = Path(os.environ.get("GITHUB_STEP_SUMMARY", "/tmp/mokhatiti-arabic-summary.md"))
+summary_path.write_text("# Arabic translation audit\n\n" + summary + "\n", encoding="utf-8")
 if total == 0:
     print("No English UI resource bundles were found; audit cannot pass.", file=sys.stderr)
     sys.exit(2)
